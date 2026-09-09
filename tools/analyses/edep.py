@@ -7,8 +7,8 @@ event. The parser reads the summary block EdepAna_module.cc prints at endJob
 
 import re
 
-from ..mu2e_job import MUSE_WORKAREA
-from ..spec import AnalysisSpec
+from ..mu2e_job import MUSE_WORKAREA, run_mu2e_job
+from ..spec import AnalysisSpec, RunContext, RunOutcome
 
 FCL = MUSE_WORKAREA / "Mu2eOptAna" / "fcl" / "edep.fcl"
 
@@ -73,16 +73,55 @@ def summarize_edep(metrics: dict[str, float]) -> str:
     )
 
 
+def run(context: RunContext) -> RunOutcome:
+    """Run edep.fcl over the input art file(s) and parse the summary block."""
+    outcome = run_mu2e_job(
+        fcl=FCL,
+        input_paths=context.input_paths,
+        outdir=context.outdir,
+        single=len(context.input_paths) == 1 and not context.wants_file_list,
+        timeout_s=context.timeout_s,
+        max_events=context.max_events,
+    )
+    extra = {"returncode": outcome.returncode}
+    if outcome.file_list_path is not None:
+        extra["file_list_path"] = str(outcome.file_list_path)
+
+    if outcome.timed_out:
+        return RunOutcome(
+            files=outcome.new_root_files, log_path=outcome.log_path, extra=extra,
+            error=f"mu2e timed out after {context.timeout_s}s on "
+                  f"{len(context.input_paths)} input file(s)",
+        )
+    if outcome.failed:
+        extra["stdout_tail"] = outcome.stdout_tail()
+        return RunOutcome(
+            files=outcome.new_root_files, log_path=outcome.log_path, extra=extra,
+            error=f"mu2e exited {outcome.returncode}",
+        )
+
+    metrics = parse_edep_summary(outcome.stdout)
+    if metrics is None:
+        extra["stdout_tail"] = outcome.stdout_tail()
+        return RunOutcome(
+            files=outcome.new_root_files, log_path=outcome.log_path, extra=extra,
+            error="EdepAna summary block not found in mu2e output",
+        )
+    return RunOutcome(metrics=metrics, files=outcome.new_root_files,
+                      log_path=outcome.log_path, extra=extra)
+
+
 SPEC = AnalysisSpec(
     name="edep",
     fcl=FCL,
+    input_kind="art_files",
+    run=run,
     description=(
         "Average calorimeter and tracker energy deposition per event and per "
         "generated event (EdepAna)."
     ),
     metrics=tuple(name for name, _ in _SUMMARY_FIELDS),
     units=METRIC_UNITS,
-    parse=parse_edep_summary,
     summarize=summarize_edep,
     input_hint=(
         "art file(s) holding compressDetStepMCs, CaloClusterMaker and "

@@ -7,13 +7,13 @@ driven by `registry.ANALYSES`, so adding an analysis there extends the
 """
 
 from pathlib import Path
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import Field, validate_call
 
-from .mu2e_job import run_mu2e_job, validate_input_paths
+from .mu2e_job import validate_input_paths
 from .registry import ANALYSES, ANALYSIS_NAMES
-from .spec import ArtifactResult
+from .spec import ArtifactResult, RunContext
 
 # Built from the registry, so the schema's enum grows with it. Literal accepts
 # a tuple of values at runtime, which is what lets this stay dynamic.
@@ -22,14 +22,24 @@ AnalysisName = Literal[ANALYSIS_NAMES]  # type: ignore[valid-type]
 
 @validate_call
 def list_analyses() -> ArtifactResult:
-    """List the analyses run_analysis can run, with the metrics each returns.
+    """List the analyses run_analysis can run, with their inputs and metrics.
 
-    Use this tool first to discover valid `analysis` names, what each one
-    measures, which metric names it reports (and their units), and what the
-    input art file(s) must contain.
+    Use this tool first to discover valid `analysis` names, what each measures,
+    which metric names it reports (and their units), which parameters it takes,
+    and what its input file must be. `input_kind` says what to feed it:
+
+      "art_files"  mu2e art file(s) — pass data_file or data_files
+      "root_file"  a ROOT file written by an earlier analysis (see
+                   `produced_by`) — pass data_file
+
+    Chaining: an analysis whose `produced_by` names another should be given a
+    ROOT file from that one's `files` output.
     """
     catalogue = {name: spec.describe() for name, spec in sorted(ANALYSES.items())}
-    missing = [name for name, entry in catalogue.items() if not entry["fcl_exists"]]
+    missing = [
+        name for name, entry in catalogue.items()
+        if entry.get("fcl_exists") is False
+    ]
     message = f"{len(catalogue)} analyses available: {', '.join(catalogue)}."
     if missing:
         message += f" WARNING: fcl file missing for {', '.join(missing)}."
@@ -47,120 +57,120 @@ def run_analysis(
     output_dir: Annotated[str, Field(min_length=1)],
     data_file: Annotated[str | None, Field(min_length=1)] = None,
     data_files: Annotated[list[str] | None, Field(min_length=1)] = None,
+    parameters: dict[str, Any] | None = None,
     max_events: Annotated[int | None, Field(ge=1)] = None,
     timeout_s: Annotated[int, Field(ge=1, le=7200)] = 900,
 ) -> ArtifactResult:
-    """Run one analysis over mu2e art file(s) and return its metrics.
+    """Run one analysis over its input file(s) and return its metrics.
 
-    Runs a real mu2e job — `mu2e -c <the analysis' fcl> -s <file>` for a single
-    input, or `-S <file list>` for several — then parses the job's summary
-    output into numbers. Expect seconds to many minutes, growing with the
-    number of input files and events.
+    Call `list_analyses` first if you are unsure of the `analysis` name, the
+    parameters it needs, or which metrics it reports; the metrics land in
+    `metadata` under the names listed there.
 
-    Call `list_analyses` first if you are unsure of the `analysis` name or
-    which metrics it reports; the parsed metrics land in `metadata` under the
-    names listed there. Results are per-job: with several input files the
-    metrics cover the whole set, NOT one file each — run the tool once per
-    file if you need per-file numbers.
+    What happens depends on the analysis' `input_kind`:
+
+    * "art_files" runs a real mu2e job (`mu2e -c <fcl> -s <file>`, or `-S` with
+      a generated file list for several inputs). Expect seconds to many
+      minutes. Metrics cover the whole input set as ONE job, not one result per
+      file — run the tool once per file if you need per-file numbers.
+    * "root_file" runs a Python computation over one ROOT file produced by an
+      earlier analysis, which is fast. Feed it a path from that analysis'
+      `files` output.
 
     Args:
-        analysis: Which analysis to run (see list_analyses), e.g. "edep" for
-            average calorimeter/tracker energy deposition.
-        output_dir: Directory the job runs in; its ROOT output, the captured
-            mu2e.log and (for several inputs) filelist.txt are written here.
-            Created if missing. Use a fresh directory per job to keep outputs
-            from different runs apart.
-        data_file: Absolute path to one input art file. Pass exactly one of
+        analysis: Which analysis to run (see list_analyses), e.g. "edep".
+        output_dir: Directory the analysis runs in and writes to — job output,
+            logs, figures. Created if missing. Use a fresh directory per run to
+            keep outputs apart.
+        data_file: Absolute path to one input file. Pass exactly one of
             data_file or data_files.
         data_files: Absolute paths to several input art files, analyzed
-            together in one job. Pass exactly one of data_file or data_files.
-        max_events: Process at most this many events (mu2e --nevts). Useful
-            for a quick check before a full run; omit to process everything.
+            together in one job. Only for "art_files" analyses.
+        parameters: Analysis-specific physics knobs, e.g.
+            {"sig_eff": 0.1} for approx_ce_sensitivity. list_analyses reports
+            each analysis' parameters, defaults, and which are required.
+        max_events: Process at most this many events (mu2e --nevts). Only for
+            "art_files" analyses; useful for a quick check before a full run.
             CAUTION: generated-event counts come from the input's subrun
             bookkeeping and cover the whole file either way, so any
-            "per gen event" metric is meaningless when this is set — use it
-            to check that a job runs, not for physics numbers.
+            "per gen event" metric is meaningless when this is set.
         timeout_s: Kill the job if it runs longer than this many seconds.
             Raise it when passing many files.
     """
     spec = ANALYSES[analysis]
 
-    if (data_file is None) == (data_files is None):
+    def fail(message: str, **extra: Any) -> ArtifactResult:
         return ArtifactResult(
-            status="error", files=[],
-            message="Pass exactly one of data_file (one art file) or "
-                    "data_files (a list of art files).",
-            metadata={"analysis": analysis, "data_file": data_file,
-                      "data_files": data_files},
+            status="error", files=[], message=f"{analysis}: {message}",
+            metadata={"analysis": analysis, **extra},
         )
+
+    if (data_file is None) == (data_files is None):
+        return fail("pass exactly one of data_file (one input file) or "
+                    "data_files (a list of art files).",
+                    data_file=data_file, data_files=data_files)
+
+    if spec.input_kind == "root_file":
+        if data_files is not None:
+            return fail(
+                f"takes a single ROOT file: pass data_file, not data_files. "
+                f"{spec.input_hint}"
+            )
+        if max_events is not None:
+            return fail("does not run a mu2e job, so max_events does not apply.")
+
+    # Physics knobs are validated against the spec, which names the offender.
+    try:
+        params = spec.resolve_params(parameters)
+    except ValueError as exc:
+        return fail(str(exc), parameters=parameters)
 
     inputs = [data_file] if data_file is not None else list(data_files)
     paths = [Path(p) for p in inputs]
     problems = validate_input_paths(paths)
     if problems:
-        return ArtifactResult(
-            status="error", files=[],
-            message="Invalid input data file(s): " + "; ".join(problems),
-            metadata={"analysis": analysis, "data_files": [str(p) for p in paths]},
-        )
+        return fail("invalid input file(s): " + "; ".join(problems),
+                    data_files=[str(p) for p in paths])
 
-    if not spec.fcl.exists():
-        return ArtifactResult(
-            status="error", files=[],
-            message=f"fcl for analysis '{analysis}' not found: {spec.fcl}",
-            metadata={"analysis": analysis, "fcl": str(spec.fcl)},
-        )
+    if spec.fcl is not None and not spec.fcl.exists():
+        return fail(f"fcl not found: {spec.fcl}", fcl=str(spec.fcl))
 
-    outcome = run_mu2e_job(
-        fcl=spec.fcl,
+    outcome = spec.run(RunContext(
         input_paths=paths,
         outdir=Path(output_dir).expanduser().resolve(),
-        single=data_file is not None,
+        params=params,
         timeout_s=timeout_s,
         max_events=max_events,
-    )
+        wants_file_list=data_files is not None,
+    ))
 
-    # Describes the job in every result, so a caller chaining several analyses
-    # can tell which inputs a number came from without re-reading logs.
-    job_metadata = {
+    # Describes the run in every result, so a caller chaining analyses can tell
+    # which inputs and assumptions a number came from without re-reading logs.
+    metadata: dict[str, Any] = {
         "analysis": analysis,
-        "fcl": str(spec.fcl),
-        "data_files": [str(p) for p in outcome.input_paths],
-        "n_input_files": len(outcome.input_paths),
-        "log_path": str(outcome.log_path),
+        "input_kind": spec.input_kind,
+        "data_files": [str(p) for p in paths],
+        "n_input_files": len(paths),
+        **({"parameters": params} if params else {}),
+        **({"max_events": max_events} if max_events is not None else {}),
+        **({"fcl": str(spec.fcl)} if spec.fcl is not None else {}),
+        **outcome.extra,
     }
-    if outcome.file_list_path is not None:
-        job_metadata["file_list_path"] = str(outcome.file_list_path)
-    if max_events is not None:
-        job_metadata["max_events"] = max_events
+    if outcome.log_path is not None:
+        metadata["log_path"] = str(outcome.log_path)
 
-    if outcome.timed_out:
+    if outcome.error is not None or outcome.metrics is None:
+        error = outcome.error or "analysis produced no metrics"
+        where = f" See {outcome.log_path} for details." if outcome.log_path else ""
         return ArtifactResult(
-            status="error", files=outcome.new_root_files,
-            message=f"{analysis}: mu2e timed out after {timeout_s}s on "
-                    f"{len(paths)} input file(s). See {outcome.log_path}.",
-            metadata=job_metadata,
-        )
-
-    metrics = spec.parse(outcome.stdout)
-    if outcome.failed or metrics is None:
-        reason = (
-            f"mu2e exited {outcome.returncode}" if outcome.failed
-            else f"{analysis} summary block not found in mu2e output"
-        )
-        return ArtifactResult(
-            status="error", files=outcome.new_root_files,
-            message=f"{analysis}: {reason}. See {outcome.log_path} for the full log.",
-            metadata={**job_metadata, "returncode": outcome.returncode,
-                      "stdout_tail": outcome.stdout_tail()},
+            status="error", files=outcome.files,
+            message=f"{analysis}: {error}.{where}", metadata=metadata,
         )
 
     return ArtifactResult(
         status="success",
-        files=outcome.new_root_files,
-        message=(
-            f"{analysis} over {len(paths)} input file(s): "
-            f"{spec.summarize(metrics)}"
-        ),
-        metadata={**job_metadata, "returncode": outcome.returncode, **metrics},
+        files=outcome.files,
+        message=f"{analysis} over {len(paths)} input file(s): "
+                f"{spec.summarize(outcome.metrics)}",
+        metadata={**metadata, **outcome.metrics},
     )

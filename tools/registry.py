@@ -12,7 +12,7 @@ from importlib import import_module
 from .spec import AnalysisSpec
 
 # Module names under tools.analyses, each exposing SPEC.
-_ANALYSIS_MODULES = ("edep",)
+_ANALYSIS_MODULES = ("edep", "approx_ce_sensitivity")
 
 
 def _load() -> dict[str, AnalysisSpec]:
