@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "analysis-mcp-server"
+version = "0.1.0"
+description = "MCP server exposing Mu2e analysis fcl jobs (energy deposition, ...) as agent tools."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "mcp[cli]>=1.27,<2",
+    "pydantic>=2,<3",
+]
+
+[tool.mcp-server]
+tool_modules = ["tools"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["analysis_mcp_server*", "tools*"]

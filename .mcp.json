@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "mu2e-analysis": {
+      "command": "python3",
+      "args": ["-m", "analysis_mcp_server", "--transport", "stdio"]
+    }
+  }
+}
