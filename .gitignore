@@ -3,5 +3,9 @@ __pycache__/
 .venv/
 .pytest_cache/
 *.root
-mu2e.log
+*~
+*.log
+*.tmp
+*.save
 filelist.txt
+output/

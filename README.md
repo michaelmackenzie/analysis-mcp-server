@@ -288,6 +288,44 @@ Clients connect to `http://127.0.0.1:8000/mcp`. Stop it with **Ctrl+C**
 (Ctrl+Z only suspends it and keeps the port; just start again — a leftover
 `analysis_mcp_server` holding the port is cleared automatically).
 
+## A worked example
+
+`examples/simple_client.py` is a ~50-line MCP client that does what an agent
+would: start the server, list the tools, `list_analyses`, run `edep` over an
+art file you name, then feed the `nts.*.root` it wrote to
+`approx_ce_sensitivity`.
+
+```bash
+source /cvmfs/mu2e.opensciencegrid.org/setupmu2e-art.sh
+pyenv ana 2.7.0
+
+# the client starts the server itself over stdio
+python3 examples/simple_client.py ../dts.mmackenz.CeEndpoint.<...>.art
+```
+
+A quick check that skips the full job (and so the chained sensitivity, whose
+per-gen-event normalization `--max-events` invalidates):
+
+```bash
+python3 examples/simple_client.py path/to/some.art --max-events 200 --no-chain
+```
+
+Against a server you started by hand, same code over HTTP:
+
+```bash
+python3 -m analysis_mcp_server --transport streamable-http --port 8000 &
+python3 examples/simple_client.py path/to/some.art --url http://127.0.0.1:8000/mcp
+```
+
+The input path may be relative or use `~`; the client resolves it, since the
+tool itself takes only absolute paths (the job runs in `output_dir`, not in
+your shell's directory).
+
+Other flags: `--output-dir` (defaults to `output/example`), `--sig-eff`
+(handed to `approx_ce_sensitivity`), `--timeout-s`. There is no default input
+file: `edep` runs over any art file with the right products, while
+`approx_ce_sensitivity` only means anything for a CE signal sample.
+
 ## Use it from a client
 
 **Claude Code** — the checked-in `.mcp.json` already wires it up; or:

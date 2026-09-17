@@ -257,6 +257,7 @@ def _write_plots(outdir: Path, signal: Hist1D, dio_reco: Hist1D, cosmic: Hist1D,
     ax.set_xlabel("Energy (MeV)")
     ax.set_ylabel("Rate")
     ax.set_title("DIO spectrum")
+    ax.set_ylim(1.e-10, 1.e20)
     ax.legend(fontsize="small")
     fig.tight_layout()
     path = figdir / "dio.png"
