@@ -19,7 +19,7 @@ from tools import ANALYSES, list_analyses, run_analysis
 from tools.analyses import approx_ce_sensitivity as sens
 from tools.analyses.edep import parse_edep_summary
 from tools.mu2e_job import build_input_args, validate_input_paths
-from tools.root_hist import Hist1D
+from tools.spectrum import Kernel, Spectrum
 from tools.spec import ParamSpec
 
 # Verbatim shape of the block EdepAna_module.cc prints, with art's usual
@@ -72,88 +72,80 @@ def test_edep_parse_returns_none_on_truncated_summary():
     assert parse_edep_summary(truncated) is None
 
 
-# --- the histogram helper ----------------------------------------------------
+# --- the spectrum helper -----------------------------------------------------
 
-def test_hist_find_bin_edges_and_flow():
-    h = Hist1D(10, 0.0, 1.0)
-    assert h.find_bin(-0.1) == 0            # underflow
-    assert h.find_bin(0.0) == 1
-    assert h.find_bin(0.55) == 6
-    assert h.find_bin(1.0) == 11            # overflow
-    assert h.bin_width == 0.1
+def test_spectrum_axis_and_total():
+    s = Spectrum(np.full(10, 2.0), 0.0, 0.1)
+    assert s.nbins == 10 and abs(s.xmax - 1.0) < 1e-12
+    assert abs(s.centers()[0] - 0.05) < 1e-12
+    assert s.values.sum() == 20.0
 
 
-def test_hist_integral_is_content_sum_not_density():
-    h = Hist1D(4, 0.0, 4.0)
-    for i in range(1, 5):
-        h.set_content(i, 2.0)
-    assert h.integral() == 8.0              # not multiplied by bin width
-    assert h.integral(2, 3) == 4.0          # inclusive
+def test_spectrum_rebin_merges_groups_and_drops_leftovers():
+    s = Spectrum(np.arange(1.0, 11.0), 0.0, 1.0).rebin(3)
+    assert s.nbins == 3 and s.width == 3.0 and abs(s.xmax - 9.0) < 1e-12
+    assert list(s.values) == [6.0, 15.0, 24.0]   # the 10th bin is dropped
 
 
-def test_hist_fill_out_of_range_goes_to_flow_not_edges():
-    h = Hist1D(4, 0.0, 4.0)
-    h.fill([-1.0, 0.5, 9.0], 1.0)
-    assert h.content(0) == 1.0 and h.content(5) == 1.0
-    assert h.integral() == 1.0              # flow excluded
+def test_spectrum_regrid_sums_onto_a_coarser_axis():
+    fine = Spectrum(np.ones(100), 0.0, 0.1)          # 10 units over [0, 10)
+    coarse = fine.regrid(Spectrum(np.zeros(5), 0.0, 1.0))
+    assert coarse.nbins == 5 and list(coarse.values) == [10.0] * 5
+    assert coarse.values.sum() == 50.0               # half of it fell off the axis
 
 
-def test_hist_rebin_merges_groups_and_keeps_leftovers_in_overflow():
-    h = Hist1D(10, 0.0, 10.0)
-    for i in range(1, 11):
-        h.set_content(i, float(i))
-    h.rebin(3)
-    assert h.nbins == 3 and h.xmax == 9.0
-    assert [h.content(i) for i in (1, 2, 3)] == [6.0, 15.0, 24.0]
-    assert h.content(4) == 10.0             # the 10th bin went to overflow
+def test_gaussian_kernel_is_normalized_and_centered():
+    kernel = Kernel.gaussian(width=0.05, sigma=0.2)
+    assert abs(kernel.mass.sum() - 1.0) < 1e-12
+    spectrum = kernel.as_spectrum(0.05)
+    mpv, fwhm = sens.mpv_fwhm(spectrum)
+    assert abs(mpv) < 0.03                                  # centered on zero
+    assert abs(fwhm - 2.355 * 0.2) < 0.06                   # FWHM = 2.355 sigma
 
 
-# --- approx_ce_sensitivity: the physics pieces -------------------------------
+def test_kernel_from_density_keeps_the_response_total():
+    # A response carrying only half the probability (an efficiency folded in),
+    # on a coarser grid than the target.
+    response = Spectrum(np.full(10, 0.5 / (10 * 0.2)), -1.0, 0.2)
+    kernel = Kernel.from_density(response, width=0.05)
+    assert abs(kernel.mass.sum() - 0.5) < 1e-9
+
 
 def test_dio_spectrum_is_a_normalized_density():
     dio = sens.load_dio_spectrum()
     # Density in energy: sum(contents) * bin width == 1
-    assert abs(dio.integral() * dio.bin_width - 1.0) < 1e-9
+    assert abs(dio.values.sum() * dio.width - 1.0) < 1e-9
     # Falls steeply toward the CE endpoint
-    assert dio.content(dio.find_bin(60.0)) > dio.content(dio.find_bin(100.0))
-    assert dio.content(dio.find_bin(100.0)) > dio.content(dio.find_bin(104.5))
+    at = lambda e: dio.values[int((e - dio.xmin) / dio.width)]
+    assert at(60.0) > at(100.0) > at(104.5)
 
 
-def test_tracker_resolution_is_a_unit_gaussian_density():
-    res = sens.tracker_resolution(sigma=0.2)
-    assert abs(res.integral() * res.bin_width - 1.0) < 1e-6
-    mpv, fwhm = sens.mpv_fwhm(res)
-    assert abs(mpv) < 0.01                                  # centered on zero
-    assert abs(fwhm - 2.355 * 0.2) < 0.02                   # FWHM = 2.355 sigma
+def test_smear_conserves_total_and_shifts_by_the_response_mean():
+    true = Spectrum(np.zeros(200), 0.0, 0.1)
+    true.values[100] = 1.0                                  # delta at 10 MeV
+    response = Spectrum(np.zeros(200), -5.0, 0.05)          # delta at -2 MeV
+    response.values[59] = 1.0 / response.width
+
+    reco = true.smear(Kernel.from_density(response, true.width))
+    assert abs(reco.values.sum() - 1.0) < 1e-9              # probability kept
+    assert abs(reco.centers()[int(np.argmax(reco.values))] - 8.0) < 0.2
 
 
-def test_convolve_conserves_total_and_shifts_by_the_response_mean():
-    true = Hist1D(200, 0.0, 20.0)
-    true.set_content(true.find_bin(10.0), 1.0)              # delta at 10 MeV
-    response = Hist1D(200, -5.0, 5.0)                       # delta at -2 MeV
-    response.set_content(response.find_bin(-2.0), 1.0 / response.bin_width)
-
-    reco = sens.convolve(true, response)
-    assert abs(reco.integral() - 1.0) < 1e-9                # probability kept
-    assert abs(reco.bin_center(reco.get_maximum_bin()) - 8.0) < 0.1  # shifted
-
-
-def test_convolve_pushes_content_off_axis_into_flow():
-    true = Hist1D(100, 0.0, 10.0)
-    true.set_content(true.find_bin(1.0), 1.0)
-    response = Hist1D(100, -5.0, 5.0)
-    response.set_content(response.find_bin(-4.0), 1.0 / response.bin_width)
-    reco = sens.convolve(true, response)
-    assert reco.integral() < 1e-12                          # left the axis
-    assert reco.content(0) > 0.9                            # found in underflow
+def test_smear_drops_content_pushed_off_the_axis():
+    true = Spectrum(np.zeros(100), 0.0, 0.1)
+    true.values[10] = 1.0                                   # 1 MeV
+    response = Spectrum(np.zeros(100), -5.0, 0.1)
+    response.values[9] = 1.0 / response.width               # shift by -4 MeV
+    reco = true.smear(Kernel.from_density(response, true.width))
+    assert reco.values.sum() < 1e-12                        # left the axis
 
 
 def test_scan_finds_the_best_window():
-    signal, dio, cosmic = (Hist1D(100, 50.0, 150.0) for _ in range(3))
-    signal.values()[:] = 0.0
-    signal.values()[45:55] = 10.0        # a signal bump at ~95-105 MeV
-    dio.values()[:] = 1.0
-    cosmic.values()[:] = 1.0
+    signal, dio, cosmic = (Spectrum(np.zeros(100), 50.0, 1.0, name=n)
+                           for n in ("signal", "dio", "cosmic"))
+    signal.values[45:55] = 10.0          # a signal bump at ~95-105 MeV
+    dio.values[:] = 1.0
+    cosmic.values[:] = 1.0
     best, top = sens.scan_signal_box(signal, dio, cosmic)
     assert best["low_mev"] >= 50.0
     # The bump spans bins 46..55 -> centers 95.5..104.5
@@ -169,11 +161,12 @@ def test_scan_keeps_a_tiny_window_count_against_a_huge_spectrum_total():
     prefix sums to get a count of order 1 loses it completely to float
     cancellation, which silently reported dio_background = 0.
     """
-    signal, dio, cosmic = (Hist1D(100, 50.0, 150.0) for _ in range(3))
-    signal.values()[50:60] = 10.0
-    cosmic.values()[:] = 1.0
-    dio.values()[0] = 4.0e17          # enormous, far below the signal window
-    dio.values()[50:60] = 2.0e-1      # what we must still be able to see
+    signal, dio, cosmic = (Spectrum(np.zeros(100), 50.0, 1.0, name=n)
+                           for n in ("signal", "dio", "cosmic"))
+    signal.values[50:60] = 10.0
+    cosmic.values[:] = 1.0
+    dio.values[0] = 4.0e17            # enormous, far below the signal window
+    dio.values[50:60] = 2.0e-1        # what we must still be able to see
 
     best, _ = sens.scan_signal_box(signal, dio, cosmic)
     assert best["dio"] > 0.0, "tiny DIO count was lost to cancellation"

@@ -40,7 +40,7 @@ schema agents see.
 tools/
   spec.py             AnalysisSpec, ParamSpec, RunContext/RunOutcome, ArtifactResult
   mu2e_job.py         running mu2e: env setup, -s/-S inputs, logs, timeouts
-  root_hist.py        a small TH1-like histogram for converted ROOT macros
+  spectrum.py         bin contents on a uniform grid: rebin, regrid, smear
   registry.py         the catalogue: name -> AnalysisSpec
   analyses/
     edep.py                    energy deposition: fcl + summary parser
@@ -51,8 +51,8 @@ analysis_mcp_server/  generic drop-in wrapper (FastMCP): server.py, cli.py
 tests/test_tools.py   parsers, registry, input handling — no mu2e, no MCP
 ```
 
-The split that matters: **the shared machinery (`mu2e_job.py`, `root_hist.py`)
-knows how to run jobs and read histograms but nothing about physics;
+The split that matters: **the shared machinery (`mu2e_job.py`, `spectrum.py`)
+knows how to run jobs and handle binned spectra but nothing about physics;
 `analyses/*.py` knows the physics.** The registry joins them, and the two tools
 are generic over it.
 
@@ -174,14 +174,21 @@ beamline configurations, not a sensitivity calculation. Note it needs a **CE
 signal** sample — given a beam file where nothing leaves >10 MeV in the
 calorimeter it reports that plainly instead of dividing by zero.
 
-Two deviations from the macro, both deliberate:
+Three deviations from the macro, all deliberate:
 
-- It prints the 10 best windows to the log rather than all ~100k scanned.
+- It logs the best window for each of the 10 best lower edges rather than all
+  ~100k scanned — the top 10 overall only ever differ by a bin.
 - Window sums are accumulated from each window's own edge, never as
   differences of whole-spectrum prefix sums. The DIO spectrum spans ~18 orders
   of magnitude, and differencing totals of ~4e17 to get a count of order 1
   loses it entirely to float cancellation (it silently reported
   `dio_background = 0`). `tests/test_tools.py` locks this in.
+- Smearing is `np.convolve` against a kernel resampled onto the smeared
+  spectrum's own binning (`spectrum.py`), not a bin-by-bin redistribution: the
+  Gaussian resolution is integrated over each offset bin and the measured
+  response is interpolated rather than snapped to the nearest bin. On the
+  Run-1B CE sample that moves `dio_background` by ~2% and `sensitivity` by
+  0.01%.
 
 ## Adding an analysis
 

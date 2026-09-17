@@ -87,7 +87,7 @@ def run_analysis(
         data_files: Absolute paths to several input art files, analyzed
             together in one job. Only for "art_files" analyses.
         parameters: Analysis-specific physics knobs, e.g.
-            {"sig_eff": 0.1} for approx_ce_sensitivity. list_analyses reports
+            {"sig_eff": 2.5e-4} for approx_ce_sensitivity. list_analyses reports
             each analysis' parameters, defaults, and which are required.
         max_events: Process at most this many events (mu2e --nevts). Only for
             "art_files" analyses; useful for a quick check before a full run.

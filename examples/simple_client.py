@@ -81,7 +81,7 @@ def parse_args() -> argparse.Namespace:
              "event' metric is meaningless when this is set.",
     )
     parser.add_argument(
-        "--sig-eff", type=float, default=0.1,
+        "--sig-eff", type=float, default=2.5e-4,
         help="Signal efficiency handed to approx_ce_sensitivity.",
     )
     parser.add_argument(

@@ -24,20 +24,22 @@ The numbers are rough by construction — this is a figure of merit for
 comparing beamline configurations, not a sensitivity calculation.
 """
 
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
 
-from ..root_hist import Hist1D
+from ..spectrum import Kernel, Spectrum
 from ..spec import AnalysisSpec, ParamSpec, RunContext, RunOutcome
 
 # --- assumptions carried over from the macro ---------------------------------
 
 NPOT = 1.0e18                     # protons on target assumed
-SIGNAL_BR = 1.0e-13 / 0.609       # CE branching ratio for R_mue = 1e-9
+SIGNAL_BR = 1.0e-13 / 0.609       # CE branching ratio for R_mue = 1e-13
 MEAN_POT_PER_EVENT = 1.6e7        # 1BB
 ONSPILL_SECONDS_PER_EVENT = 1.695e-6
-COSMIC_RATE_PER_SECOND_PER_MEV = 2.0e4 / 1.1e7  # rough, per second per MeV/c
+# COSMIC_RATE_PER_SECOND_PER_MEV = 2.0e4 / 1.1e7  # rough, per second per MeV/c
+COSMIC_RATE_PER_SECOND_PER_MEV = 10. / 7.8e5  # rough, per second per MeV/c, taken from Run 1A mu- --> e- analysis
 DIO_RATE_FRACTION = 0.39          # DIO fraction feeding the rate normalization
 TRK_RESOLUTION_SIGMA_MEV = 0.2
 SIGNAL_BOX_MIN_MEV = 50.0         # below this DIO swamps everything anyway
@@ -64,7 +66,7 @@ class SensitivityError(RuntimeError):
 
 # --- pieces of the calculation -----------------------------------------------
 
-def load_dio_spectrum(table: Path = DIO_TABLE) -> Hist1D:
+def load_dio_spectrum(table: Path = DIO_TABLE) -> Spectrum:
     """The theoretical DIO spectrum as a probability density in energy.
 
     The table holds (energy, weight) rows on a 0.01 MeV grid; each row sets the
@@ -78,127 +80,74 @@ def load_dio_spectrum(table: Path = DIO_TABLE) -> Hist1D:
         raise SensitivityError(f"DIO table {table} is not two columns of numbers")
     energy, weight = data[:, 0], data[:, 1]
 
-    dio = Hist1D(DIO_NBINS, DIO_EMIN, DIO_EMAX, name="h_dio", title="DIO spectrum")
+    width = (DIO_EMAX - DIO_EMIN) / DIO_NBINS
+    values = np.zeros(DIO_NBINS)
     # Nudge left by half a bin so a tabulated energy lands in the bin it ends.
-    bins = dio.find_bin(energy - dio.bin_width / 2.0)
-    dio.contents[bins] = weight
+    index = np.floor((energy - width / 2.0 - DIO_EMIN) / width).astype(np.int64)
+    inside = (index >= 0) & (index < DIO_NBINS)
+    values[index[inside]] = weight[inside]
 
-    total = dio.integral()
+    total = values.sum()
     if total <= 0.0:
         raise SensitivityError(f"DIO table {table} summed to zero weight")
-    return dio.scale(1.0 / (dio.bin_width * total))
+    return Spectrum(values / (total * width), DIO_EMIN, width,
+                    name="dio", title="DIO spectrum")
 
 
-def tracker_resolution(sigma: float = TRK_RESOLUTION_SIGMA_MEV,
-                       nbins: int = 5000, half_range: float = 5.0) -> Hist1D:
-    """Gaussian tracker response as a density in energy offset."""
-    res = Hist1D(nbins, -half_range, half_range, name="response", title="response")
-    centers = res.centers()
-    res.values()[:] = np.exp(-0.5 * (centers / sigma) ** 2) / (
-        sigma * np.sqrt(2.0 * np.pi)
-    )
-    return res
-
-
-def convolve(true_hist: Hist1D, response: Hist1D, name: str = "") -> Hist1D:
-    """Smear `true_hist` by `response`, a density of energy offsets.
-
-    Keeps the binning of `true_hist`: each true bin's content is redistributed
-    to bins at (true energy + offset), weighted by the response probability
-    mass in each offset bin. Content pushed off the axis lands in the flow
-    bins rather than piling up at the edges.
-    """
-    reco = Hist1D(true_hist.nbins, true_hist.xmin, true_hist.xmax,
-                  name=name or f"{true_hist.name}_reco", title=true_hist.title)
-
-    true_centers = true_hist.centers()
-    true_values = true_hist.values()
-    # Bins with nothing in them contribute nothing; skipping them is what makes
-    # the 11000 x 5000 DIO convolution affordable.
-    filled = np.flatnonzero(true_values != 0.0)
-    if filled.size == 0:
-        return reco
-    centers, weights = true_centers[filled], true_values[filled]
-
-    offsets = response.centers()
-    probabilities = response.values() * response.bin_width
-    active = np.flatnonzero(probabilities != 0.0)
-
-    for joffset in active:
-        target = reco.find_bin(centers + offsets[joffset])
-        np.add.at(reco.contents, target, weights * probabilities[joffset])
-    return reco
-
-
-def mpv_fwhm(hist: Hist1D) -> tuple[float, float]:
+def mpv_fwhm(spectrum: Spectrum) -> tuple[float, float]:
     """Rough most-probable value and full width at half maximum."""
-    max_bin = hist.get_maximum_bin()
-    mpv = float(hist.bin_center(max_bin))
-    half = hist.content(max_bin) / 2.0
-    first = hist.find_first_bin_above(half)
-    last = max(first, hist.find_last_bin_above(half))
-    if first < 0:
+    peak = int(np.argmax(spectrum.values))
+    mpv = float(spectrum.centers()[peak])
+    above = np.flatnonzero(spectrum.values > spectrum.values[peak] / 2.0)
+    if above.size == 0:
         return mpv, 0.0
-    return mpv, hist.bin_up_edge(last) - hist.bin_low_edge(first)
+    edges = spectrum.edges()
+    return mpv, float(edges[above[-1] + 1] - edges[above[0]])
 
 
-def scan_signal_box(signal: Hist1D, dio: Hist1D, cosmic: Hist1D,
+def scan_signal_box(signal: Spectrum, dio: Spectrum, cosmic: Spectrum,
                     box_min_mev: float = SIGNAL_BOX_MIN_MEV,
                     top_n: int = 10) -> tuple[dict[str, float], list[dict]]:
     """Find the window [x1, x2] maximizing S/sqrt(B).
 
-    Scans every pair of signal bins with x1 >= box_min_mev.
-
-    Window sums are accumulated from each window's own lower edge outward,
-    never as a difference of whole-spectrum prefix sums: the DIO spectrum spans
-    ~18 orders of magnitude, so subtracting two such totals to get a count of
-    order 1 loses the answer entirely to float cancellation.
+    The three spectra share one binning, so a window is a slice and the scan is
+    a cumulative sum per lower edge. Those sums run outward from each window's
+    own lower edge, never as a difference of whole-spectrum prefix sums: the
+    DIO spectrum spans ~18 orders of magnitude, so subtracting two such totals
+    to get a count of order 1 loses the answer entirely to float cancellation.
     """
+    for other in (dio, cosmic):
+        if (other.nbins, other.xmin, other.width) != (signal.nbins, signal.xmin,
+                                                      signal.width):
+            raise SensitivityError(
+                f"'{other.name}' is not on the signal's binning; regrid it first"
+            )
+
     centers = signal.centers()
-    first_bin = int(np.searchsorted(centers, box_min_mev)) + 1
-
-    # Tail sums for the loop guards, summed inward from the top edge.
-    signal_tail = np.cumsum(signal.values()[::-1])[::-1]
-
-    def running(hist: Hist1D, lo: int) -> np.ndarray:
-        """Sums from bin `lo` outward: running[k] covers bins lo..lo+k."""
-        return np.cumsum(hist.contents[max(lo, 0):])
-
+    first_bin = int(np.searchsorted(centers, box_min_mev))
     best: dict[str, float] | None = None
-    tried: list[dict] = []
+    per_edge: list[dict] = []
 
-    for ibin in range(first_bin, signal.nbins + 1):
-        # Nothing left to the right: no wider window can help.
-        if signal_tail[ibin - 1] <= 0.0:
-            break
-        x1 = float(centers[ibin - 1])
-        s_lo, d_lo, c_lo = (h.find_bin(x1) for h in (signal, dio, cosmic))
-        s_run, d_run, c_run = (running(h, lo) for h, lo in
-                               ((signal, s_lo), (dio, d_lo), (cosmic, c_lo)))
-
-        def window(run: np.ndarray, lo: int, hi: int) -> float:
-            """Sum of bins lo..hi, clipped to what the histogram holds."""
-            index = min(max(hi - lo, 0), run.size - 1)
-            return float(run[index]) if run.size else 0.0
-
-        for jbin in range(ibin, signal.nbins + 1):
-            if signal_tail[jbin - 1] <= 0.0:
-                break
-            x2 = float(centers[jbin - 1])
-            s = window(s_run, s_lo, signal.find_bin(x2))
-            d = window(d_run, d_lo, dio.find_bin(x2))
-            c = window(c_run, c_lo, cosmic.find_bin(x2))
-            background = d + c
-            if s <= 0.0 or background <= 0.0:
-                continue
-            entry = {
-                "low_mev": x1, "high_mev": x2, "signal": s, "dio": d,
-                "cosmic": c, "background": background,
-                "sensitivity": s / np.sqrt(background),
-            }
-            tried.append(entry)
-            if best is None or entry["sensitivity"] > best["sensitivity"]:
-                best = entry
+    for ibin in range(first_bin, signal.nbins):
+        s = np.cumsum(signal.values[ibin:])
+        d = np.cumsum(dio.values[ibin:])
+        c = np.cumsum(cosmic.values[ibin:])
+        background = d + c
+        usable = np.flatnonzero((s > 0.0) & (background > 0.0))
+        if usable.size == 0:
+            continue
+        ratio = s[usable] / np.sqrt(background[usable])
+        jbest = usable[int(np.argmax(ratio))]
+        entry = {
+            "low_mev": float(centers[ibin]),
+            "high_mev": float(centers[ibin + jbest]),
+            "signal": float(s[jbest]), "dio": float(d[jbest]),
+            "cosmic": float(c[jbest]), "background": float(background[jbest]),
+            "sensitivity": float(s[jbest] / np.sqrt(background[jbest])),
+        }
+        per_edge.append(entry)
+        if best is None or entry["sensitivity"] > best["sensitivity"]:
+            best = entry
 
     if best is None:
         raise SensitivityError(
@@ -206,16 +155,18 @@ def scan_signal_box(signal: Hist1D, dio: Hist1D, cosmic: Hist1D,
             "histograms are probably empty above "
             f"{box_min_mev:g} MeV"
         )
-    tried.sort(key=lambda e: e["sensitivity"], reverse=True)
-    return best, tried[:top_n]
+    # The best window for each lower edge, ranked -- more informative in the
+    # log than the top 10 overall, which only ever differ by a bin.
+    per_edge.sort(key=lambda e: e["sensitivity"], reverse=True)
+    return best, per_edge[:top_n]
 
 
 # --- plots -------------------------------------------------------------------
 
-def _write_plots(outdir: Path, signal: Hist1D, dio_reco: Hist1D, cosmic: Hist1D,
-                 response: Hist1D, resolution: Hist1D, dio_true: Hist1D,
-                 extras: dict[str, Hist1D], best: dict[str, float],
-                 mpv: float, fwhm: float) -> list[str]:
+def _write_plots(outdir: Path, signal: Spectrum, dio_reco: Spectrum,
+                 cosmic: Spectrum, response: Spectrum, resolution: Spectrum,
+                 dio_true: Spectrum, extras: dict[str, Spectrum],
+                 best: dict[str, float], mpv: float, fwhm: float) -> list[str]:
     """Reproduce the macro's figures. Returns the paths written."""
     import matplotlib
     matplotlib.use("Agg")
@@ -225,9 +176,8 @@ def _write_plots(outdir: Path, signal: Hist1D, dio_reco: Hist1D, cosmic: Hist1D,
     figdir.mkdir(parents=True, exist_ok=True)
     written: list[str] = []
 
-    def step(ax, hist: Hist1D, **kwargs):
-        edges = np.linspace(hist.xmin, hist.xmax, hist.nbins + 1)
-        ax.stairs(hist.values(), edges, **kwargs)
+    def step(ax, spectrum: Spectrum, **kwargs):
+        ax.stairs(spectrum.values, spectrum.edges(), **kwargs)
 
     # signal vs background — the one that matters
     fig, ax = plt.subplots(figsize=(8, 6))
@@ -240,7 +190,7 @@ def _write_plots(outdir: Path, signal: Hist1D, dio_reco: Hist1D, cosmic: Hist1D,
     ax.set_xlim(min(95.0, mpv - 1.5 * fwhm), max(105.0, mpv + 1.5 * fwhm))
     ax.set_ylim(1e-3, 1e4)
     ax.set_xlabel("Energy (MeV)")
-    ax.set_ylabel(f"Rate / {signal.bin_width:.1f} MeV")
+    ax.set_ylabel(f"Rate / {signal.width:.1f} MeV")
     ax.set_title(f"Signal vs. background — S/sqrt(B) = {best['sensitivity']:.3g}")
     ax.legend(ncols=2, fontsize="small")
     fig.tight_layout()
@@ -300,7 +250,7 @@ def _write_plots(outdir: Path, signal: Hist1D, dio_reco: Hist1D, cosmic: Hist1D,
 
 # --- the runner --------------------------------------------------------------
 
-def _read_hist(rootfile, path: str, required: bool = True) -> Hist1D | None:
+def _read_hist(rootfile, path: str, required: bool = True) -> Spectrum | None:
     try:
         obj = rootfile[path]
     except KeyError:
@@ -309,7 +259,7 @@ def _read_hist(rootfile, path: str, required: bool = True) -> Hist1D | None:
                 f"histogram '{path}' not found — is this an EdepAna nts.*.root file?"
             )
         return None
-    return Hist1D.from_uproot(obj, name=path.rsplit("/", 1)[-1])
+    return Spectrum.from_uproot(obj, name=path.rsplit("/", 1)[-1])
 
 
 def run(context: RunContext) -> RunOutcome:
@@ -343,26 +293,33 @@ def run(context: RunContext) -> RunOutcome:
                 )
 
         # 1-2. signal shape -> rate, then smeared by the tracker resolution
-        signal.rebin(SIGNAL_REBIN)
-        signal.scale(npot * SIGNAL_BR * sig_eff / signal.entries)
-        response.scale(sig_eff / response.entries / response.bin_width)
-        resolution = tracker_resolution()
-        signal_reco = convolve(signal, resolution, name="signal_reco")
+        signal = signal.rebin(SIGNAL_REBIN)
+        signal = signal.scaled(npot * SIGNAL_BR * sig_eff / signal.entries)
+        # A density in energy offset. The efficiency is folded in here, so it
+        # rides along with the response into the smeared DIO spectrum.
+        response = response.scaled(sig_eff / response.entries / response.width)
+        signal_reco = signal.smear(
+            Kernel.gaussian(signal.width, TRK_RESOLUTION_SIGMA_MEV)
+        )
         mpv, fwhm = mpv_fwhm(signal_reco)
 
-        # 3. DIO: theory spectrum -> rate, smeared by energy loss + resolution
-        dio_true = load_dio_spectrum()
-        dio_true.scale(DIO_RATE_FRACTION * sig_eff * npot)
-        dio_reco = convolve(convolve(dio_true, response), resolution, name="dio_reco")
-        dio_reco.rebin(int(signal_reco.bin_width / dio_reco.bin_width))
+        # 3. DIO: theory spectrum -> rate, smeared by the energy loss and then
+        # by the resolution on its own fine binning, then put on signal's bins.
+        dio_true = load_dio_spectrum().scaled(DIO_RATE_FRACTION * sig_eff * npot)
+        resolution = Kernel.gaussian(dio_true.width, TRK_RESOLUTION_SIGMA_MEV)
+        dio_reco = (dio_true
+                    .smear(Kernel.from_density(response, dio_true.width))
+                    .smear(resolution)
+                    .regrid(signal_reco))
 
         # 4. cosmics: flat rate per MeV/c over the implied on-spill time
         events = npot / MEAN_POT_PER_EVENT
         onspill_seconds = events * ONSPILL_SECONDS_PER_EVENT
         cosmic_rate = COSMIC_RATE_PER_SECOND_PER_MEV * onspill_seconds
-        cosmic = Hist1D(signal_reco.nbins, signal_reco.xmin, signal_reco.xmax,
-                        name="cosmic")
-        cosmic.values()[:] = cosmic_rate * cosmic.bin_width
+        cosmic = replace(
+            signal_reco, name="cosmic", title="Cosmics",
+            values=np.full(signal_reco.nbins, cosmic_rate * signal_reco.width),
+        )
 
         # 5. best window
         best, top = scan_signal_box(signal_reco, dio_reco, cosmic)
@@ -409,7 +366,8 @@ def run(context: RunContext) -> RunOutcome:
     log_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
     files = _write_plots(outdir, signal_reco, dio_reco, cosmic, response,
-                         resolution, dio_true, extras, best, mpv, fwhm)
+                         resolution.as_spectrum(dio_true.width, "resolution"),
+                         dio_true, extras, best, mpv, fwhm)
 
     return RunOutcome(
         metrics=metrics,
