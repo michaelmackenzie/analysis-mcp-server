@@ -11,6 +11,7 @@ from typing import Annotated, Any, Literal
 
 from pydantic import Field, validate_call
 
+from .mu2e_env import current as current_env
 from .mu2e_job import validate_input_paths
 from .registry import ANALYSES, ANALYSIS_NAMES
 from .spec import ArtifactResult, RunContext
@@ -26,7 +27,9 @@ def list_analyses() -> ArtifactResult:
 
     Use this tool first to discover valid `analysis` names, what each measures,
     which metric names it reports (and their units), which parameters it takes,
-    and what its input file must be. `input_kind` says what to feed it:
+    and what its input file must be. It also names the Offline environment the
+    server runs mu2e jobs in — a muse work area, a Musing, or a code tarball —
+    which is fixed when the server starts. `input_kind` says what to feed it:
 
       "art_files"  mu2e art file(s) — pass data_file or data_files
       "root_file"  a ROOT file written by an earlier analysis (see
@@ -35,19 +38,21 @@ def list_analyses() -> ArtifactResult:
     Chaining: an analysis whose `produced_by` names another should be given a
     ROOT file from that one's `files` output.
     """
+    env = current_env()
     catalogue = {name: spec.describe() for name, spec in sorted(ANALYSES.items())}
     missing = [
         name for name, entry in catalogue.items()
         if entry.get("fcl_exists") is False
     ]
-    message = f"{len(catalogue)} analyses available: {', '.join(catalogue)}."
+    message = (f"{len(catalogue)} analyses available: {', '.join(catalogue)}. "
+               f"mu2e jobs run against {env.describe()}.")
     if missing:
         message += f" WARNING: fcl file missing for {', '.join(missing)}."
     return ArtifactResult(
         status="success",
         files=[],
         message=message,
-        metadata={"analyses": catalogue},
+        metadata={"analyses": catalogue, "environment": env.describe()},
     )
 
 
@@ -133,12 +138,16 @@ def run_analysis(
         return fail("invalid input file(s): " + "; ".join(problems),
                     data_files=[str(p) for p in paths])
 
-    if spec.fcl is not None and not spec.fcl.exists():
-        return fail(f"fcl not found: {spec.fcl}", fcl=str(spec.fcl))
+    env = current_env()
+    outdir = Path(output_dir).expanduser().resolve()
+    # Only code already on disk can be checked up front; for a Musing the
+    # answer comes from art when the job runs.
+    if spec.fcl is not None and (problem := env.missing_fcl(spec.fcl, outdir)):
+        return fail(problem, fcl=str(spec.fcl), environment=env.describe())
 
     outcome = spec.run(RunContext(
         input_paths=paths,
-        outdir=Path(output_dir).expanduser().resolve(),
+        outdir=outdir,
         params=params,
         timeout_s=timeout_s,
         max_events=max_events,
@@ -154,7 +163,8 @@ def run_analysis(
         "n_input_files": len(paths),
         **({"parameters": params} if params else {}),
         **({"max_events": max_events} if max_events is not None else {}),
-        **({"fcl": str(spec.fcl)} if spec.fcl is not None else {}),
+        **({"fcl": str(spec.fcl), "environment": env.describe()}
+           if spec.fcl is not None else {}),
         **outcome.extra,
     }
     if outcome.log_path is not None:

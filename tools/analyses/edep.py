@@ -6,11 +6,14 @@ event. The parser reads the summary block EdepAna_module.cc prints at endJob
 """
 
 import re
+from pathlib import Path
 
-from ..mu2e_job import MUSE_WORKAREA, run_mu2e_job
+from ..mu2e_job import run_mu2e_job
 from ..spec import AnalysisSpec, RunContext, RunOutcome
 
-FCL = MUSE_WORKAREA / "Mu2eOptAna" / "fcl" / "edep.fcl"
+# Relative: resolved against the configured code (a work area or an
+# unpacked tarball), or left to art's FHICL_FILE_PATH for a Musing.
+FCL = Path("Mu2eOptAna/fcl/edep.fcl")
 
 # Matches the block EdepAna_module.cc prints, e.g.:
 #   EdepAna summary:

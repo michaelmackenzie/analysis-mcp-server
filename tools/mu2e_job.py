@@ -1,29 +1,18 @@
 """Running a mu2e job — the part every analysis shares.
 
 No analysis-specific knowledge lives here: callers supply an fcl and get back
-the job's output. Two things about the environment drive the shape of this
-module:
-
-* `mu2e` only exists after the Offline environment is set up, so every job
-  re-sources it in a fresh bash subprocess instead of assuming the server
-  process inherited it.
-* Analysis modules like `EdepAna` are *locally built* (not in the Offline
-  release yet), so `muse setup` must run from the muse work area — the one
-  holding `backing -> .../Musings/SimJob/Run1Baq` and
-  `build/<platform>/Mu2eOptAna/lib`. Running it anywhere else leaves the
-  module off CET_PLUGIN_PATH and art dies with 'Library specification
-  "EdepAna" does not correspond to any library'.
+the job's output. `mu2e` exists only after the Offline environment is set up,
+so every job runs in a fresh bash that sets it up first, rather than assuming
+the server process inherited anything. Which code that is — a muse work area,
+a Musing, or a code tarball — is `mu2e_env`'s business; this module asks it
+for the commands and for where the fcl lives.
 """
 
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
-# The muse work area: `muse setup` runs here so the local Mu2eOptAna build and
-# the backing release both land on the path.
-MUSE_WORKAREA = Path("/exp/mu2e/app/users/mmackenz/mu2eopt")
-
-MU2E_ENV_SETUP = "source /cvmfs/mu2e.opensciencegrid.org/setupmu2e-art.sh"
+from .mu2e_env import Mu2eEnv, current as current_env
 
 
 @dataclass
@@ -38,6 +27,7 @@ class JobOutcome:
     log_path: Path
     input_paths: list[Path]
     input_flag: str  # "-s" or "-S"
+    environment: str  # which Offline setup ran, as mu2e_env describes it
     file_list_path: Path | None
     written_root_files: list[str] = field(default_factory=list)
 
@@ -117,6 +107,7 @@ def run_mu2e_job(
     timeout_s: int,
     max_events: int | None = None,
     log_name: str = "mu2e.log",
+    env: Mu2eEnv | None = None,
 ) -> JobOutcome:
     """Run `mu2e -c <fcl> -s|-S <input>` in outdir and capture everything.
 
@@ -124,7 +115,13 @@ def run_mu2e_job(
     ROOT files the job wrote there (TFileService output), whether they were
     new or overwrote a previous run's — outputs, logs and file lists are all
     simply overwritten, so a directory can be reused.
+
+    `env` says where Offline comes from; the configured one is used by
+    default. `fcl` may be relative, in which case it is resolved against the
+    environment's code when that is a directory on disk, and otherwise handed
+    to art to find on FHICL_FILE_PATH.
     """
+    env = env or current_env()
     outdir.mkdir(parents=True, exist_ok=True)
     log_path = outdir / log_name
     before = root_snapshot(outdir)
@@ -136,13 +133,11 @@ def run_mu2e_job(
 
     # $1 = input (art file or file list), $2 = output dir — passed as bash
     # positional parameters so paths never need shell quoting.
-    script = (
-        f'cd "{MUSE_WORKAREA}" && '
-        f"{MU2E_ENV_SETUP} && "
-        "muse setup && "
-        'cd "$2" && '
-        f'mu2e -c "{fcl}" {input_flag} "$1"{nevts}'
-    )
+    script = " && ".join([
+        *env.setup_commands(outdir),
+        'cd "$2"',
+        f'mu2e -c "{env.resolve_fcl(fcl, outdir)}" {input_flag} "$1"{nevts}',
+    ])
     try:
         proc = subprocess.run(
             ["bash", "-lc", script, "_", input_arg, str(outdir)],
@@ -161,6 +156,7 @@ def run_mu2e_job(
 
     inputs_note = "\n".join(f"  {p}" for p in input_paths)
     log_path.write_text(
+        f"# {env.describe()}\n"
         f"$ {script}\n({len(input_paths)} input file(s), {input_flag})\n"
         f"{inputs_note}\n\n--- stdout ---\n{stdout}\n\n--- stderr ---\n{stderr}\n",
         encoding="utf-8",
@@ -175,6 +171,7 @@ def run_mu2e_job(
         log_path=log_path,
         input_paths=list(input_paths),
         input_flag=input_flag,
+        environment=env.describe(),
         file_list_path=file_list_path,
         written_root_files=written_root_files(outdir, before),
     )

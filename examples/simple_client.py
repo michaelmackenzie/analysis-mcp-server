@@ -35,9 +35,16 @@ metrics are meaningless with --max-events, so skip the chained sensitivity):
 
 Against a server you started by hand, which is the same code over HTTP:
 
-    python3 -m analysis_mcp_server --transport streamable-http --port 8000 &
+    python3 -m analysis_mcp_server --transport streamable-http --port 8000 \
+        --work-area /exp/mu2e/app/users/mmackenz/mu2eopt &
     python3 examples/simple_client.py path/to/some.art \
         --url http://127.0.0.1:8000/mcp
+
+Where Offline comes from is the server's own setting, and this client starts
+the server with --work-area pointing at the local muse area above. Pass
+--musing 'SimJob MDC2025au' or --code-tarball <file> to set up a published
+Musing or a code tarball instead; with --url the running server's setting
+applies and these are ignored.
 
 There is no default input file on purpose: `edep` runs over whatever art file
 you point it at, and `approx_ce_sensitivity` only means anything for a CE
@@ -57,6 +64,12 @@ from mcp.client.stdio import stdio_client
 from mcp.client.streamable_http import streamablehttp_client
 
 REPO = Path(__file__).resolve().parent.parent
+
+# The muse work area these examples were written against: a local build of
+# Mu2eOptAna over a Run-1B backing release, which is what `edep` (the locally
+# built EdepAna module) needs. --musing or --code-tarball point the server
+# somewhere else instead.
+WORK_AREA = "/exp/mu2e/app/users/mmackenz/mu2eopt"
 
 
 def parse_args() -> argparse.Namespace:
@@ -80,7 +93,32 @@ def parse_args() -> argparse.Namespace:
         "--url",
         help="Connect to an already-running streamable-http server "
              "(e.g. http://127.0.0.1:8000/mcp). Without it the client starts "
-             "the server itself over stdio.",
+             "the server itself over stdio. That server carries its own "
+             "Offline setup, so the code options below do not apply to it.",
+    )
+    code = parser.add_mutually_exclusive_group()
+    code.add_argument(
+        "--work-area", default=WORK_AREA,
+        help="Muse work area the server sets up in.",
+    )
+    code.add_argument(
+        "--musing", metavar="'NAME VERSION'",
+        help="Set up a published Musing instead, e.g. 'SimJob MDC2025au'. "
+             "Note edep needs the locally built EdepAna, which a bare Musing "
+             "does not have.",
+    )
+    code.add_argument(
+        "--code-tarball",
+        help="Set up an unpacked code tarball instead.",
+    )
+    parser.add_argument(
+        "--code-dir",
+        help="Where --code-tarball is unpacked. Worth setting to reuse one "
+             "unpacking across runs; the default unpacks beside each job.",
+    )
+    parser.add_argument(
+        "--code-subdir",
+        help="Directory inside the unpacked tarball to run muse setup in.",
     )
     parser.add_argument(
         "--max-events", type=int,
@@ -169,16 +207,31 @@ def show_result(result: dict[str, Any], metrics: list[str]) -> None:
     print(f"  log    : {meta.get('log_path', '(none)')}")
 
 
-async def connect(stack: AsyncExitStack, url: str | None) -> ClientSession:
-    """Open a session, either against `url` or a server we start ourselves."""
-    if url:
-        print(f"Connecting to {url} ...")
-        read, write, _ = await stack.enter_async_context(streamablehttp_client(url))
+def code_args(args: argparse.Namespace) -> list[str]:
+    """The server flags saying where Offline comes from: one of the three."""
+    if args.musing:
+        return ["--musing", args.musing]
+    if args.code_tarball:
+        return ["--code-tarball", args.code_tarball,
+                *(["--code-dir", args.code_dir] if args.code_dir else []),
+                *(["--code-subdir", args.code_subdir] if args.code_subdir else [])]
+    return ["--work-area", args.work_area]
+
+
+async def connect(stack: AsyncExitStack, args: argparse.Namespace) -> ClientSession:
+    """Open a session, either against `--url` or a server we start ourselves."""
+    if args.url:
+        print(f"Connecting to {args.url} ...")
+        read, write, _ = await stack.enter_async_context(
+            streamablehttp_client(args.url)
+        )
     else:
-        print("Starting the server over stdio ...")
+        server_args = ["-m", "analysis_mcp_server", "--transport", "stdio",
+                       *code_args(args)]
+        print(f"Starting the server over stdio: {' '.join(code_args(args))} ...")
         server = StdioServerParameters(
             command=sys.executable,
-            args=["-m", "analysis_mcp_server", "--transport", "stdio"],
+            args=server_args,
             cwd=str(REPO),
         )
         read, write = await stack.enter_async_context(stdio_client(server))
@@ -202,7 +255,7 @@ async def main() -> int:
             return 2
 
     async with AsyncExitStack() as stack:
-        session = await connect(stack, args.url)
+        session = await connect(stack, args)
 
         tools = await session.list_tools()
         print(f"Tools: {', '.join(tool.name for tool in tools.tools)}")
@@ -211,6 +264,7 @@ async def main() -> int:
         print("\n=== list_analyses ===")
         catalogue = payload(await session.call_tool("list_analyses", {}))
         print(catalogue["message"])
+        print(f"Offline environment: {catalogue['metadata']['environment']}")
         analyses = catalogue["metadata"]["analyses"]
         show_catalogue(analyses)
 

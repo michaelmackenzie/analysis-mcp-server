@@ -21,6 +21,8 @@ from typing import Any, Callable, Literal
 
 from pydantic import BaseModel
 
+from .mu2e_env import current as current_env
+
 InputKind = Literal["art_files", "root_file"]
 ParamKind = Literal["number", "text"]
 
@@ -148,7 +150,9 @@ class AnalysisSpec:
     parameters: tuple[ParamSpec, ...] = ()
     input_hint: str = ""
     produced_by: tuple[str, ...] = ()
-    fcl: Path | None = None  # art_files analyses only; shown by list_analyses
+    # art_files analyses only, relative to the configured code (e.g.
+    # Mu2eOptAna/fcl/edep.fcl); resolved per environment by list_analyses.
+    fcl: Path | None = None
 
     def describe(self) -> dict[str, Any]:
         """The registry entry as list_analyses reports it."""
@@ -163,8 +167,12 @@ class AnalysisSpec:
         if self.produced_by:
             entry["produced_by"] = list(self.produced_by)
         if self.fcl is not None:
-            entry["fcl"] = str(self.fcl)
-            entry["fcl_exists"] = self.fcl.exists()
+            env = current_env()
+            entry["fcl"] = str(env.resolve_fcl(self.fcl))
+            # None where only art can tell: a Musing's fcl comes off
+            # FHICL_FILE_PATH, and a per-job tarball is not unpacked yet.
+            entry["fcl_exists"] = (None if env.base_dir() is None
+                                   else env.missing_fcl(self.fcl) is None)
         return entry
 
     def resolve_params(self, supplied: dict[str, Any] | None) -> dict[str, float | str]:

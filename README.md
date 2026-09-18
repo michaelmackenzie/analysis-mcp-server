@@ -40,7 +40,8 @@ schema agents see.
 ```
 tools/
   spec.py             AnalysisSpec, ParamSpec, RunContext/RunOutcome, ArtifactResult
-  mu2e_job.py         running mu2e: env setup, -s/-S inputs, logs, timeouts
+  mu2e_env.py         where Offline comes from: work area, Musing, or tarball
+  mu2e_job.py         running mu2e: -s/-S inputs, logs, timeouts
   spectrum.py         bin contents on a uniform grid: rebin, regrid, smear
   registry.py         the catalogue: name -> AnalysisSpec
   analyses/
@@ -295,25 +296,57 @@ source /cvmfs/mu2e.opensciencegrid.org/setupmu2e-art.sh
 pyenv ana            # Python 3.12 with mcp + pydantic
 ```
 
-The tool sets up mu2e **itself**, once per job, in a fresh bash subprocess:
+The server sets up mu2e **itself**, once per job, in a fresh bash subprocess,
+so it does not care whether the shell that launched it had the Offline
+environment. Where that Offline comes from is one setting, fixed when the
+server starts — `tools/mu2e_env.py` is the only place that knows how:
+
+| flag | environment variable | what a job runs |
+|---|---|---|
+| `--work-area <dir>` | `MU2E_WORK_AREA` | `cd <dir> && muse setup` |
+| `--musing 'SimJob MDC2025au'` | `MU2E_MUSING` | `muse setup SimJob MDC2025au` |
+| `--code-tarball <file>` | `MU2E_CODE_TARBALL` | unpack it, then `muse setup` in the tree |
 
 ```bash
-cd /exp/mu2e/app/users/mmackenz/mu2eopt/   # the muse work area
-source /cvmfs/mu2e.opensciencegrid.org/setupmu2e-art.sh
-muse setup                                  # backing -> Musings/SimJob/Run1Baq
-mu2e -c <fcl> -s <data file>
+python3 -m analysis_mcp_server --transport stdio \
+    --work-area /exp/mu2e/app/users/mmackenz/mu2eopt
+python3 -m analysis_mcp_server --transport stdio --musing 'SimJob MDC2025au'
+python3 -m analysis_mcp_server --transport stdio --code-tarball ~/code.tar
 ```
 
-so the server does not care whether the shell that launched it had the
-Offline environment. `MUSE_WORKAREA` in `tools/mu2e_job.py` is the one path
-that encodes this.
+The flags are mutually exclusive; with none of them (and no environment
+variable) the server falls back to `DEFAULT_WORK_AREA` in `tools/mu2e_env.py`.
+A work area that is not a directory, a tarball that is not a file, or a Musing
+without a version is a startup error naming itself, not a failure inside the
+first job. `list_analyses` reports the environment in use, and every mu2e
+result carries it in `metadata.environment`, so a number can be traced to the
+code that produced it.
 
-> **Why `muse setup` must run in the work area**: `EdepAna` is a locally built
-> module (not in the Offline release yet). Its library comes from
+A tarball is unpacked once — into `<output_dir>/code` by default, so runs stay
+self-contained, or into `--code-dir <dir>` to share one unpacking between
+them. A `<dir>.unpacked` marker beside it means later jobs reuse it rather
+than unpacking again. `muse setup` runs in the unpacked root, or in its single
+top-level directory if that is all the tarball holds; `--code-subdir` says so
+explicitly when it holds something else.
+
+### Which analyses a given environment can run
+
+Analyses name their fcl **relative** to that code — `Mu2eOptAna/fcl/edep.fcl`.
+For a work area or an unpacked tarball that is a path on disk, so a missing
+fcl is caught before the job starts and `list_analyses` reports `fcl_exists`.
+A Musing has no directory of ours to look in: the relative path goes to
+`mu2e` and art resolves it on `FHICL_FILE_PATH`, `fcl_exists` comes back
+`null`, and a fcl that is not there fails in the job with art's own
+`Can't find file "..."`, which the result carries in `metadata.stdout_tail`.
+
+> **Why the analyses here want the work area**: `EdepAna` is a locally built
+> module (not in any Offline release). Its library comes from
 > `build/al9-prof-e29-p103/Mu2eOptAna/lib/`, which only lands on
-> `CET_PLUGIN_PATH` when `muse setup` runs in the area holding `backing`.
-> Run it anywhere else and art dies with
-> `Library specification "EdepAna" does not correspond to any library`.
+> `CET_PLUGIN_PATH` when `muse setup` runs in the area holding `backing`, and
+> `Mu2eOptAna/fcl/*.fcl` only lives there too. Run `edep` or `muon_stop_rate`
+> against a bare `SimJob` Musing and the job fails plainly — tarball that work
+> area up (`tar -cf code.tar backing build Mu2eOptAna`) and `--code-tarball`
+> gives the same results as `--work-area`.
 
 ## Test
 
@@ -321,7 +354,7 @@ that encodes this.
 python3 tests/test_tools.py
 ```
 
-47 tests, none of which start a mu2e job. (The `ana` env has no pytest, so
+55 tests, none of which start a mu2e job. (The `ana` env has no pytest, so
 these are bare asserts.)
 
 ## Run the server
@@ -394,10 +427,12 @@ file: `edep` runs over any art file with the right products, while
 
 ## Use it from a client
 
-**Claude Code** — the checked-in `.mcp.json` already wires it up; or:
+**Claude Code** — the checked-in `.mcp.json` already wires it up, work area
+and all; or:
 
 ```bash
-claude mcp add mu2e-analysis -- python3 -m analysis_mcp_server --transport stdio
+claude mcp add mu2e-analysis -- python3 -m analysis_mcp_server \
+    --transport stdio --work-area /exp/mu2e/app/users/mmackenz/mu2eopt
 ```
 
 **`multiagent-client-demo`** (`../multiagent-client-demo`), stdio — the

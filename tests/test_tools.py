@@ -22,6 +22,7 @@ from tools.analyses.muon_stop_rate import (CountsError, dataset_description,
                                            dataset_hint, parse_counts,
                                            parse_prescale_filters, stop_rates,
                                            wrong_dataset)
+from tools.mu2e_env import EnvError, Mu2eEnv, configure, current
 from tools.mu2e_job import (build_input_args, root_snapshot,
                             validate_input_paths, written_root_files)
 from tools.spectrum import Kernel, Spectrum
@@ -317,10 +318,12 @@ def test_every_spec_is_self_consistent():
             assert metric in spec.metrics, f"{name}: unit for unknown '{metric}'"
         for param in spec.parameters:
             assert param.description.strip(), f"{name}: {param.name} needs a description"
-        # art_files analyses run an fcl; root_file ones must not claim to
+        # art_files analyses name an fcl relative to the configured code;
+        # root_file ones must not claim one at all
         if spec.input_kind == "art_files":
-            assert spec.fcl is not None and spec.fcl.is_absolute(), name
-            assert spec.fcl.exists(), f"{name}: missing fcl {spec.fcl}"
+            assert spec.fcl is not None and not spec.fcl.is_absolute(), name
+            assert current().missing_fcl(spec.fcl) is None, \
+                f"{name}: {current().missing_fcl(spec.fcl)}"
         else:
             assert spec.fcl is None, f"{name}: root_file analysis should have no fcl"
             assert spec.produced_by, f"{name}: say which analysis produces its input"
@@ -474,6 +477,103 @@ def test_multiple_inputs_write_one_path_per_line_for_dash_S(tmp_dir):
     assert arg == str(file_list)
     # mu2e wants one absolute path per line, trailing newline included.
     assert file_list.read_text() == "/data/a.art\n/data/b.art\n/data/c.art\n"
+
+
+# --- where Offline comes from ------------------------------------------------
+
+def test_musing_is_taken_as_a_name_and_a_version():
+    for spelling in ("SimJob MDC2025au", "SimJob/MDC2025au"):
+        env = Mu2eEnv.for_musing(spelling)
+        assert env.musing == ("SimJob", "MDC2025au")
+        assert env.describe() == "musing SimJob MDC2025au"
+    # and the version is not optional
+    for bad in ("SimJob", "SimJob MDC2025au extra"):
+        try:
+            Mu2eEnv.for_musing(bad)
+        except EnvError as exc:
+            assert "SimJob MDC2025au" in str(exc)      # shows the spelling wanted
+        else:
+            raise AssertionError(f"{bad!r} should not be a Musing")
+
+
+def test_a_musing_sets_itself_up_and_leaves_the_fcl_to_art(tmp_dir):
+    env = Mu2eEnv.for_musing("SimJob MDC2025au")
+    commands = env.setup_commands(Path(tmp_dir))
+    assert commands[-1] == "muse setup SimJob MDC2025au"
+    assert any("setupmu2e-art.sh" in c for c in commands)
+    # No directory of ours to resolve against: art finds it on FHICL_FILE_PATH,
+    # so the relative path is passed through and cannot be pre-checked.
+    fcl = Path("Mu2eOptAna/fcl/edep.fcl")
+    assert env.base_dir(Path(tmp_dir)) is None
+    assert env.resolve_fcl(fcl, Path(tmp_dir)) == fcl
+    assert env.missing_fcl(fcl, Path(tmp_dir)) is None
+
+
+def test_a_work_area_is_set_up_in_place_and_resolves_its_own_fcl(tmp_dir):
+    area = Path(tmp_dir)
+    (area / "Mu2eOptAna" / "fcl").mkdir(parents=True)
+    (area / "Mu2eOptAna" / "fcl" / "edep.fcl").write_text("# fcl")
+
+    env = Mu2eEnv.for_work_area(area)
+    assert env.setup_commands(area) == [
+        f"cd {area}",
+        "source /cvmfs/mu2e.opensciencegrid.org/setupmu2e-art.sh",
+        "muse setup",
+    ]
+    assert env.resolve_fcl(Path("Mu2eOptAna/fcl/edep.fcl")) == area / "Mu2eOptAna/fcl/edep.fcl"
+    assert env.missing_fcl(Path("Mu2eOptAna/fcl/edep.fcl")) is None
+    # a missing one is caught before any job starts
+    assert "not found" in env.missing_fcl(Path("Mu2eOptAna/fcl/nope.fcl"))
+
+
+def test_a_work_area_that_is_not_a_directory_is_rejected(tmp_dir):
+    try:
+        Mu2eEnv.for_work_area(Path(tmp_dir) / "nowhere")
+    except EnvError as exc:
+        assert "not a directory" in str(exc)
+    else:
+        raise AssertionError("a missing work area should be rejected")
+
+
+def test_a_tarball_is_unpacked_once_beside_the_job_then_set_up(tmp_dir):
+    tarball = Path(tmp_dir) / "code.tar"
+    tarball.write_bytes(b"not really a tarball, only its path is used here")
+    job = Path(tmp_dir) / "job"
+
+    env = Mu2eEnv.for_tarball(tarball)
+    assert env.unpack_dir(job) == job / "code"          # self-contained by default
+    commands = env.setup_commands(job)
+    unpack, enter = commands[0], commands[1]
+    assert str(tarball) in unpack and "tar -xf" in unpack
+    assert f"{job / 'code'}.unpacked" in unpack         # the marker that makes it once
+    assert str(job / "code") in enter
+    assert commands[-1] == "muse setup"
+
+    # a shared unpack directory is used as given, and can be pre-checked
+    shared = Mu2eEnv.for_tarball(tarball, code_dir=Path(tmp_dir) / "shared")
+    assert shared.unpack_dir(job) == Path(tmp_dir) / "shared"
+    assert shared.base_dir() == Path(tmp_dir) / "shared"
+    # nothing unpacked yet, so nothing can be said about the fcl
+    assert shared.missing_fcl(Path("Mu2eOptAna/fcl/edep.fcl")) is None
+
+    sub = Mu2eEnv.for_tarball(tarball, code_dir=Path(tmp_dir) / "shared",
+                              code_subdir="Code")
+    assert sub.base_dir() == Path(tmp_dir) / "shared" / "Code"
+
+
+def test_configured_environment_is_what_analyses_see(tmp_dir):
+    before = current()
+    try:
+        configure(Mu2eEnv.for_musing("SimJob MDC2025au"))
+        catalogue = list_analyses()
+        assert "musing SimJob MDC2025au" in catalogue.message
+        assert catalogue.metadata["environment"] == "musing SimJob MDC2025au"
+        edep = catalogue.metadata["analyses"]["edep"]
+        assert edep["fcl"] == "Mu2eOptAna/fcl/edep.fcl"   # relative, art resolves it
+        assert edep["fcl_exists"] is None                 # unknowable from here
+    finally:
+        configure(None)
+        assert current().describe() == before.describe()
 
 
 def test_written_root_files_reports_a_rerun_that_overwrote_its_output(tmp_dir):

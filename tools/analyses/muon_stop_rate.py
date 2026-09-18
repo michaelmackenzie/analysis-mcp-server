@@ -42,10 +42,12 @@ to show for it. The check is on the filter's own name, so it follows
 import re
 from pathlib import Path
 
-from ..mu2e_job import MUSE_WORKAREA, run_mu2e_job
+from ..mu2e_job import run_mu2e_job
 from ..spec import AnalysisSpec, ParamSpec, RunContext, RunOutcome
 
-FCL = MUSE_WORKAREA / "Mu2eOptAna" / "fcl" / "print_counts.fcl"
+# Relative: resolved against the configured code (a work area or an
+# unpacked tarball), or left to art's FHICL_FILE_PATH for a Musing.
+FCL = Path("Mu2eOptAna/fcl/print_counts.fcl")
 
 # The filter whose prescale applies to the target-stop output stream.
 PRESCALE_FILTER = "TargetStopPrescaleFilter"
