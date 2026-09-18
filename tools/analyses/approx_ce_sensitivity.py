@@ -35,12 +35,12 @@ from ..spec import AnalysisSpec, ParamSpec, RunContext, RunOutcome
 
 # --- assumptions carried over from the macro ---------------------------------
 
+MUON_CAPTURE_RATE = 0.609         # N(muon captures) / N(muon stops) on aluminum
 NPOT = 1.0e18                     # protons on target assumed
-SIGNAL_BR = 1.0e-13 / 0.609       # CE branching ratio for R_mue = 1e-13
+SIGNAL_BR = 1.0e-13 / MUON_CAPTURE_RATE # CE branching ratio for R_mue = 1e-13
 MEAN_POT_PER_EVENT = 1.6e7        # 1BB
 ONSPILL_SECONDS_PER_EVENT = 1.695e-6
 COSMIC_RATE_PER_SECOND_PER_MEV = 10. / 7.8e5  # rough, per second per MeV/c, taken from Run 1A mu- --> e- analysis
-DIO_RATE_FRACTION = 0.39          # DIO fraction feeding the rate normalization
 TRK_RESOLUTION_SIGMA_MEV = 0.2
 SIGNAL_BOX_MIN_MEV = 50.0         # below this DIO swamps everything anyway
 SIGNAL_REBIN = 2
@@ -307,7 +307,7 @@ def run(context: RunContext) -> RunOutcome:
 
         # 3. DIO: theory spectrum -> rate, smeared by the energy loss and then
         # by the resolution on its own fine binning, then put on signal's bins.
-        dio_true = load_dio_spectrum().scaled(DIO_RATE_FRACTION * sig_eff * npot)
+        dio_true = load_dio_spectrum().scaled((1. - MUON_CAPTURE_RATE) * sig_eff * npot)
         resolution = Kernel.gaussian(dio_true.width, TRK_RESOLUTION_SIGMA_MEV)
         dio_reco = (dio_true
                     .smear(Kernel.from_density(response, dio_true.width))
