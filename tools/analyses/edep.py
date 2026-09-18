@@ -89,14 +89,14 @@ def run(context: RunContext) -> RunOutcome:
 
     if outcome.timed_out:
         return RunOutcome(
-            files=outcome.new_root_files, log_path=outcome.log_path, extra=extra,
+            files=outcome.written_root_files, log_path=outcome.log_path, extra=extra,
             error=f"mu2e timed out after {context.timeout_s}s on "
                   f"{len(context.input_paths)} input file(s)",
         )
     if outcome.failed:
         extra["stdout_tail"] = outcome.stdout_tail()
         return RunOutcome(
-            files=outcome.new_root_files, log_path=outcome.log_path, extra=extra,
+            files=outcome.written_root_files, log_path=outcome.log_path, extra=extra,
             error=f"mu2e exited {outcome.returncode}",
         )
 
@@ -104,10 +104,10 @@ def run(context: RunContext) -> RunOutcome:
     if metrics is None:
         extra["stdout_tail"] = outcome.stdout_tail()
         return RunOutcome(
-            files=outcome.new_root_files, log_path=outcome.log_path, extra=extra,
+            files=outcome.written_root_files, log_path=outcome.log_path, extra=extra,
             error="EdepAna summary block not found in mu2e output",
         )
-    return RunOutcome(metrics=metrics, files=outcome.new_root_files,
+    return RunOutcome(metrics=metrics, files=outcome.written_root_files,
                       log_path=outcome.log_path, extra=extra)
 
 

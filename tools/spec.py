@@ -22,6 +22,7 @@ from typing import Any, Callable, Literal
 from pydantic import BaseModel
 
 InputKind = Literal["art_files", "root_file"]
+ParamKind = Literal["number", "text"]
 
 
 class ArtifactResult(BaseModel):
@@ -35,9 +36,11 @@ class ArtifactResult(BaseModel):
 
 @dataclass(frozen=True)
 class ParamSpec:
-    """A physics knob an analysis takes, reported by list_analyses.
+    """A knob an analysis takes, reported by list_analyses.
 
-    `default=None` means the caller must supply it.
+    `default=None` means the caller must supply it. Most knobs are numbers
+    with optional bounds; `kind="text"` is for the ones that name something in
+    the job's output, like a filter's module label.
     """
 
     name: str
@@ -45,6 +48,7 @@ class ParamSpec:
     default: float | int | str | None = None
     minimum: float | None = None
     maximum: float | None = None
+    kind: ParamKind = "number"
 
     @property
     def required(self) -> bool:
@@ -55,12 +59,18 @@ class ParamSpec:
             "description": self.description,
             "required": self.required,
             "default": self.default,
+            "kind": self.kind,
             "minimum": self.minimum,
             "maximum": self.maximum,
         }
 
-    def check(self, value: Any) -> float:
-        """Validate one supplied value, returning it as a float."""
+    def check(self, value: Any) -> float | str:
+        """Validate one supplied value, as the number or text it should be."""
+        if self.kind == "text":
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"parameter '{self.name}' must be a non-empty "
+                                 f"string, got {value!r}")
+            return value
         try:
             number = float(value)
         except (TypeError, ValueError):
@@ -80,7 +90,7 @@ class RunContext:
 
     input_paths: list[Path]
     outdir: Path
-    params: dict[str, float]
+    params: dict[str, float | str]
     timeout_s: int
     max_events: int | None = None
     # True when the caller passed data_files (a list) rather than data_file, so
@@ -157,7 +167,7 @@ class AnalysisSpec:
             entry["fcl_exists"] = self.fcl.exists()
         return entry
 
-    def resolve_params(self, supplied: dict[str, Any] | None) -> dict[str, float]:
+    def resolve_params(self, supplied: dict[str, Any] | None) -> dict[str, float | str]:
         """Merge supplied parameters over the defaults, validating them.
 
         Raises ValueError naming the offender for unknown, missing, or
@@ -171,7 +181,7 @@ class AnalysisSpec:
                 f"unknown parameter(s) for '{self.name}': {', '.join(unknown)}. "
                 f"Known: {', '.join(known) or '(none)'}"
             )
-        resolved: dict[str, float] = {}
+        resolved: dict[str, float | str] = {}
         missing = []
         for name, param in known.items():
             if name in supplied:
@@ -179,7 +189,7 @@ class AnalysisSpec:
             elif param.required:
                 missing.append(name)
             else:
-                resolved[name] = float(param.default)
+                resolved[name] = param.check(param.default)
         if missing:
             raise ValueError(
                 f"missing required parameter(s) for '{self.name}': "

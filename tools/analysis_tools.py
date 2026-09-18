@@ -80,8 +80,9 @@ def run_analysis(
     Args:
         analysis: Which analysis to run (see list_analyses), e.g. "edep".
         output_dir: Directory the analysis runs in and writes to — job output,
-            logs, figures. Created if missing. Use a fresh directory per run to
-            keep outputs apart.
+            logs, figures. Created if missing, and safe to reuse: a rerun
+            overwrites the previous run's output rather than failing. Use a
+            fresh directory per run only when you want the outputs kept apart.
         data_file: Absolute path to one input file. Pass exactly one of
             data_file or data_files.
         data_files: Absolute paths to several input art files, analyzed

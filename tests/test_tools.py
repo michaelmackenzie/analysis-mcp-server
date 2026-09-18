@@ -18,7 +18,12 @@ import numpy as np
 from tools import ANALYSES, list_analyses, run_analysis
 from tools.analyses import approx_ce_sensitivity as sens
 from tools.analyses.edep import parse_edep_summary
-from tools.mu2e_job import build_input_args, validate_input_paths
+from tools.analyses.muon_stop_rate import (CountsError, dataset_description,
+                                           dataset_hint, parse_counts,
+                                           parse_prescale_filters, stop_rates,
+                                           wrong_dataset)
+from tools.mu2e_job import (build_input_args, root_snapshot,
+                            validate_input_paths, written_root_files)
 from tools.spectrum import Kernel, Spectrum
 from tools.spec import ParamSpec
 
@@ -37,9 +42,35 @@ EdepAna summary:
 Art has completed and will exit with status 0.
 """
 
+# Verbatim shape of what print_counts.fcl prints, with art's usual noise. One
+# prescale block per filter the production job ran; only the target-stop one
+# applies to a TargetStops file.
+SAMPLE_COUNTS_STDOUT = """\
+18-Sep-2026 12:04:13 CDT  Opened input file "sim.mmackenz.TargetStops.Run1Bak_local0813111400.001800_00000000.art"
+
+ProductPrint mu2e::PrescaleFilterFraction_PolyStopPrescaleFilter__MuBeamResampler
+ Fraction passing filter 0.000800 N Seen 12500 with prescale fraction 0.001000
+
+ProductPrint mu2e::PrescaleFilterFraction_TargetStopPrescaleFilter__MuBeamResampler
+ Fraction passing filter 1.000000 N Seen 12500 with prescale fraction 1.000000
+
+ProductPrint mu2e::PrescaleFilterFraction_EarlyPrescaleFilter__MuBeamResampler
+ Fraction passing filter 0.034800 N Seen 12500 with prescale fraction 0.033333
+
+Begin processing the 1st record. run: 1800 subRun: 0 event: 3 at 18-Sep-2026 12:04:13 CDT
+GenEventCount: 12500 events in run: 1800 subRun: 0
+     1 BeginRun records found
+     1 Subrun records found
+   735 Event records found
+GenEventCount total: 12500 events in 1 SubRuns
+
+Art has completed and will exit with status 0.
+"""
+
 # One stdout sample per art_files analysis, so the registry test can exercise
 # each parser. Add an entry when adding such an analysis.
-SAMPLE_STDOUT = {"edep": SAMPLE_EDEP_STDOUT}
+SAMPLE_STDOUT = {"edep": SAMPLE_EDEP_STDOUT,
+                 "muon_stop_rate": SAMPLE_COUNTS_STDOUT}
 
 
 # --- the edep parser ---------------------------------------------------------
@@ -70,6 +101,90 @@ def test_edep_parse_returns_none_without_summary():
 def test_edep_parse_returns_none_on_truncated_summary():
     truncated = SAMPLE_EDEP_STDOUT.split("Events with calo Edep")[0]
     assert parse_edep_summary(truncated) is None
+
+
+# --- the muon_stop_rate parser -----------------------------------------------
+
+def test_counts_parses_events_gen_events_and_the_target_stop_prescale():
+    assert parse_counts(SAMPLE_COUNTS_STDOUT) == {
+        "n_events": 735.0,
+        "n_gen_events": 12500.0,
+        "prescale": 1.0,        # the TargetStop filter's, not PolyStop's 0.001
+    }
+
+
+def test_counts_takes_the_prescale_of_whichever_filter_is_named():
+    counts = parse_counts(SAMPLE_COUNTS_STDOUT, "PolyStopPrescaleFilter")
+    assert counts["prescale"] == 0.001
+    assert counts["n_events"] == 735.0      # the file's events, either way
+
+
+def test_counts_reads_every_prescale_block():
+    filters = parse_prescale_filters(SAMPLE_COUNTS_STDOUT)
+    assert set(filters) == {"PolyStopPrescaleFilter", "TargetStopPrescaleFilter",
+                            "EarlyPrescaleFilter"}
+    poly = filters["PolyStopPrescaleFilter"]
+    assert poly["prescale"] == 0.001 and poly["fraction_passing"] == 0.0008
+    assert poly["n_seen"] == 12500.0 and poly["process"] == "MuBeamResampler"
+
+
+def test_counts_rejects_output_without_the_target_stop_filter():
+    without = SAMPLE_COUNTS_STDOUT.replace("TargetStopPrescaleFilter",
+                                           "IPAStopPrescaleFilter")
+    try:
+        parse_counts(without)
+    except CountsError as exc:
+        assert "TargetStopPrescaleFilter" in str(exc)
+        assert "IPAStopPrescaleFilter" in str(exc)      # names what it did find
+    else:
+        raise AssertionError("a file without the filter must be reported")
+
+
+def test_counts_rejects_output_without_the_generated_event_count():
+    without = SAMPLE_COUNTS_STDOUT.replace("GenEventCount total: 12500 events", "")
+    try:
+        parse_counts(without)
+    except CountsError as exc:
+        assert "generated" in str(exc)
+    else:
+        raise AssertionError("missing gen-event bookkeeping must be reported")
+
+
+def test_dataset_description_reads_mu2e_names_and_passes_on_others():
+    name = Path("sim.mmackenz.TargetStops.Run1Bak_local0813111400.001800_00000000.art")
+    assert dataset_description(name) == "TargetStops"
+    assert dataset_description(Path("my_stops.art")) is None   # not a Mu2e name
+
+
+def test_dataset_hint_comes_from_the_filter_label():
+    assert dataset_hint("TargetStopPrescaleFilter") == "targetstop"
+    assert dataset_hint("PolyStopPrescaleFilter") == "polystop"
+    assert dataset_hint("SomethingElse") == ""      # nothing to check against
+
+
+def test_wrong_dataset_follows_the_filter_it_is_given():
+    stem = "Run1Bak_local0813111400.001800_00000000.art"
+    target = Path(f"sim.mmackenz.TargetStops.{stem}")
+    poly = Path(f"sim.mmackenz.PolyStops.{stem}")
+    unnamed = Path("stops.art")
+    # A poly-stop file parses fine and carries the target filter's product, so
+    # only the name says it is the wrong input.
+    assert wrong_dataset([target, unnamed]) == []
+    assert wrong_dataset([target, poly]) == [f"sim.mmackenz.PolyStops.{stem} (PolyStops)"]
+    # ... and the check follows the filter: with the poly filter it is the
+    # target-stop file that is out of place.
+    assert wrong_dataset([target, poly], "PolyStopPrescaleFilter") == [
+        f"sim.mmackenz.TargetStops.{stem} (TargetStops)"
+    ]
+    assert wrong_dataset([target, poly], "OddlyNamedFilter") == []
+
+
+def test_stop_rates_divide_out_the_prescale_and_scale_by_the_upstream_efficiency():
+    counts = {"n_events": 735.0, "n_gen_events": 12500.0, "prescale": 0.5}
+    rates = stop_rates(counts, upstream_eff=2.0e-3)
+    # the prescale kept half the events, so the true rate is twice 735/12500
+    assert abs(rates["stops_per_gen_event"] - 0.1176) < 1e-6
+    assert abs(rates["stops_per_pot"] - 0.1176 * 2.0e-3) < 1e-9
 
 
 # --- the spectrum helper -----------------------------------------------------
@@ -187,8 +302,8 @@ def test_sensitivity_rejects_a_file_without_the_histograms(tmp_dir):
 
 # --- the registry (loops over every analysis) --------------------------------
 
-def test_registry_includes_both_analyses():
-    assert {"edep", "approx_ce_sensitivity"} <= set(ANALYSES)
+def test_registry_includes_every_analysis():
+    assert {"edep", "muon_stop_rate", "approx_ce_sensitivity"} <= set(ANALYSES)
 
 
 def test_every_spec_is_self_consistent():
@@ -226,6 +341,9 @@ def test_every_art_analysis_parser_matches_its_declared_metrics():
         assert sample is not None, f"{name}: add a sample stdout to SAMPLE_STDOUT"
         if name == "edep":
             assert tuple(parse_edep_summary(sample)) == spec.metrics
+        elif name == "muon_stop_rate":
+            parsed = stop_rates(parse_counts(sample), upstream_eff=1.0)
+            assert tuple(parsed) == spec.metrics
 
 
 def test_list_analyses_reports_every_registered_analysis():
@@ -240,11 +358,24 @@ def test_list_analyses_reports_every_registered_analysis():
     assert edep["fcl_exists"] is True
     assert edep["units"]["avg_calo_edep_per_event_mev"] == "MeV"
 
+    stops = catalogue["muon_stop_rate"]
+    assert stops["input_kind"] == "art_files"
+    assert stops["fcl"].endswith("Mu2eOptAna/fcl/print_counts.fcl")
+    assert stops["fcl_exists"] is True
+    assert stops["parameters"]["upstream_eff"]["required"] is True
+    assert stops["units"]["stops_per_pot"] == "stops / POT"
+
     ce = catalogue["approx_ce_sensitivity"]
     assert ce["input_kind"] == "root_file"
     assert ce["produced_by"] == ["edep"]          # chaining is discoverable
     assert ce["parameters"]["sig_eff"]["required"] is True
     assert ce["parameters"]["npot"]["required"] is False
+    cosmic = ce["parameters"]["cosmic_rate_per_s_per_mev"]
+    assert cosmic["required"] is False
+    assert cosmic["default"] == sens.COSMIC_RATE_PER_SECOND_PER_MEV
+    # the normalization a result was built on is reported with it
+    assert {"npot", "cosmic_rate_per_s_per_mev"} <= set(ce["metrics"])
+    assert ce["units"]["npot"] == "POT"
     assert "fcl" not in ce
 
 
@@ -280,6 +411,38 @@ def test_unknown_parameter_is_reported(tmp_dir):
     assert "wat" in result.message and "unknown" in result.message
 
 
+def test_cosmic_rate_defaults_to_the_modules_assumption():
+    spec = ANALYSES["approx_ce_sensitivity"]
+    params = spec.resolve_params({"sig_eff": 0.1})
+    assert params["cosmic_rate_per_s_per_mev"] == sens.COSMIC_RATE_PER_SECOND_PER_MEV
+    # and a supplied value is what reaches the run
+    params = spec.resolve_params({"sig_eff": 0.1, "cosmic_rate_per_s_per_mev": 5.0e-3})
+    assert params["cosmic_rate_per_s_per_mev"] == 5.0e-3
+    try:
+        spec.resolve_params({"sig_eff": 0.1, "cosmic_rate_per_s_per_mev": -1.0})
+    except ValueError as exc:
+        assert "cosmic_rate_per_s_per_mev" in str(exc)
+    else:
+        raise AssertionError("a negative rate should be rejected")
+
+
+def test_text_param_defaults_and_validates():
+    spec = ANALYSES["muon_stop_rate"]
+    # left out, it falls back to the target-stop stream
+    assert (spec.resolve_params({"upstream_eff": 0.012})["prescale_filter"]
+            == "TargetStopPrescaleFilter")
+    assert (spec.resolve_params({"upstream_eff": 0.012,
+                                 "prescale_filter": "PolyStopPrescaleFilter"})
+            ["prescale_filter"] == "PolyStopPrescaleFilter")
+    for bad in ("", "   ", 7):
+        try:
+            spec.resolve_params({"upstream_eff": 0.012, "prescale_filter": bad})
+        except ValueError as exc:
+            assert "prescale_filter" in str(exc)
+        else:
+            raise AssertionError(f"{bad!r} should not be a valid label")
+
+
 def test_param_spec_rejects_non_numbers():
     param = ParamSpec(name="p", description="d", default=1.0)
     try:
@@ -311,6 +474,32 @@ def test_multiple_inputs_write_one_path_per_line_for_dash_S(tmp_dir):
     assert arg == str(file_list)
     # mu2e wants one absolute path per line, trailing newline included.
     assert file_list.read_text() == "/data/a.art\n/data/b.art\n/data/c.art\n"
+
+
+def test_written_root_files_reports_a_rerun_that_overwrote_its_output(tmp_dir):
+    """Rerunning into the same directory must still report the job's output."""
+    outdir = Path(tmp_dir)
+    stale = outdir / "nts.owner.edep.Run1B.001800_00000000.root"
+    stale.write_bytes(b"from an earlier run")
+    before = root_snapshot(outdir)
+
+    # nothing touched yet
+    assert written_root_files(outdir, before) == []
+
+    # the job overwrites the file it wrote last time, and adds another
+    stale.write_bytes(b"from this run, a different size")
+    fresh = outdir / "nts.owner.edep.Run1B.001801_00000000.root"
+    fresh.write_bytes(b"new this time")
+    assert written_root_files(outdir, before) == sorted([str(stale), str(fresh)])
+
+
+def test_written_root_files_ignores_files_the_job_left_alone(tmp_dir):
+    outdir = Path(tmp_dir)
+    untouched = outdir / "someone_elses.root"
+    untouched.write_bytes(b"not ours")
+    before = root_snapshot(outdir)
+    (outdir / "notes.txt").write_text("not a ROOT file")   # nor is this
+    assert written_root_files(outdir, before) == []
 
 
 def test_validate_input_paths_flags_only_bad_ones(tmp_dir):

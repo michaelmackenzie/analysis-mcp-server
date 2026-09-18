@@ -6,7 +6,9 @@ What it does, in the order an agent would:
   1. connect to the server and list its tools
   2. `list_analyses`  -- the catalogue: input kinds, metrics, parameters
   3. `run_analysis`   -- `edep` over the art file you name
-  4. `run_analysis`   -- `approx_ce_sensitivity` over the nts.*.root step 3
+  4. `run_analysis`   -- `muon_stop_rate`, if you pass --stops-file: another
+                         analysis over its own input, so it takes its own file
+  5. `run_analysis`   -- `approx_ce_sensitivity` over the nts.*.root step 3
                          wrote, which is what `produced_by` is for
 
 Environment (the `ana` python already has the mcp SDK; no installs needed):
@@ -19,6 +21,11 @@ relative or use ~; it is resolved here, because the server takes only
 absolute paths (it runs the job from its own working directory):
 
     python3 examples/simple_client.py ../dts.mmackenz.CeEndpoint.....art
+
+With the stopping rate too, which needs a target-stop sim file of its own:
+
+    python3 examples/simple_client.py ../dts.mmackenz.CeEndpoint.....art \
+        --stops-file ../sim.mmackenz.TargetStops.....art
 
 A quick smoke test that does not wait for a full mu2e job (per-gen-event
 metrics are meaningless with --max-events, so skip the chained sensitivity):
@@ -83,6 +90,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--sig-eff", type=float, default=2.5e-4,
         help="Signal efficiency handed to approx_ce_sensitivity.",
+    )
+    parser.add_argument(
+        "--stops-file",
+        help="A target-stop sim file (sim.*.TargetStops.*.art). Given one, "
+             "the client also runs muon_stop_rate over it.",
+    )
+    parser.add_argument(
+        "--upstream-eff", type=float, default=0.012,
+        help="Efficiency of everything upstream of the stopping target "
+             "(generated events per POT), handed to muon_stop_rate.",
+    )
+    parser.add_argument(
+        "--prescale-filter",
+        help="Prescale filter label for muon_stop_rate. Left out, the server "
+             "falls back to its default, the target-stop stream.",
     )
     parser.add_argument(
         "--timeout-s", type=int, default=1800,
@@ -172,9 +194,12 @@ async def main() -> int:
     # The tool rejects relative paths, and rightly so -- the mu2e job runs
     # in output_dir, not here. Resolve ours so a relative argument works.
     data_file = Path(args.data_file).expanduser().resolve()
-    if not data_file.exists():
-        print(f"No such input file: {data_file}", file=sys.stderr)
-        return 2
+    stops_file = (Path(args.stops_file).expanduser().resolve()
+                  if args.stops_file else None)
+    for path in (data_file, stops_file):
+        if path is not None and not path.exists():
+            print(f"No such input file: {path}", file=sys.stderr)
+            return 2
 
     async with AsyncExitStack() as stack:
         session = await connect(stack, args.url)
@@ -203,10 +228,31 @@ async def main() -> int:
         if edep["status"] != "success":
             return 1
 
+        # 3. A second analysis, over its own input. Its prescale_filter
+        #    parameter is optional, so it is passed only when you set one and
+        #    the server's default -- the target-stop stream -- runs otherwise.
+        if stops_file is not None:
+            print(f"\n=== run_analysis: muon_stop_rate on {stops_file} ===")
+            parameters: dict[str, Any] = {"upstream_eff": args.upstream_eff}
+            if args.prescale_filter:
+                parameters["prescale_filter"] = args.prescale_filter
+            stops = payload(await session.call_tool("run_analysis", {
+                "analysis": "muon_stop_rate",
+                "data_file": str(stops_file),
+                "output_dir": str(outdir / "muon_stop_rate"),
+                "parameters": parameters,
+                "timeout_s": args.timeout_s,
+            }))
+            show_result(stops, analyses["muon_stop_rate"]["metrics"])
+            if stops["status"] == "success":
+                meta = stops["metadata"]
+                print(f"  prescale filter used: {meta['prescale_filter']} "
+                      f"(of {', '.join(sorted(meta['prescale_filters']))})")
+
         if args.no_chain:
             return 0
 
-        # 3. Chain: the nts.*.root edep wrote is what the sensitivity reads.
+        # 4. Chain: the nts.*.root edep wrote is what the sensitivity reads.
         ntuples = [f for f in edep["files"] if Path(f).name.startswith("nts.")]
         if not ntuples:
             print("\nNo nts.*.root in edep's output, nothing to chain.")

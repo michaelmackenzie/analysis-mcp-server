@@ -15,8 +15,9 @@ The chain, following the original macro:
    then convolved with the *measured* energy-loss response
    (`trk_front_energy_diff`, energy at the tracker minus energy at birth) and
    the same tracker resolution.
-4. Cosmic background: flat in momentum at a rough rate per MeV/c, scaled by
-   the live on-spill time implied by NPOT.
+4. Cosmic background: flat in momentum at a rough rate per second per MeV/c
+   (the `cosmic_rate_per_s_per_mev` parameter), scaled by the live on-spill
+   time implied by NPOT.
 5. Scan every window [x1, x2] with x1 >= 50 MeV and keep the one maximizing
    S/sqrt(B).
 
@@ -38,7 +39,6 @@ NPOT = 1.0e18                     # protons on target assumed
 SIGNAL_BR = 1.0e-13 / 0.609       # CE branching ratio for R_mue = 1e-13
 MEAN_POT_PER_EVENT = 1.6e7        # 1BB
 ONSPILL_SECONDS_PER_EVENT = 1.695e-6
-# COSMIC_RATE_PER_SECOND_PER_MEV = 2.0e4 / 1.1e7  # rough, per second per MeV/c
 COSMIC_RATE_PER_SECOND_PER_MEV = 10. / 7.8e5  # rough, per second per MeV/c, taken from Run 1A mu- --> e- analysis
 DIO_RATE_FRACTION = 0.39          # DIO fraction feeding the rate normalization
 TRK_RESOLUTION_SIGMA_MEV = 0.2
@@ -268,6 +268,8 @@ def run(context: RunContext) -> RunOutcome:
 
     sig_eff = context.params["sig_eff"]
     npot = context.params["npot"]
+    cosmic_rate_per_s_per_mev = context.params["cosmic_rate_per_s_per_mev"]
+    mean_pot_per_event = context.params["mean_pot_per_event"]
     outdir = context.outdir
     outdir.mkdir(parents=True, exist_ok=True)
 
@@ -313,9 +315,9 @@ def run(context: RunContext) -> RunOutcome:
                     .regrid(signal_reco))
 
         # 4. cosmics: flat rate per MeV/c over the implied on-spill time
-        events = npot / MEAN_POT_PER_EVENT
+        events = npot / mean_pot_per_event
         onspill_seconds = events * ONSPILL_SECONDS_PER_EVENT
-        cosmic_rate = COSMIC_RATE_PER_SECOND_PER_MEV * onspill_seconds
+        cosmic_rate = cosmic_rate_per_s_per_mev * onspill_seconds
         cosmic = replace(
             signal_reco, name="cosmic", title="Cosmics",
             values=np.full(signal_reco.nbins, cosmic_rate * signal_reco.width),
@@ -336,6 +338,10 @@ def run(context: RunContext) -> RunOutcome:
         "total_background": float(best["background"]),
         "signal_mpv_mev": float(mpv),
         "signal_fwhm_mev": float(fwhm),
+        # The assumptions the rates above are built on, reported with them so
+        # a number never travels without the normalization behind it.
+        "npot": float(npot),
+        "cosmic_rate_per_s_per_mev": float(cosmic_rate_per_s_per_mev),
     }
 
     log_path = outdir / "approx_ce_sensitivity.log"
@@ -345,8 +351,8 @@ def run(context: RunContext) -> RunOutcome:
         f"  sig_eff          {sig_eff:g}",
         f"  NPOT             {npot:g}",
         f"  signal BR        {SIGNAL_BR:.4g}  (R_mue = 1e-9)",
-        f"  cosmic rate      {cosmic_rate:.4g} per MeV/c "
-        f"({onspill_seconds:.4g} s on-spill)",
+        f"  cosmic rate      {cosmic_rate_per_s_per_mev:.4g} per s per MeV/c "
+        f"-> {cosmic_rate:.4g} per MeV/c ({onspill_seconds:.4g} s on-spill)",
         f"  signal entries   {signal.entries:g}",
         f"  MPV / FWHM       {mpv:.3f} / {fwhm:.3f} MeV",
         "",
@@ -374,7 +380,6 @@ def run(context: RunContext) -> RunOutcome:
         files=files,
         log_path=log_path,
         extra={
-            "npot": npot,
             "sig_eff": sig_eff,
             "signal_br": SIGNAL_BR,
             "cosmic_rate_per_mev": cosmic_rate,
@@ -390,7 +395,9 @@ def summarize(metrics: dict[str, float]) -> str:
         f"S/sqrt(B) = {metrics['sensitivity']:.4g} in "
         f"[{metrics['signal_box_low_mev']:.1f}, "
         f"{metrics['signal_box_high_mev']:.1f}] MeV "
-        f"(S = {metrics['signal_rate']:.3g}, B = {metrics['total_background']:.3g})."
+        f"(S = {metrics['signal_rate']:.3g}, B = {metrics['total_background']:.3g}) "
+        f"for {metrics['npot']:.3g} POT and a cosmic rate of "
+        f"{metrics['cosmic_rate_per_s_per_mev']:.4g} per s per MeV/c."
     )
 
 
@@ -406,12 +413,15 @@ SPEC = AnalysisSpec(
         "sensitivity", "signal_box_low_mev", "signal_box_high_mev",
         "signal_rate", "dio_background", "cosmic_background",
         "total_background", "signal_mpv_mev", "signal_fwhm_mev",
+        "npot", "cosmic_rate_per_s_per_mev",
     ),
     units={
         "signal_box_low_mev": "MeV",
         "signal_box_high_mev": "MeV",
         "signal_mpv_mev": "MeV",
         "signal_fwhm_mev": "MeV",
+        "npot": "POT",
+        "cosmic_rate_per_s_per_mev": "per second per MeV/c",
     },
     parameters=(
         ParamSpec(
@@ -424,6 +434,19 @@ SPEC = AnalysisSpec(
             name="npot",
             description="Protons on target to assume for the rate normalization.",
             default=NPOT, minimum=0.0,
+        ),
+        ParamSpec(
+            name="mean_pot_per_event",
+            description="Mean number of protons on target per event.",
+            default=MEAN_POT_PER_EVENT, minimum=1.0,
+        ),
+        ParamSpec(
+            name="cosmic_rate_per_s_per_mev",
+            description="Cosmic-ray background rate, flat in momentum, per "
+                        "second per MeV/c. The default is the rough Run-1A "
+                        "mu- -> e- number; scaled by the on-spill live time "
+                        "that npot and mean npot per event implies.",
+            default=COSMIC_RATE_PER_SECOND_PER_MEV, minimum=0.0,
         ),
     ),
     input_hint=(

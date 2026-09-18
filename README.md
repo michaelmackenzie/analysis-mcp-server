@@ -8,8 +8,9 @@ mu2e -c <the analysis' fcl> -s <data file>     # one file
 mu2e -c <the analysis' fcl> -S <file list>     # several, one path per line
 ```
 
-or a Python computation over a ROOT file an earlier analysis produced. Two
-analyses ship: energy deposition (`edep`) and approximate CE sensitivity
+or a Python computation over a ROOT file an earlier analysis produced. Three
+analyses ship: energy deposition (`edep`), muon stopping rate
+(`muon_stop_rate`) and approximate CE sensitivity
 (`approx_ce_sensitivity`). Adding more is one small module each.
 
 Built to the same pattern as
@@ -44,6 +45,7 @@ tools/
   registry.py         the catalogue: name -> AnalysisSpec
   analyses/
     edep.py                    energy deposition: fcl + summary parser
+    muon_stop_rate.py          stopping rate: counts, prescale, POT scaling
     approx_ce_sensitivity.py   CE sensitivity from EdepAna histograms
   analysis_tools.py   the MCP tools: list_analyses, run_analysis
   __init__.py         __all__ — ONLY these names become tools
@@ -79,6 +81,7 @@ workflow can chain several runs and collect `metadata` uniformly.
 | analysis | input | reports |
 |---|---|---|
 | `edep` | art file(s) | average calo/tracker energy deposition per event and per generated event |
+| `muon_stop_rate` | `sim.*.TargetStops.*.art` | stopped muons per generated event and per POT, from the file's event count, generated-event count and output prescale |
 | `approx_ce_sensitivity` | `nts.*.root` from `edep` | `S/sqrt(B)` for the best momentum window, with the window and its signal/DIO/cosmic counts |
 
 `approx_ce_sensitivity` declares `produced_by = ["edep"]`, so chaining is
@@ -93,12 +96,15 @@ Analyses declare their own physics knobs, passed as `parameters`:
 run_analysis(analysis="approx_ce_sensitivity",
              data_file=".../nts.owner.edep.Run1B.001800_00000000.root",
              output_dir=".../sens",
-             parameters={"sig_eff": 0.1})     # npot defaults to 1e18
+             parameters={"sig_eff": 0.1})     # npot and the cosmic rate
+                                              # fall back to their defaults
 ```
 
 `list_analyses` reports each parameter's description, default, range, and
 whether it is required; unknown, missing, or out-of-range values come back as
-a plain error naming the offender.
+a plain error naming the offender. A parameter is a number unless its `kind`
+is `"text"`, which is for the ones that name something in the job's output —
+`muon_stop_rate`'s `prescale_filter` is the only one so far.
 
 ### Inputs
 
@@ -123,7 +129,9 @@ physics numbers.
 
 Every result carries `analysis`, `input_kind`, `data_files`, `n_input_files`,
 `log_path`, the resolved `parameters`, and — for the `-S` case —
-`file_list_path`. On success the analysis' metrics are merged into `metadata`
+`file_list_path`. `output_dir` can be reused: a rerun overwrites the previous
+run's ROOT output, log, file list and figures, and `files` reports what this
+run wrote whether or not the name was there before. On success the analysis' metrics are merged into `metadata`
 under the names `list_analyses` advertises. `files` lists what the run wrote:
 the job's ROOT output for `edep`, the figures for `approx_ce_sensitivity`. On
 failure `status="error"`, and for mu2e jobs `metadata.stdout_tail` holds the
@@ -142,11 +150,49 @@ last 20 log lines, so an agent can diagnose without re-running.
 | `avg_trk_edep_per_event_mev` | MeV | `Average tracker energy deposition per event` |
 | `avg_trk_edep_per_gen_event_mev` | MeV | `... per gen event` |
 
+`muon_stop_rate` runs `print_counts.fcl` and reports:
+
+| metric | unit | from the job's print |
+|---|---|---|
+| `n_events` | | `<N> Event records found` — stopped muons kept in the file |
+| `n_gen_events` | | `GenEventCount total: <N> events in <M> SubRuns` |
+| `prescale` | | `with prescale fraction <P>`, for the `prescale_filter` |
+| `stops_per_gen_event` | stops / generated event | `n_events / (n_gen_events * prescale)` |
+| `stops_per_pot` | stops / POT | the above times the required `upstream_eff` parameter |
+
+It takes two parameters:
+
+- `upstream_eff` (required) — the efficiency of everything upstream, i.e.
+  generated events of this file's stage per POT, POT -> MuBeam for a Run-1B
+  TargetStops file. No default: the rate per POT is only as meaningful as the
+  number you supply.
+- `prescale_filter` (optional, default `TargetStopPrescaleFilter`) — the
+  module label of the filter whose stream the file belongs to. Pass
+  `PolyStopPrescaleFilter` to read a poly-stop file's own rate, or another
+  label for a job that named its filters differently.
+
+`metadata` carries every `PrescaleFilterFraction` block the job printed
+(`prescale_filters`), not just the one used, so the other streams' fractions
+are there to read off, alongside the `prescale_filter` that was applied.
+
+The production job writes *all* of its filters' products into *every* output
+stream, so a poly-stop file parses fine against the target filter and would
+silently be divided by the wrong prescale. The input's Mu2e file name is
+therefore checked before the job is started, against the stream named by
+`prescale_filter` (`TargetStopPrescaleFilter` -> the description must contain
+"targetstop"), and anything else comes back as an error naming what was
+passed. A file whose name is not in Mu2e's
+`<tier>.<owner>.<description>.<config>.<sequencer>.<format>` form is left
+alone and run.
+
 `approx_ce_sensitivity` reports `sensitivity` (S/sqrt(B)),
 `signal_box_low_mev` / `signal_box_high_mev`, `signal_rate`,
-`dio_background`, `cosmic_background`, `total_background`, and the signal
-peak's `signal_mpv_mev` / `signal_fwhm_mev`. Its `metadata` also records the
-assumptions used (`npot`, `sig_eff`, `signal_br`, `cosmic_rate_per_mev`,
+`dio_background`, `cosmic_background`, `total_background`, the signal peak's
+`signal_mpv_mev` / `signal_fwhm_mev`, and the two assumptions those rates are
+built on — `npot` and `cosmic_rate_per_s_per_mev` — so a number never travels
+without its normalization. The summary line carries them too. Its `metadata`
+also records the rest of the assumptions (`sig_eff`, `signal_br`, the
+`cosmic_rate_per_mev` the cosmic rate works out to over the live time, and
 `onspill_seconds`), and it writes the macro's figures — `sig_vs_bkg.png`,
 `dio.png`, `response.png`, `res.png`, `ce_z.png`, `ce_r.png` — into
 `<output_dir>/figures`.
@@ -164,8 +210,9 @@ momentum window:
 2. **DIO** — the Heeck/Szafron theoretical spectrum, scaled to a rate, then
    smeared by the *measured* energy-loss response
    (`hist_2/trk_front_energy_diff`) and the same resolution.
-3. **Cosmics** — flat in momentum at a rough rate per MeV/c, scaled by the
-   on-spill live time implied by `npot`.
+3. **Cosmics** — flat in momentum at `cosmic_rate_per_s_per_mev` (default:
+   the rough Run-1A mu- -> e- rate), scaled by the on-spill live time implied
+   by `npot`.
 4. **Window scan** — every `[x1, x2]` with `x1 >= 50 MeV`, keeping the best
    S/sqrt(B). The top 10 windows go to the log.
 
@@ -206,7 +253,7 @@ def run(context: RunContext) -> RunOutcome:
         return RunOutcome(error=f"mu2e exited {outcome.returncode}",
                           log_path=outcome.log_path)
     return RunOutcome(metrics=parse_stops_summary(outcome.stdout),
-                      files=outcome.new_root_files, log_path=outcome.log_path)
+                      files=outcome.written_root_files, log_path=outcome.log_path)
 
 SPEC = AnalysisSpec(
     name="stops",
@@ -274,7 +321,7 @@ that encodes this.
 python3 tests/test_tools.py
 ```
 
-36 tests, none of which start a mu2e job. (The `ana` env has no pytest, so
+47 tests, none of which start a mu2e job. (The `ana` env has no pytest, so
 these are bare asserts.)
 
 ## Run the server
@@ -297,10 +344,10 @@ Clients connect to `http://127.0.0.1:8000/mcp`. Stop it with **Ctrl+C**
 
 ## A worked example
 
-`examples/simple_client.py` is a ~50-line MCP client that does what an agent
+`examples/simple_client.py` is a small MCP client that does what an agent
 would: start the server, list the tools, `list_analyses`, run `edep` over an
-art file you name, then feed the `nts.*.root` it wrote to
-`approx_ce_sensitivity`.
+art file you name, optionally run `muon_stop_rate` over a target-stop file,
+then feed the `nts.*.root` `edep` wrote to `approx_ce_sensitivity`.
 
 ```bash
 source /cvmfs/mu2e.opensciencegrid.org/setupmu2e-art.sh
@@ -327,6 +374,18 @@ python3 examples/simple_client.py path/to/some.art --url http://127.0.0.1:8000/m
 The input path may be relative or use `~`; the client resolves it, since the
 tool itself takes only absolute paths (the job runs in `output_dir`, not in
 your shell's directory).
+
+`muon_stop_rate` needs an input of its own, so it runs only when you name
+one:
+
+```bash
+python3 examples/simple_client.py path/to/a/CeEndpoint/dts.art \
+    --stops-file ../sim.mmackenz.TargetStops.<...>.art
+```
+
+That run passes `upstream_eff` (`--upstream-eff`, default 0.012) and leaves
+`prescale_filter` out, so the server's default target-stop label applies;
+`--prescale-filter PolyStopPrescaleFilter` overrides it, for a poly-stop file.
 
 Other flags: `--output-dir` (defaults to `output/example`), `--sig-eff`
 (handed to `approx_ce_sensitivity`), `--timeout-s`. There is no default input
@@ -376,7 +435,7 @@ writing outputs to /exp/mu2e/data/users/mmackenz/localtest/agent-output.
 Report the average calo and tracker Edep per event and per generated event.
 ```
 
-Chaining the two analyses, which is what `produced_by` is for:
+Chaining `edep` into the sensitivity, which is what `produced_by` is for:
 
 ```
 Run the edep analysis on <a CE signal art file>, then feed the nts.*.root it

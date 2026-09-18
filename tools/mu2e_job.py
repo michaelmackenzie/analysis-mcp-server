@@ -39,7 +39,7 @@ class JobOutcome:
     input_paths: list[Path]
     input_flag: str  # "-s" or "-S"
     file_list_path: Path | None
-    new_root_files: list[str] = field(default_factory=list)
+    written_root_files: list[str] = field(default_factory=list)
 
     @property
     def failed(self) -> bool:
@@ -71,6 +71,34 @@ def build_input_args(
     return "-S", str(file_list_path), file_list_path
 
 
+def root_snapshot(outdir: Path) -> dict[str, tuple[float, int]]:
+    """Name -> (mtime, size) for every ROOT file in outdir.
+
+    Taken before and after a job so its output is recognized by having been
+    *written*, not by being absent beforehand. Running twice into the same
+    directory overwrites the previous run's files, and a job whose output was
+    overwritten still produced it — comparing names alone would report nothing
+    the second time and leave an analysis chained onto it with no input.
+    """
+    snapshot: dict[str, tuple[float, int]] = {}
+    for path in outdir.glob("*.root"):
+        try:
+            stat = path.stat()
+        except OSError:      # vanished between the glob and the stat
+            continue
+        snapshot[path.name] = (stat.st_mtime, stat.st_size)
+    return snapshot
+
+
+def written_root_files(outdir: Path, before: dict[str, tuple[float, int]]) -> list[str]:
+    """The ROOT files in outdir that a job created or rewrote since `before`."""
+    return sorted(
+        str(outdir / name)
+        for name, stamp in root_snapshot(outdir).items()
+        if before.get(name) != stamp
+    )
+
+
 def validate_input_paths(paths: list[Path]) -> list[str]:
     """Return one complaint per unusable input path; empty means all good."""
     return [
@@ -92,12 +120,14 @@ def run_mu2e_job(
 ) -> JobOutcome:
     """Run `mu2e -c <fcl> -s|-S <input>` in outdir and capture everything.
 
-    Writes the combined stdout/stderr to outdir/<log_name> and reports any
-    ROOT files the job newly created there (TFileService output).
+    Writes the combined stdout/stderr to outdir/<log_name> and reports the
+    ROOT files the job wrote there (TFileService output), whether they were
+    new or overwrote a previous run's — outputs, logs and file lists are all
+    simply overwritten, so a directory can be reused.
     """
     outdir.mkdir(parents=True, exist_ok=True)
     log_path = outdir / log_name
-    before = {p.name for p in outdir.glob("*.root")}
+    before = root_snapshot(outdir)
 
     input_flag, input_arg, file_list_path = build_input_args(
         input_paths, outdir, single=single
@@ -136,7 +166,6 @@ def run_mu2e_job(
         encoding="utf-8",
     )
 
-    after = {p.name for p in outdir.glob("*.root")}
     return JobOutcome(
         command=script,
         returncode=returncode,
@@ -147,5 +176,5 @@ def run_mu2e_job(
         input_paths=list(input_paths),
         input_flag=input_flag,
         file_list_path=file_list_path,
-        new_root_files=sorted(str(outdir / name) for name in (after - before)),
+        written_root_files=written_root_files(outdir, before),
     )
