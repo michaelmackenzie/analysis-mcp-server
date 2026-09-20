@@ -43,6 +43,12 @@ class ParamSpec:
     `default=None` means the caller must supply it. Most knobs are numbers
     with optional bounds; `kind="text"` is for the ones that name something in
     the job's output, like a filter's module label.
+
+    A text knob is normally required to say something, so "" is refused as a
+    typo. `allow_empty=True` makes "" a meaningful answer instead — "there is
+    no such thing in this job" — for a knob that names something optional,
+    like `count`'s prescale filter. With `default=""` that is also the knob's
+    default, so the caller can simply not mention it.
     """
 
     name: str
@@ -51,6 +57,8 @@ class ParamSpec:
     minimum: float | None = None
     maximum: float | None = None
     kind: ParamKind = "number"
+    # text only: "" means "not set" rather than an empty value to reject.
+    allow_empty: bool = False
 
     @property
     def required(self) -> bool:
@@ -69,7 +77,12 @@ class ParamSpec:
     def check(self, value: Any) -> float | str:
         """Validate one supplied value, as the number or text it should be."""
         if self.kind == "text":
-            if not isinstance(value, str) or not value.strip():
+            if not isinstance(value, str):
+                raise ValueError(f"parameter '{self.name}' must be a string, "
+                                 f"got {value!r}")
+            if not value.strip():
+                if self.allow_empty:
+                    return ""
                 raise ValueError(f"parameter '{self.name}' must be a non-empty "
                                  f"string, got {value!r}")
             return value

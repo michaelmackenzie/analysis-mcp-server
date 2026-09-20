@@ -8,9 +8,9 @@ mu2e -c <the analysis' fcl> -s <data file>     # one file
 mu2e -c <the analysis' fcl> -S <file list>     # several, one path per line
 ```
 
-or a Python computation over a ROOT file an earlier analysis produced. Three
-analyses ship: energy deposition (`edep`), muon stopping rate
-(`muon_stop_rate`) and approximate CE sensitivity
+or a Python computation over a ROOT file an earlier analysis produced. Four
+analyses ship: energy deposition (`edep`), event counts (`count`), muon
+stopping rate (`muon_stop_rate`) and approximate CE sensitivity
 (`approx_ce_sensitivity`). Adding more is one small module each.
 
 Built to the same pattern as
@@ -46,7 +46,9 @@ tools/
   registry.py         the catalogue: name -> AnalysisSpec
   analyses/
     edep.py                    energy deposition: fcl + summary parser
-    muon_stop_rate.py          stopping rate: counts, prescale, POT scaling
+    count.py                   events, gen events, optional prescale + the
+                               parsing/job muon_stop_rate builds on
+    muon_stop_rate.py          stopping rate: count.py + POT scaling
     approx_ce_sensitivity.py   CE sensitivity from EdepAna histograms
   analysis_tools.py   the MCP tools: list_analyses, run_analysis
   __init__.py         __all__ — ONLY these names become tools
@@ -82,6 +84,7 @@ workflow can chain several runs and collect `metadata` uniformly.
 | analysis | input | reports |
 |---|---|---|
 | `edep` | art file(s) | average calo/tracker energy deposition per event and per generated event |
+| `count` | any art file with subrun bookkeeping | events kept per generated event, dividing out a prescale only if you name the filter |
 | `muon_stop_rate` | `sim.*.TargetStops.*.art` | stopped muons per generated event and per POT, from the file's event count, generated-event count and output prescale |
 | `approx_ce_sensitivity` | `nts.*.root` from `edep` | `S/sqrt(B)` for the best momentum window, with the window and its signal/DIO/cosmic counts |
 
@@ -151,7 +154,31 @@ last 20 log lines, so an agent can diagnose without re-running.
 | `avg_trk_edep_per_event_mev` | MeV | `Average tracker energy deposition per event` |
 | `avg_trk_edep_per_gen_event_mev` | MeV | `... per gen event` |
 
-`muon_stop_rate` runs `print_counts.fcl` and reports:
+`count` runs `print_counts.fcl` and reports what any art file with subrun
+bookkeeping can say about itself:
+
+| metric | unit | from the job's print |
+|---|---|---|
+| `n_events` | | `<N> Event records found` — events kept in the file |
+| `n_gen_events` | | `GenEventCount total: <N> events in <M> SubRuns` |
+| `prescale` | | `with prescale fraction <P>`, for the `prescale_filter`, or 1 |
+| `saved_per_gen_event` | events / generated event | `n_events / (n_gen_events * prescale)` |
+
+Its one parameter, `prescale_filter`, is **optional and has no assumed name**:
+most files were never prescaled, and a job that did prescale one chooses its
+own module labels. Left unset (the default, `""`) the prescale is 1 and the
+answer is the file's own events per generated event; name a filter and that
+filter's prescale is divided out, giving the rate before the prescale threw
+events away. A filter that is named but not in the job's output is an error
+rather than a silent fallback to 1 — that fallback would report a prescaled
+file's rate short by exactly the prescale, with nothing in the output to show
+for it. Either way `metadata.prescale_filters` lists every block the job
+printed, so an unset run is also how you discover what there was to name.
+
+`muon_stop_rate` is `count` with the target-stop filter and one more factor.
+It shares `count.py`'s parsing, input check and job run — `count.py` is the
+only place that knows how to read `print_counts.fcl` — and adds what is about
+muon stops rather than about counting. It reports:
 
 | metric | unit | from the job's print |
 |---|---|---|
@@ -170,7 +197,10 @@ It takes two parameters:
 - `prescale_filter` (optional, default `TargetStopPrescaleFilter`) — the
   module label of the filter whose stream the file belongs to. Pass
   `PolyStopPrescaleFilter` to read a poly-stop file's own rate, or another
-  label for a job that named its filters differently.
+  label for a job that named its filters differently. Unlike `count`'s
+  same-named knob it will not take `""`: a target-stop file is always
+  prescaled, so "no filter" is not an answer here — use `count` for a file
+  that was not.
 
 `metadata` carries every `PrescaleFilterFraction` block the job printed
 (`prescale_filters`), not just the one used, so the other streams' fractions
@@ -354,7 +384,7 @@ A Musing has no directory of ours to look in: the relative path goes to
 python3 tests/test_tools.py
 ```
 
-55 tests, none of which start a mu2e job. (The `ana` env has no pytest, so
+59 tests, none of which start a mu2e job. (The `ana` env has no pytest, so
 these are bare asserts.)
 
 ## Run the server

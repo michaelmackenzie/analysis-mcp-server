@@ -18,10 +18,11 @@ import numpy as np
 from tools import ANALYSES, list_analyses, run_analysis
 from tools.analyses import approx_ce_sensitivity as sens
 from tools.analyses.edep import parse_edep_summary
-from tools.analyses.muon_stop_rate import (CountsError, dataset_description,
-                                           dataset_hint, parse_counts,
-                                           parse_prescale_filters, stop_rates,
-                                           wrong_dataset)
+from tools.analyses.count import (CountsError, dataset_description,
+                                  dataset_hint, parse_counts,
+                                  parse_prescale_filters, saved_rates,
+                                  wrong_dataset)
+from tools.analyses.muon_stop_rate import PRESCALE_FILTER, stop_rates
 from tools.mu2e_env import EnvError, Mu2eEnv, configure, current
 from tools.mu2e_job import (build_input_args, root_snapshot,
                             validate_input_paths, written_root_files)
@@ -71,6 +72,7 @@ Art has completed and will exit with status 0.
 # One stdout sample per art_files analysis, so the registry test can exercise
 # each parser. Add an entry when adding such an analysis.
 SAMPLE_STDOUT = {"edep": SAMPLE_EDEP_STDOUT,
+                 "count": SAMPLE_COUNTS_STDOUT,
                  "muon_stop_rate": SAMPLE_COUNTS_STDOUT}
 
 
@@ -104,10 +106,10 @@ def test_edep_parse_returns_none_on_truncated_summary():
     assert parse_edep_summary(truncated) is None
 
 
-# --- the muon_stop_rate parser -----------------------------------------------
+# --- the shared count parser (count.py) --------------------------------------
 
-def test_counts_parses_events_gen_events_and_the_target_stop_prescale():
-    assert parse_counts(SAMPLE_COUNTS_STDOUT) == {
+def test_counts_parses_events_gen_events_and_the_named_prescale():
+    assert parse_counts(SAMPLE_COUNTS_STDOUT, PRESCALE_FILTER) == {
         "n_events": 735.0,
         "n_gen_events": 12500.0,
         "prescale": 1.0,        # the TargetStop filter's, not PolyStop's 0.001
@@ -118,6 +120,39 @@ def test_counts_takes_the_prescale_of_whichever_filter_is_named():
     counts = parse_counts(SAMPLE_COUNTS_STDOUT, "PolyStopPrescaleFilter")
     assert counts["prescale"] == 0.001
     assert counts["n_events"] == 735.0      # the file's events, either way
+
+
+def test_counts_needs_no_prescale_filter_at_all():
+    """No filter named: prescale 1, and the blocks that ARE there are ignored.
+
+    The point of `count`: nothing assumes a prescale module exists. The sample
+    holds three prescale blocks and none of them may be picked up by accident.
+    """
+    for unset in (None, ""):
+        assert parse_counts(SAMPLE_COUNTS_STDOUT, unset) == {
+            "n_events": 735.0,
+            "n_gen_events": 12500.0,
+            "prescale": 1.0,
+        }
+    # ... and the counts still parse out of a job that printed no block at all
+    bare = SAMPLE_COUNTS_STDOUT[SAMPLE_COUNTS_STDOUT.index("Begin processing"):]
+    assert parse_prescale_filters(bare) == {}
+    assert parse_counts(bare)["n_events"] == 735.0
+
+
+def test_counts_never_falls_back_to_no_prescale_for_a_filter_that_is_missing():
+    """A named-but-absent filter is an error, not a silent prescale of 1.
+
+    Falling back would report a prescaled file's rate short by exactly the
+    prescale, with nothing in the output to show for it.
+    """
+    without = SAMPLE_COUNTS_STDOUT.replace("PolyStopPrescaleFilter", "OtherFilter")
+    try:
+        parse_counts(without, "PolyStopPrescaleFilter")
+    except CountsError as exc:
+        assert "PolyStopPrescaleFilter" in str(exc)
+    else:
+        raise AssertionError("a named filter that is absent must be reported")
 
 
 def test_counts_reads_every_prescale_block():
@@ -133,7 +168,7 @@ def test_counts_rejects_output_without_the_target_stop_filter():
     without = SAMPLE_COUNTS_STDOUT.replace("TargetStopPrescaleFilter",
                                            "IPAStopPrescaleFilter")
     try:
-        parse_counts(without)
+        parse_counts(without, PRESCALE_FILTER)
     except CountsError as exc:
         assert "TargetStopPrescaleFilter" in str(exc)
         assert "IPAStopPrescaleFilter" in str(exc)      # names what it did find
@@ -144,7 +179,7 @@ def test_counts_rejects_output_without_the_target_stop_filter():
 def test_counts_rejects_output_without_the_generated_event_count():
     without = SAMPLE_COUNTS_STDOUT.replace("GenEventCount total: 12500 events", "")
     try:
-        parse_counts(without)
+        parse_counts(without, PRESCALE_FILTER)
     except CountsError as exc:
         assert "generated" in str(exc)
     else:
@@ -161,6 +196,7 @@ def test_dataset_hint_comes_from_the_filter_label():
     assert dataset_hint("TargetStopPrescaleFilter") == "targetstop"
     assert dataset_hint("PolyStopPrescaleFilter") == "polystop"
     assert dataset_hint("SomethingElse") == ""      # nothing to check against
+    assert dataset_hint(None) == "" and dataset_hint("") == ""   # no filter at all
 
 
 def test_wrong_dataset_follows_the_filter_it_is_given():
@@ -170,14 +206,27 @@ def test_wrong_dataset_follows_the_filter_it_is_given():
     unnamed = Path("stops.art")
     # A poly-stop file parses fine and carries the target filter's product, so
     # only the name says it is the wrong input.
-    assert wrong_dataset([target, unnamed]) == []
-    assert wrong_dataset([target, poly]) == [f"sim.mmackenz.PolyStops.{stem} (PolyStops)"]
+    assert wrong_dataset([target, unnamed], PRESCALE_FILTER) == []
+    assert wrong_dataset([target, poly], PRESCALE_FILTER) == [
+        f"sim.mmackenz.PolyStops.{stem} (PolyStops)"
+    ]
+    # With no filter named nothing is divided out, so no file is the wrong one.
+    assert wrong_dataset([target, poly]) == []
+    assert wrong_dataset([target, poly], "") == []
     # ... and the check follows the filter: with the poly filter it is the
     # target-stop file that is out of place.
     assert wrong_dataset([target, poly], "PolyStopPrescaleFilter") == [
         f"sim.mmackenz.TargetStops.{stem} (TargetStops)"
     ]
     assert wrong_dataset([target, poly], "OddlyNamedFilter") == []
+
+
+def test_saved_rates_divide_out_the_prescale():
+    counts = {"n_events": 735.0, "n_gen_events": 12500.0, "prescale": 0.5}
+    assert abs(saved_rates(counts)["saved_per_gen_event"] - 0.1176) < 1e-6
+    # an unprescaled file (prescale 1) is just the ratio
+    plain = {"n_events": 735.0, "n_gen_events": 12500.0, "prescale": 1.0}
+    assert abs(saved_rates(plain)["saved_per_gen_event"] - 0.0588) < 1e-6
 
 
 def test_stop_rates_divide_out_the_prescale_and_scale_by_the_upstream_efficiency():
@@ -304,7 +353,8 @@ def test_sensitivity_rejects_a_file_without_the_histograms(tmp_dir):
 # --- the registry (loops over every analysis) --------------------------------
 
 def test_registry_includes_every_analysis():
-    assert {"edep", "muon_stop_rate", "approx_ce_sensitivity"} <= set(ANALYSES)
+    assert {"edep", "count", "muon_stop_rate",
+            "approx_ce_sensitivity"} <= set(ANALYSES)
 
 
 def test_every_spec_is_self_consistent():
@@ -344,8 +394,11 @@ def test_every_art_analysis_parser_matches_its_declared_metrics():
         assert sample is not None, f"{name}: add a sample stdout to SAMPLE_STDOUT"
         if name == "edep":
             assert tuple(parse_edep_summary(sample)) == spec.metrics
+        elif name == "count":
+            assert tuple(saved_rates(parse_counts(sample))) == spec.metrics
         elif name == "muon_stop_rate":
-            parsed = stop_rates(parse_counts(sample), upstream_eff=1.0)
+            parsed = stop_rates(parse_counts(sample, PRESCALE_FILTER),
+                                upstream_eff=1.0)
             assert tuple(parsed) == spec.metrics
 
 
@@ -367,6 +420,15 @@ def test_list_analyses_reports_every_registered_analysis():
     assert stops["fcl_exists"] is True
     assert stops["parameters"]["upstream_eff"]["required"] is True
     assert stops["units"]["stops_per_pot"] == "stops / POT"
+
+    counts = catalogue["count"]
+    assert counts["input_kind"] == "art_files"
+    assert counts["fcl"].endswith("Mu2eOptAna/fcl/print_counts.fcl")
+    assert counts["fcl_exists"] is True
+    # the whole point of `count`: naming a prescale filter is optional
+    assert counts["parameters"]["prescale_filter"]["required"] is False
+    assert counts["parameters"]["prescale_filter"]["default"] == ""
+    assert counts["units"]["saved_per_gen_event"] == "events / generated event"
 
     ce = catalogue["approx_ce_sensitivity"]
     assert ce["input_kind"] == "root_file"
@@ -444,6 +506,27 @@ def test_text_param_defaults_and_validates():
             assert "prescale_filter" in str(exc)
         else:
             raise AssertionError(f"{bad!r} should not be a valid label")
+
+
+def test_optional_text_param_takes_the_empty_string_as_an_answer():
+    """count's prescale_filter: "" means "no such filter", not a typo.
+
+    muon_stop_rate's same-named knob (above) still refuses it — the difference
+    is ParamSpec.allow_empty, not the name.
+    """
+    spec = ANALYSES["count"]
+    assert spec.resolve_params(None)["prescale_filter"] == ""
+    assert spec.resolve_params({"prescale_filter": ""})["prescale_filter"] == ""
+    assert spec.resolve_params({"prescale_filter": "  "})["prescale_filter"] == ""
+    assert (spec.resolve_params({"prescale_filter": "PolyStopPrescaleFilter"})
+            ["prescale_filter"] == "PolyStopPrescaleFilter")
+    # allow_empty is about blank text, not about text: a number is still wrong
+    try:
+        spec.resolve_params({"prescale_filter": 7})
+    except ValueError as exc:
+        assert "prescale_filter" in str(exc)
+    else:
+        raise AssertionError("a non-string label should be rejected")
 
 
 def test_param_spec_rejects_non_numbers():
