@@ -23,6 +23,7 @@ from tools.analyses.count import (CountsError, dataset_description,
                                   parse_prescale_filters, saved_rates,
                                   wrong_dataset)
 from tools.analyses.muon_stop_rate import PRESCALE_FILTER, stop_rates
+from tools.analyses.stop_materials import material_rates
 from tools.mu2e_env import EnvError, Mu2eEnv, configure, current
 from tools.mu2e_job import (build_input_args, root_snapshot,
                             validate_input_paths, written_root_files)
@@ -350,11 +351,73 @@ def test_sensitivity_rejects_a_file_without_the_histograms(tmp_dir):
     assert "trk_front_energy" in result.message
 
 
+# --- stop_materials ----------------------------------------------------------
+
+# A MuBeam-stage ntuple with TargetMuonFinder/, PolyMuonFinder/ and
+# IPAMuonFinder/stopmat; the test using it is skipped where it is not on disk.
+STOPMAT_FILE = Path("/exp/mu2e/app/users/mmackenz/mu2eopt/"
+                    "nts.mmackenz.mubeam.Run1Bak_local0818120248.001800_00000000.root")
+
+
+def test_material_rates_divide_by_n_gen_and_sort_most_first():
+    rows = material_rates([("Al", 30.0, 30.0 ** 0.5), ("Steel", 70.0, 70.0 ** 0.5),
+                           ("Ti", 0.0, 0.0)], n_gen_events=1000.0)
+    assert [r["material"] for r in rows] == ["Steel", "Al", "Ti"]
+    assert abs(rows[0]["stops_per_gen_event"] - 0.07) < 1e-12
+    assert abs(rows[1]["stops_per_gen_event_err"] - 30.0 ** 0.5 / 1000.0) < 1e-12
+    assert abs(rows[0]["fraction"] - 0.7) < 1e-12 and rows[2]["fraction"] == 0.0
+
+
+def test_stop_materials_names_the_modules_it_could_have_read(tmp_dir):
+    """A module without a stopmat is an error listing the ones that have one."""
+    import uproot
+    path = Path(tmp_dir) / "stops.root"
+    with uproot.recreate(path) as f:
+        f["PolyMuonFinder/stopmat"] = np.histogram(np.zeros(1), bins=2)
+    result = run_analysis(analysis="stop_materials", data_file=str(path),
+                          output_dir=tmp_dir, parameters={"n_gen_events": 10})
+    assert result.status == "error"
+    assert "TargetMuonFinder/stopmat" in result.message
+    assert "PolyMuonFinder" in result.message
+
+
+def test_stop_materials_needs_n_gen_events(tmp_dir):
+    result = run_analysis(analysis="stop_materials", data_file="/a.root",
+                          output_dir=tmp_dir)
+    assert result.status == "error" and "n_gen_events" in result.message
+
+
+def test_stop_materials_reads_the_labelled_bins_of_a_real_file(tmp_dir):
+    if not STOPMAT_FILE.exists():
+        print(f"     (skipped: {STOPMAT_FILE} not on disk)")
+        return
+    result = run_analysis(analysis="stop_materials", data_file=str(STOPMAT_FILE),
+                          output_dir=tmp_dir, parameters={"n_gen_events": 1e6})
+    assert result.status == "success", result.message
+    meta = result.metadata
+    assert meta["stop_module"] == "TargetMuonFinder"
+    materials = {row["material"]: row for row in meta["materials"]}
+    assert "StoppingTarget_Al" in materials
+    # every stop is in a named bin, and the total is what the rates add up to
+    assert meta["unnamed_stops"] == 0.0
+    assert meta["n_stops"] == meta["hist_entries"]
+    total = sum(row["stops_per_gen_event"] for row in meta["materials"])
+    assert abs(total - meta["stops_per_gen_event"]) < 1e-12
+    assert abs(meta["stops_per_gen_event"] - meta["n_stops"] / 1e6) < 1e-15
+
+    poly = run_analysis(analysis="stop_materials", data_file=str(STOPMAT_FILE),
+                        output_dir=tmp_dir,
+                        parameters={"n_gen_events": 1e6,
+                                    "stop_module": "PolyMuonFinder"})
+    assert poly.status == "success", poly.message
+    assert poly.metadata["hist_path"] == "PolyMuonFinder/stopmat"
+
+
 # --- the registry (loops over every analysis) --------------------------------
 
 def test_registry_includes_every_analysis():
     assert {"edep", "count", "muon_stop_rate",
-            "approx_ce_sensitivity"} <= set(ANALYSES)
+            "approx_ce_sensitivity", "stop_materials"} <= set(ANALYSES)
 
 
 def test_every_spec_is_self_consistent():
@@ -376,7 +439,10 @@ def test_every_spec_is_self_consistent():
                 f"{name}: {current().missing_fcl(spec.fcl)}"
         else:
             assert spec.fcl is None, f"{name}: root_file analysis should have no fcl"
-            assert spec.produced_by, f"{name}: say which analysis produces its input"
+            # its input comes from another analysis here, or from elsewhere
+            # (a production job's ntuple) — either way, say which
+            assert spec.produced_by or spec.input_hint.strip(), \
+                f"{name}: say what produces its input"
 
 
 def test_every_summarizer_handles_its_own_metrics():
@@ -442,6 +508,11 @@ def test_list_analyses_reports_every_registered_analysis():
     assert {"npot", "cosmic_rate_per_s_per_mev"} <= set(ce["metrics"])
     assert ce["units"]["npot"] == "POT"
     assert "fcl" not in ce
+
+    mats = catalogue["stop_materials"]
+    assert mats["input_kind"] == "root_file"
+    assert mats["parameters"]["n_gen_events"]["required"] is True
+    assert mats["parameters"]["stop_module"]["default"] == "TargetMuonFinder"
 
 
 # --- parameter handling ------------------------------------------------------

@@ -8,10 +8,10 @@ mu2e -c <the analysis' fcl> -s <data file>     # one file
 mu2e -c <the analysis' fcl> -S <file list>     # several, one path per line
 ```
 
-or a Python computation over a ROOT file an earlier analysis produced. Four
-analyses ship: energy deposition (`edep`), event counts (`count`), muon
-stopping rate (`muon_stop_rate`) and approximate CE sensitivity
-(`approx_ce_sensitivity`). Adding more is one small module each.
+or a Python computation over a ROOT file. Five analyses ship: energy
+deposition (`edep`), event counts (`count`), muon stopping rate
+(`muon_stop_rate`), approximate CE sensitivity (`approx_ce_sensitivity`) and
+muon stops per material (`stop_materials`). Adding more is one small module each.
 
 Built to the same pattern as
 [`spectra-mcp-server`](https://github.com/HEP-KE/spectra-mcp-server), so the
@@ -50,6 +50,7 @@ tools/
                                parsing/job muon_stop_rate builds on
     muon_stop_rate.py          stopping rate: count.py + POT scaling
     approx_ce_sensitivity.py   CE sensitivity from EdepAna histograms
+    stop_materials.py          stops per material from <module>/stopmat
   analysis_tools.py   the MCP tools: list_analyses, run_analysis
   __init__.py         __all__ — ONLY these names become tools
 analysis_mcp_server/  generic drop-in wrapper (FastMCP): server.py, cli.py
@@ -87,6 +88,7 @@ workflow can chain several runs and collect `metadata` uniformly.
 | `count` | any art file with subrun bookkeeping | events kept per generated event, dividing out a prescale only if you name the filter |
 | `muon_stop_rate` | `sim.*.TargetStops.*.art` | stopped muons per generated event and per POT, from the file's event count, generated-event count and output prescale |
 | `approx_ce_sensitivity` | `nts.*.root` from `edep` | `S/sqrt(B)` for the best momentum window, with the window and its signal/DIO/cosmic counts |
+| `stop_materials` | `nts.*.root` from the stop-finding job (e.g. MuBeam) | muon stops per material, and per generated event for the `n_gen_events` you supply |
 
 `approx_ce_sensitivity` declares `produced_by = ["edep"]`, so chaining is
 discoverable: run `edep`, then pass the `nts.*.root` from its `files` to the
@@ -227,6 +229,37 @@ also records the rest of the assumptions (`sig_eff`, `signal_br`, the
 `onspill_seconds`), and it writes the macro's figures — `sig_vs_bkg.png`,
 `dio.png`, `response.png`, `res.png`, `ce_z.png`, `ce_r.png` — into
 `<output_dir>/figures`.
+
+`stop_materials` reads the TH1 `<stop_module>/stopmat` that a stop finder
+books in its job's TFileService output — one alphanumeric bin per stopping
+material, labelled with the material name, filled once per stopped muon. It
+takes two parameters:
+
+- `n_gen_events` (required) — the generated events the file is equivalent
+  to. The ntuple has no generated-event bookkeeping, so every rate is the
+  stop count divided by this number.
+- `stop_module` (optional, default `TargetMuonFinder`) — which finder's
+  histogram to read, e.g. `PolyMuonFinder` or `IPAMuonFinder`. If you name
+  one that has no `stopmat`, the error lists the modules that do.
+
+It reports the totals as metrics:
+
+| metric | unit | |
+|---|---|---|
+| `n_stops` | | stops summed over the labelled bins |
+| `n_gen_events` | | the parameter, repeated so the rate carries its normalization |
+| `stops_per_gen_event` | stops / generated event | `n_stops / n_gen_events` |
+| `stops_per_gen_event_err` | stops / generated event | from the histogram's bin errors |
+| `n_materials` | | materials with at least one stop |
+
+The breakdown is in `metadata.materials`, most stops first: one row per
+material with `material`, `stops`, `stops_err`, `stops_per_gen_event`,
+`stops_per_gen_event_err` and `fraction`. The same table is written to
+`<output_dir>/stop_materials.log`. ROOT extends an alphanumeric axis by
+doubling it, so unlabelled empty bins are normal and are dropped. Content in
+an unlabelled bin or in the under/overflow is kept out of the total and
+reported as `unnamed_stops`, with the details in `unlabelled_bins`,
+`underflow` and `overflow`.
 
 ## approx_ce_sensitivity
 
@@ -449,6 +482,20 @@ python3 examples/simple_client.py path/to/a/CeEndpoint/dts.art \
 That run passes `upstream_eff` (`--upstream-eff`, default 0.012) and leaves
 `prescale_filter` out, so the server's default target-stop label applies;
 `--prescale-filter PolyStopPrescaleFilter` overrides it, for a poly-stop file.
+
+`stop_materials` works the same way, over the ntuple of a job that ran the
+stop finders. It needs `--n-gen-events`, the generated events that file is
+equivalent to. The art file is optional, so leave it out and nothing but
+`stop_materials` runs (no mu2e job):
+
+```bash
+python3 examples/simple_client.py \
+    --stopmat-file ../nts.mmackenz.mubeam.Run1Bak_local0818120248.001800_00000000.root \
+    --n-gen-events 1e5
+```
+
+`--stop-module PolyMuonFinder` (or `IPAMuonFinder`) reads another finder's
+histogram; left out, the server's default `TargetMuonFinder` applies.
 
 Other flags: `--output-dir` (defaults to `output/example`), `--sig-eff`
 (handed to `approx_ce_sensitivity`), `--timeout-s`. There is no default input

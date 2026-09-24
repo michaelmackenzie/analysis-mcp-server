@@ -12,7 +12,8 @@ from importlib import import_module
 from .spec import AnalysisSpec
 
 # Module names under tools.analyses, each exposing SPEC.
-_ANALYSIS_MODULES = ("edep", "count", "muon_stop_rate", "approx_ce_sensitivity")
+_ANALYSIS_MODULES = ("edep", "count", "muon_stop_rate", "approx_ce_sensitivity",
+                     "stop_materials")
 
 
 def _load() -> dict[str, AnalysisSpec]:

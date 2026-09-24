@@ -5,10 +5,12 @@ What it does, in the order an agent would:
 
   1. connect to the server and list its tools
   2. `list_analyses`  -- the catalogue: input kinds, metrics, parameters
-  3. `run_analysis`   -- `edep` over the art file you name
+  3. `run_analysis`   -- `edep` over the art file you name, if you name one
   4. `run_analysis`   -- `muon_stop_rate`, if you pass --stops-file: another
                          analysis over its own input, so it takes its own file
-  5. `run_analysis`   -- `approx_ce_sensitivity` over the nts.*.root step 3
+  5. `run_analysis`   -- `stop_materials`, if you pass --stopmat-file: stops
+                         per material from a stop finder's stopmat histogram
+  6. `run_analysis`   -- `approx_ce_sensitivity` over the nts.*.root step 3
                          wrote, which is what `produced_by` is for
 
 Environment (the `ana` python already has the mcp SDK; no installs needed):
@@ -26,6 +28,14 @@ With the stopping rate too, which needs a target-stop sim file of its own:
 
     python3 examples/simple_client.py ../dts.mmackenz.CeEndpoint.....art \
         --stops-file ../sim.mmackenz.TargetStops.....art
+
+Stops per material, from the ntuple of a job that ran the stop finders. It
+needs the generated events that file is equivalent to, and leaves out the art
+file so no mu2e job runs at all:
+
+    python3 examples/simple_client.py \
+        --stopmat-file ../nts.mmackenz.mubeam.Run1Bak_local0818120248.001800_00000000.root \
+        --n-gen-events 1e5 [--stop-module PolyMuonFinder]
 
 A quick smoke test that does not wait for a full mu2e job (per-gen-event
 metrics are meaningless with --max-events, so skip the chained sensitivity):
@@ -78,11 +88,13 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
-        "data_file",
-        help="Path to the input art file. A relative path (or ~) is "
-             "resolved against the current directory before the call: the "
-             "server only takes absolute paths, since it runs the job from "
-             "its own working directory.",
+        "data_file", nargs="?",
+        help="Path to the input art file for edep (and, chained from it, "
+             "approx_ce_sensitivity). Optional when --stops-file or "
+             "--stopmat-file names something else to run. Every path given "
+             "here, relative or with ~, is resolved against the current "
+             "directory before the call: the server only takes absolute "
+             "paths, since it runs the job from its own working directory.",
     )
     parser.add_argument(
         "--output-dir",
@@ -145,6 +157,22 @@ def parse_args() -> argparse.Namespace:
              "falls back to its default, the target-stop stream.",
     )
     parser.add_argument(
+        "--stopmat-file",
+        help="The ROOT file (nts.*.root) of a job that ran the stop finders. "
+             "Given one, the client also runs stop_materials over it.",
+    )
+    parser.add_argument(
+        "--n-gen-events", type=float,
+        help="Generated events the --stopmat-file is equivalent to, handed "
+             "to stop_materials. Required with --stopmat-file.",
+    )
+    parser.add_argument(
+        "--stop-module",
+        help="Stop finder whose <module>/stopmat to read, for stop_materials. "
+             "Left out, the server falls back to its default, "
+             "TargetMuonFinder.",
+    )
+    parser.add_argument(
         "--timeout-s", type=int, default=1800,
         help="Kill the mu2e job after this many seconds.",
     )
@@ -153,7 +181,13 @@ def parse_args() -> argparse.Namespace:
         help="Stop after edep instead of feeding its ROOT file to "
              "approx_ce_sensitivity.",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if not (args.data_file or args.stops_file or args.stopmat_file):
+        parser.error("name something to run: an art file for edep, "
+                     "--stops-file, or --stopmat-file")
+    if args.stopmat_file and args.n_gen_events is None:
+        parser.error("--stopmat-file needs --n-gen-events")
+    return args
 
 
 def payload(result: Any) -> dict[str, Any]:
@@ -246,10 +280,13 @@ async def main() -> int:
 
     # The tool rejects relative paths, and rightly so -- the mu2e job runs
     # in output_dir, not here. Resolve ours so a relative argument works.
-    data_file = Path(args.data_file).expanduser().resolve()
-    stops_file = (Path(args.stops_file).expanduser().resolve()
-                  if args.stops_file else None)
-    for path in (data_file, stops_file):
+    def absolute(path: str | None) -> Path | None:
+        return Path(path).expanduser().resolve() if path else None
+
+    data_file = absolute(args.data_file)
+    stops_file = absolute(args.stops_file)
+    stopmat_file = absolute(args.stopmat_file)
+    for path in (data_file, stops_file, stopmat_file):
         if path is not None and not path.exists():
             print(f"No such input file: {path}", file=sys.stderr)
             return 2
@@ -269,18 +306,20 @@ async def main() -> int:
         show_catalogue(analyses)
 
         # 2. Energy deposition over the art file.
-        print(f"\n=== run_analysis: edep on {data_file} ===")
-        print("(a real mu2e job -- this can take a while)")
-        edep = payload(await session.call_tool("run_analysis", {
-            "analysis": "edep",
-            "data_file": str(data_file),
-            "output_dir": str(outdir / "edep"),
-            "timeout_s": args.timeout_s,
-            **({"max_events": args.max_events} if args.max_events else {}),
-        }))
-        show_result(edep, analyses["edep"]["metrics"])
-        if edep["status"] != "success":
-            return 1
+        edep = None
+        if data_file is not None:
+            print(f"\n=== run_analysis: edep on {data_file} ===")
+            print("(a real mu2e job -- this can take a while)")
+            edep = payload(await session.call_tool("run_analysis", {
+                "analysis": "edep",
+                "data_file": str(data_file),
+                "output_dir": str(outdir / "edep"),
+                "timeout_s": args.timeout_s,
+                **({"max_events": args.max_events} if args.max_events else {}),
+            }))
+            show_result(edep, analyses["edep"]["metrics"])
+            if edep["status"] != "success":
+                return 1
 
         # 3. A second analysis, over its own input. Its prescale_filter
         #    parameter is optional, so it is passed only when you set one and
@@ -303,10 +342,37 @@ async def main() -> int:
                 print(f"  prescale filter used: {meta['prescale_filter']} "
                       f"(of {', '.join(sorted(meta['prescale_filters']))})")
 
-        if args.no_chain:
-            return 0
+        # 4. Stops per material. The ntuple has no generated-event count of
+        #    its own, so n_gen_events always comes from you; stop_module is
+        #    optional and passed only when set.
+        failed = False
+        if stopmat_file is not None:
+            print(f"\n=== run_analysis: stop_materials on {stopmat_file} ===")
+            parameters = {"n_gen_events": args.n_gen_events}
+            if args.stop_module:
+                parameters["stop_module"] = args.stop_module
+            mats = payload(await session.call_tool("run_analysis", {
+                "analysis": "stop_materials",
+                "data_file": str(stopmat_file),
+                "output_dir": str(outdir / "stop_materials"),
+                "parameters": parameters,
+            }))
+            show_result(mats, analyses["stop_materials"]["metrics"])
+            if mats["status"] == "success":
+                print(f"  {'material':<24} {'stops':>8} {'stops / gen event':>26}"
+                      f" {'fraction':>9}")
+                for row in mats["metadata"]["materials"]:
+                    print(f"  {row['material']:<24} {row['stops']:>8g} "
+                          f"{row['stops_per_gen_event']:>12.4e} +- "
+                          f"{row['stops_per_gen_event_err']:<9.2e} "
+                          f"{row['fraction']:>9.4f}")
+            else:
+                failed = True
 
-        # 4. Chain: the nts.*.root edep wrote is what the sensitivity reads.
+        if edep is None or args.no_chain:
+            return 1 if failed else 0
+
+        # 5. Chain: the nts.*.root edep wrote is what the sensitivity reads.
         ntuples = [f for f in edep["files"] if Path(f).name.startswith("nts.")]
         if not ntuples:
             print("\nNo nts.*.root in edep's output, nothing to chain.")
@@ -320,7 +386,7 @@ async def main() -> int:
             "parameters": {"sig_eff": args.sig_eff},
         }))
         show_result(sens, analyses["approx_ce_sensitivity"]["metrics"])
-        return 0 if sens["status"] == "success" else 1
+        return 0 if sens["status"] == "success" and not failed else 1
 
 
 if __name__ == "__main__":

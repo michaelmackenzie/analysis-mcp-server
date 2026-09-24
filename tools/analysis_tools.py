@@ -32,8 +32,9 @@ def list_analyses() -> ArtifactResult:
     which is fixed when the server starts. `input_kind` says what to feed it:
 
       "art_files"  mu2e art file(s) — pass data_file or data_files
-      "root_file"  a ROOT file written by an earlier analysis (see
-                   `produced_by`) — pass data_file
+      "root_file"  a ROOT file, written by an earlier analysis (see
+                   `produced_by`) or by a production job (see
+                   `input_hint`) — pass data_file
 
     Chaining: an analysis whose `produced_by` names another should be given a
     ROOT file from that one's `files` output.
