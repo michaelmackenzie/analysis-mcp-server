@@ -37,6 +37,12 @@ file so no mu2e job runs at all:
         --stopmat-file ../nts.mmackenz.mubeam.Run1Bak_local0818120248.001800_00000000.root \
         --n-gen-events 1e5 [--stop-module PolyMuonFinder]
 
+Several such files are combined into one table; --n-gen-events is then the
+total for all of them:
+
+    python3 examples/simple_client.py --stopmat-file ../nts.*.root \
+        --n-gen-events 4e5
+
 A quick smoke test that does not wait for a full mu2e job (per-gen-event
 metrics are meaningless with --max-events, so skip the chained sensitivity):
 
@@ -157,14 +163,15 @@ def parse_args() -> argparse.Namespace:
              "falls back to its default, the target-stop stream.",
     )
     parser.add_argument(
-        "--stopmat-file",
-        help="The ROOT file (nts.*.root) of a job that ran the stop finders. "
-             "Given one, the client also runs stop_materials over it.",
+        "--stopmat-file", nargs="+", metavar="FILE",
+        help="ROOT file(s) (nts.*.root) of a job that ran the stop finders. "
+             "Given any, the client also runs stop_materials, combining "
+             "several into one table.",
     )
     parser.add_argument(
         "--n-gen-events", type=float,
-        help="Generated events the --stopmat-file is equivalent to, handed "
-             "to stop_materials. Required with --stopmat-file.",
+        help="Generated events the --stopmat-file(s) are equivalent to, in "
+             "total, handed to stop_materials. Required with --stopmat-file.",
     )
     parser.add_argument(
         "--stop-module",
@@ -285,8 +292,8 @@ async def main() -> int:
 
     data_file = absolute(args.data_file)
     stops_file = absolute(args.stops_file)
-    stopmat_file = absolute(args.stopmat_file)
-    for path in (data_file, stops_file, stopmat_file):
+    stopmat_files = [absolute(f) for f in args.stopmat_file or []]
+    for path in (data_file, stops_file, *stopmat_files):
         if path is not None and not path.exists():
             print(f"No such input file: {path}", file=sys.stderr)
             return 2
@@ -346,19 +353,27 @@ async def main() -> int:
         #    its own, so n_gen_events always comes from you; stop_module is
         #    optional and passed only when set.
         failed = False
-        if stopmat_file is not None:
-            print(f"\n=== run_analysis: stop_materials on {stopmat_file} ===")
+        if stopmat_files:
+            names = (str(stopmat_files[0]) if len(stopmat_files) == 1
+                     else f"{len(stopmat_files)} files")
+            print(f"\n=== run_analysis: stop_materials on {names} ===")
             parameters = {"n_gen_events": args.n_gen_events}
             if args.stop_module:
                 parameters["stop_module"] = args.stop_module
             mats = payload(await session.call_tool("run_analysis", {
                 "analysis": "stop_materials",
-                "data_file": str(stopmat_file),
+                # one file as data_file, several as data_files, as for any
+                # analysis; the server combines the list into one table
+                **({"data_file": str(stopmat_files[0])} if len(stopmat_files) == 1
+                   else {"data_files": [str(f) for f in stopmat_files]}),
                 "output_dir": str(outdir / "stop_materials"),
                 "parameters": parameters,
             }))
             show_result(mats, analyses["stop_materials"]["metrics"])
             if mats["status"] == "success":
+                if len(stopmat_files) > 1:
+                    for entry in mats["metadata"]["per_file"]:
+                        print(f"  {entry['n_stops']:>8g} stops in {entry['file']}")
                 print(f"  {'material':<24} {'stops':>8} {'stops / gen event':>26}"
                       f" {'fraction':>9}")
                 for row in mats["metadata"]["materials"]:

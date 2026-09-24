@@ -114,7 +114,7 @@ class RunContext:
 
     @property
     def input_path(self) -> Path:
-        """The single input, for root_file analyses."""
+        """The single input, for root_file analyses that take only one."""
         return self.input_paths[0]
 
 
@@ -151,6 +151,9 @@ class AnalysisSpec:
         parameters: Physics knobs the caller may/must supply.
         input_hint: What the input file(s) must contain.
         produced_by: Analyses whose output feeds this one, for chaining.
+        combines_files: root_file analyses only — takes data_files too, and
+            combines the files into one result. art_files analyses always
+            take a list, as one mu2e -S job.
     """
 
     name: str
@@ -166,6 +169,11 @@ class AnalysisSpec:
     # art_files analyses only, relative to the configured code (e.g.
     # Mu2eOptAna/fcl/edep.fcl); resolved per environment by list_analyses.
     fcl: Path | None = None
+    combines_files: bool = False
+
+    @property
+    def takes_file_list(self) -> bool:
+        return self.input_kind == "art_files" or self.combines_files
 
     def describe(self) -> dict[str, Any]:
         """The registry entry as list_analyses reports it."""
@@ -176,6 +184,7 @@ class AnalysisSpec:
             "units": dict(self.units or {}),
             "parameters": {p.name: p.describe() for p in self.parameters},
             "input_hint": self.input_hint,
+            "takes_data_files": self.takes_file_list,
         }
         if self.produced_by:
             entry["produced_by"] = list(self.produced_by)

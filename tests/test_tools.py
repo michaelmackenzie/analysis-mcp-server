@@ -23,7 +23,7 @@ from tools.analyses.count import (CountsError, dataset_description,
                                   parse_prescale_filters, saved_rates,
                                   wrong_dataset)
 from tools.analyses.muon_stop_rate import PRESCALE_FILTER, stop_rates
-from tools.analyses.stop_materials import material_rates
+from tools.analyses.stop_materials import combine_tables, material_rates
 from tools.mu2e_env import EnvError, Mu2eEnv, configure, current
 from tools.mu2e_job import (build_input_args, root_snapshot,
                             validate_input_paths, written_root_files)
@@ -368,6 +368,16 @@ def test_material_rates_divide_by_n_gen_and_sort_most_first():
     assert abs(rows[0]["fraction"] - 0.7) < 1e-12 and rows[2]["fraction"] == 0.0
 
 
+def test_combine_tables_matches_materials_by_name_not_bin():
+    """Each file labels its axis in its own order; a missing material is 0."""
+    combined = dict((name, (stops, err)) for name, stops, err in combine_tables([
+        [("Al", 3.0, 3.0), ("Steel", 4.0, 4.0)],
+        [("Steel", 12.0, 3.0), ("Ti", 1.0, 1.0)],
+    ]))
+    assert combined["Steel"] == (16.0, 5.0)       # errors add in quadrature
+    assert combined["Al"] == (3.0, 3.0) and combined["Ti"] == (1.0, 1.0)
+
+
 def test_stop_materials_names_the_modules_it_could_have_read(tmp_dir):
     """A module without a stopmat is an error listing the ones that have one."""
     import uproot
@@ -411,6 +421,36 @@ def test_stop_materials_reads_the_labelled_bins_of_a_real_file(tmp_dir):
                                     "stop_module": "PolyMuonFinder"})
     assert poly.status == "success", poly.message
     assert poly.metadata["hist_path"] == "PolyMuonFinder/stopmat"
+
+    # the same file twice: twice the stops over twice the generated events
+    both = run_analysis(analysis="stop_materials",
+                        data_files=[str(STOPMAT_FILE)] * 2, output_dir=tmp_dir,
+                        parameters={"n_gen_events": 2e6})
+    assert both.status == "success", both.message
+    assert both.metadata["n_stops"] == 2 * meta["n_stops"]
+    assert abs(both.metadata["stops_per_gen_event"]
+               - meta["stops_per_gen_event"]) < 1e-15
+    assert [f["n_stops"] for f in both.metadata["per_file"]] == [meta["n_stops"]] * 2
+    doubled = {row["material"]: row for row in both.metadata["materials"]}
+    al = materials["StoppingTarget_Al"]
+    assert doubled["StoppingTarget_Al"]["stops"] == 2 * al["stops"]
+    assert abs(doubled["StoppingTarget_Al"]["stops_err"]
+               - 2 ** 0.5 * al["stops_err"]) < 1e-9
+
+
+def test_stop_materials_names_the_file_in_a_list_that_lacks_the_histogram(tmp_dir):
+    import uproot
+    bad = Path(tmp_dir) / "bad.root"
+    with uproot.recreate(bad) as f:
+        f["other"] = np.histogram(np.zeros(1), bins=2)
+    if not STOPMAT_FILE.exists():
+        print(f"     (skipped: {STOPMAT_FILE} not on disk)")
+        return
+    result = run_analysis(analysis="stop_materials",
+                          data_files=[str(STOPMAT_FILE), str(bad)],
+                          output_dir=tmp_dir, parameters={"n_gen_events": 10})
+    assert result.status == "error"
+    assert str(bad) in result.message and str(STOPMAT_FILE) not in result.message
 
 
 # --- the registry (loops over every analysis) --------------------------------
@@ -513,6 +553,10 @@ def test_list_analyses_reports_every_registered_analysis():
     assert mats["input_kind"] == "root_file"
     assert mats["parameters"]["n_gen_events"]["required"] is True
     assert mats["parameters"]["stop_module"]["default"] == "TargetMuonFinder"
+    # a root_file analysis says whether it takes data_files; art ones always do
+    assert mats["takes_data_files"] is True
+    assert ce["takes_data_files"] is False
+    assert edep["takes_data_files"] is True
 
 
 # --- parameter handling ------------------------------------------------------

@@ -34,7 +34,8 @@ def list_analyses() -> ArtifactResult:
       "art_files"  mu2e art file(s) — pass data_file or data_files
       "root_file"  a ROOT file, written by an earlier analysis (see
                    `produced_by`) or by a production job (see
-                   `input_hint`) — pass data_file
+                   `input_hint`) — pass data_file, or data_files where
+                   `takes_data_files` is true
 
     Chaining: an analysis whose `produced_by` names another should be given a
     ROOT file from that one's `files` output.
@@ -79,9 +80,10 @@ def run_analysis(
       a generated file list for several inputs). Expect seconds to many
       minutes. Metrics cover the whole input set as ONE job, not one result per
       file — run the tool once per file if you need per-file numbers.
-    * "root_file" runs a Python computation over one ROOT file produced by an
-      earlier analysis, which is fast. Feed it a path from that analysis'
-      `files` output.
+    * "root_file" runs a Python computation over a ROOT file, which is fast.
+      Feed it a path from the producing analysis' `files` output, or the
+      production file `input_hint` describes. One whose `takes_data_files`
+      is true also takes several, and combines them into one result.
 
     Args:
         analysis: Which analysis to run (see list_analyses), e.g. "edep".
@@ -91,8 +93,10 @@ def run_analysis(
             fresh directory per run only when you want the outputs kept apart.
         data_file: Absolute path to one input file. Pass exactly one of
             data_file or data_files.
-        data_files: Absolute paths to several input art files, analyzed
-            together in one job. Only for "art_files" analyses.
+        data_files: Absolute paths to several input files, analyzed together
+            into one result: one mu2e job for "art_files" analyses, combined
+            histograms for a "root_file" analysis that takes them (see
+            `takes_data_files` in list_analyses).
         parameters: Analysis-specific physics knobs, e.g.
             {"sig_eff": 2.5e-4} for approx_ce_sensitivity. list_analyses reports
             each analysis' parameters, defaults, and which are required.
@@ -114,11 +118,11 @@ def run_analysis(
 
     if (data_file is None) == (data_files is None):
         return fail("pass exactly one of data_file (one input file) or "
-                    "data_files (a list of art files).",
+                    "data_files (a list of input files).",
                     data_file=data_file, data_files=data_files)
 
     if spec.input_kind == "root_file":
-        if data_files is not None:
+        if data_files is not None and not spec.combines_files:
             return fail(
                 f"takes a single ROOT file: pass data_file, not data_files. "
                 f"{spec.input_hint}"

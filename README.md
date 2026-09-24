@@ -88,7 +88,7 @@ workflow can chain several runs and collect `metadata` uniformly.
 | `count` | any art file with subrun bookkeeping | events kept per generated event, dividing out a prescale only if you name the filter |
 | `muon_stop_rate` | `sim.*.TargetStops.*.art` | stopped muons per generated event and per POT, from the file's event count, generated-event count and output prescale |
 | `approx_ce_sensitivity` | `nts.*.root` from `edep` | `S/sqrt(B)` for the best momentum window, with the window and its signal/DIO/cosmic counts |
-| `stop_materials` | `nts.*.root` from the stop-finding job (e.g. MuBeam) | muon stops per material, and per generated event for the `n_gen_events` you supply |
+| `stop_materials` | `nts.*.root` file(s) from the stop-finding job (e.g. MuBeam) | muon stops per material, and per generated event for the `n_gen_events` you supply |
 
 `approx_ce_sensitivity` declares `produced_by = ["edep"]`, so chaining is
 discoverable: run `edep`, then pass the `nts.*.root` from its `files` to the
@@ -123,7 +123,10 @@ Pass **exactly one** of:
 With `data_files` the whole set runs as **one** job, so the metrics cover all
 the inputs together, not one file each — call the tool once per file for
 per-file numbers. Raise `timeout_s` (max 7200) when passing many files.
-`data_files` and `max_events` apply only to `art_files` analyses.
+`max_events` applies only to `art_files` analyses. A `root_file` analysis
+takes `data_files` only if `list_analyses` reports `takes_data_files: true`
+for it (so far just `stop_materials`, which combines the files' histograms);
+the others take a single `data_file`.
 
 `max_events` (mu2e `--nevts`) caps events for a quick check before a full run.
 Beware: generated-event counts come from the input's subrun bookkeeping and
@@ -235,8 +238,8 @@ books in its job's TFileService output — one alphanumeric bin per stopping
 material, labelled with the material name, filled once per stopped muon. It
 takes two parameters:
 
-- `n_gen_events` (required) — the generated events the file is equivalent
-  to. The ntuple has no generated-event bookkeeping, so every rate is the
+- `n_gen_events` (required) — the generated events the input is equivalent
+  to, in total over all files when several are passed. The ntuple has no generated-event bookkeeping, so every rate is the
   stop count divided by this number.
 - `stop_module` (optional, default `TargetMuonFinder`) — which finder's
   histogram to read, e.g. `PolyMuonFinder` or `IPAMuonFinder`. If you name
@@ -252,14 +255,22 @@ It reports the totals as metrics:
 | `stops_per_gen_event_err` | stops / generated event | from the histogram's bin errors |
 | `n_materials` | | materials with at least one stop |
 
+Several files (`data_files`) are combined into one table, as `hadd` would.
+Bins are matched by material *name*: each file's axis is labelled in the
+order its own job met the materials, so the same bin number can be a
+different material in two files. A material that one file never saw counts
+as zero there. `metadata.per_file` gives each file's own stop count,
+histogram entries and anything outside its labelled bins, and an error in any
+one file names that file.
+
 The breakdown is in `metadata.materials`, most stops first: one row per
 material with `material`, `stops`, `stops_err`, `stops_per_gen_event`,
 `stops_per_gen_event_err` and `fraction`. The same table is written to
 `<output_dir>/stop_materials.log`. ROOT extends an alphanumeric axis by
 doubling it, so unlabelled empty bins are normal and are dropped. Content in
 an unlabelled bin or in the under/overflow is kept out of the total and
-reported as `unnamed_stops`, with the details in `unlabelled_bins`,
-`underflow` and `overflow`.
+reported as `unnamed_stops`, with the details per file in `per_file`
+(`unlabelled_bins`, `underflow`, `overflow`).
 
 ## approx_ce_sensitivity
 
@@ -494,8 +505,10 @@ python3 examples/simple_client.py \
     --n-gen-events 1e5
 ```
 
-`--stop-module PolyMuonFinder` (or `IPAMuonFinder`) reads another finder's
-histogram; left out, the server's default `TargetMuonFinder` applies.
+`--stopmat-file` takes several paths too (a shell glob works), combined into
+one table; `--n-gen-events` is then their total. `--stop-module
+PolyMuonFinder` (or `IPAMuonFinder`) reads another finder's histogram; left
+out, the server's default `TargetMuonFinder` applies.
 
 Other flags: `--output-dir` (defaults to `output/example`), `--sig-eff`
 (handed to `approx_ce_sensitivity`), `--timeout-s`. There is no default input
