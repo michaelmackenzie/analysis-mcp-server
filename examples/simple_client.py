@@ -10,7 +10,10 @@ What it does, in the order an agent would:
                          analysis over its own input, so it takes its own file
   5. `run_analysis`   -- `stop_materials`, if you pass --stopmat-file: stops
                          per material from a stop finder's stopmat histogram
-  6. `run_analysis`   -- `approx_ce_sensitivity` over the nts.*.root step 3
+  6. `run_analysis`   -- the trigger, only if you pass --trigger:
+                         `trigger_rate` and `trigger_timing` on pileup, and
+                         `trigger_efficiency` on --trigger-signal-file
+  7. `run_analysis`   -- `approx_ce_sensitivity` over the nts.*.root step 3
                          wrote, which is what `produced_by` is for
 
 Environment (the `ana` python already has the mcp SDK; no installs needed):
@@ -42,6 +45,15 @@ total for all of them:
 
     python3 examples/simple_client.py --stopmat-file ../nts.*.root \
         --n-gen-events 4e5
+
+The trigger analyses, which run only when asked for. Rate and timing run
+over the server's default pileup sample (mu2e-trig-config's CI files) unless
+--trigger-pileup-file names others; the efficiency needs a signal digi file:
+
+    python3 examples/simple_client.py --trigger \
+        [--trigger-signal-file /pnfs/.../dig.mu2e.CeEndpointOnSpill.....art] \
+        [--trigger-paths 'cpr_TrkDe_80m70p:1, apr_TrkDe_80m70p:1'] \
+        [--max-events 1000]
 
 A quick smoke test that does not wait for a full mu2e job (per-gen-event
 metrics are meaningless with --max-events, so skip the chained sensitivity):
@@ -85,6 +97,12 @@ REPO = Path(__file__).resolve().parent.parent
 # MDC2025ay (Offline v13_39_00, the first with EdepAna, which `edep` needs).
 # --musing or --code-tarball point the server somewhere else instead.
 WORK_AREA = "/exp/mu2e/app/users/mmackenz/mu2eopt"
+
+# The trigger paths --trigger runs by default: the calorimeter-seeded and
+# agnostic track paths. The TPR path is left out; it is the costliest to run
+# (its time-cluster finder dominates the event time), so name it with
+# --trigger-paths when you want it.
+DEFAULT_TRIGGER_PATHS = "cpr_TrkDe_80m70p:1, apr_TrkDe_80m70p:1"
 
 
 def parse_args() -> argparse.Namespace:
@@ -178,6 +196,31 @@ def parse_args() -> argparse.Namespace:
              "TargetMuonFinder.",
     )
     parser.add_argument(
+        "--trigger", action="store_true",
+        help="Also run the trigger analyses: trigger_rate and trigger_timing "
+             "on pileup, and trigger_efficiency if --trigger-signal-file is "
+             "given. Off by default; each is a real mu2e job.",
+    )
+    parser.add_argument(
+        "--trigger-paths", default=DEFAULT_TRIGGER_PATHS,
+        help="Trigger paths and prescales for --trigger, 'path:prescale' "
+             "entries separated by commas.",
+    )
+    parser.add_argument(
+        "--batch-mode", choices=("1BB", "2BB"), default="1BB",
+        help="Proton batches per cycle for trigger_rate, which sets the "
+             "spill duty factor (1BB 0.322, 2BB 0.246).",
+    )
+    parser.add_argument(
+        "--trigger-signal-file", nargs="+", metavar="FILE",
+        help="Signal digi art file(s) for trigger_efficiency, with --trigger.",
+    )
+    parser.add_argument(
+        "--trigger-pileup-file", nargs="+", metavar="FILE",
+        help="Pileup art file(s) for trigger_rate and trigger_timing. Left "
+             "out, the server uses its default, mu2e-trig-config's CI files.",
+    )
+    parser.add_argument(
         "--timeout-s", type=int, default=1800,
         help="Kill the mu2e job after this many seconds.",
     )
@@ -187,9 +230,13 @@ def parse_args() -> argparse.Namespace:
              "approx_ce_sensitivity.",
     )
     args = parser.parse_args()
-    if not (args.data_file or args.stops_file or args.stopmat_file):
+    if not (args.data_file or args.stops_file or args.stopmat_file
+            or args.trigger):
         parser.error("name something to run: an art file for edep, "
-                     "--stops-file, or --stopmat-file")
+                     "--stops-file, --stopmat-file, or --trigger")
+    if (args.trigger_signal_file or args.trigger_pileup_file) and not args.trigger:
+        parser.error("--trigger-signal-file and --trigger-pileup-file need "
+                     "--trigger")
     if args.stopmat_file and args.n_gen_events is None:
         parser.error("--stopmat-file needs --n-gen-events")
     return args
@@ -246,6 +293,23 @@ def show_result(result: dict[str, Any], metrics: list[str]) -> None:
     print(f"  log    : {meta.get('log_path', '(none)')}")
 
 
+def files_arg(paths: list[Path]) -> dict[str, Any]:
+    """One file as data_file, several as data_files, as for any analysis."""
+    if len(paths) == 1:
+        return {"data_file": str(paths[0])}
+    return {"data_files": [str(p) for p in paths]}
+
+
+def show_trigger_paths(result: dict[str, Any], value: str) -> None:
+    """The per-path block the efficiency and rate return in metadata.paths."""
+    if result["status"] != "success":
+        return
+    print(f"  {'path':<28} {'prescale':>8} {'passed':>7} {value:>24}")
+    for name, row in result["metadata"]["paths"].items():
+        print(f"  {name:<28} {row['prescale']:>8} {row['passed']:>7} "
+              f"{row[value]:>12.4g} +- {row[value + '_err']:<9.2g}")
+
+
 def code_args(args: argparse.Namespace) -> list[str]:
     """The server flags saying where Offline comes from: one of the three."""
     if args.musing:
@@ -291,7 +355,10 @@ async def main() -> int:
     data_file = absolute(args.data_file)
     stops_file = absolute(args.stops_file)
     stopmat_files = [absolute(f) for f in args.stopmat_file or []]
-    for path in (data_file, stops_file, *stopmat_files):
+    signal_files = [absolute(f) for f in args.trigger_signal_file or []]
+    pileup_files = [absolute(f) for f in args.trigger_pileup_file or []]
+    for path in (data_file, stops_file, *stopmat_files, *signal_files,
+                 *pileup_files):
         if path is not None and not path.exists():
             print(f"No such input file: {path}", file=sys.stderr)
             return 2
@@ -382,10 +449,70 @@ async def main() -> int:
             else:
                 failed = True
 
+        # 5. The trigger, only when asked for: the same paths and prescales
+        #    through all three. Rate and timing take no input file unless you
+        #    name one -- the server then runs its default pileup sample.
+        if args.trigger:
+            common: dict[str, Any] = {
+                "parameters": {"trigger_paths": args.trigger_paths},
+                "timeout_s": args.timeout_s,
+                **({"max_events": args.max_events} if args.max_events else {}),
+            }
+            pileup = files_arg(pileup_files) if pileup_files else {}
+            where = (f"{len(pileup_files)} pileup file(s)" if pileup_files
+                     else "the server's default pileup sample")
+            if signal_files:
+                print(f"\n=== run_analysis: trigger_efficiency on "
+                      f"{len(signal_files)} signal file(s) ===")
+                eff = payload(await session.call_tool("run_analysis", {
+                    "analysis": "trigger_efficiency", **files_arg(signal_files),
+                    "output_dir": str(outdir / "trigger_efficiency"), **common,
+                }))
+                show_result(eff, analyses["trigger_efficiency"]["metrics"])
+                show_trigger_paths(eff, "efficiency")
+                failed |= eff["status"] != "success"
+
+            print(f"\n=== run_analysis: trigger_rate on {where} ===")
+            rate = payload(await session.call_tool("run_analysis", {
+                "analysis": "trigger_rate", **pileup,
+                "output_dir": str(outdir / "trigger_rate"),
+                **common,
+                "parameters": {**common["parameters"],
+                               "batch_mode": args.batch_mode},
+            }))
+            show_result(rate, analyses["trigger_rate"]["metrics"])
+            show_trigger_paths(rate, "rate_hz")
+            failed |= rate["status"] != "success"
+
+            print(f"\n=== run_analysis: trigger_timing on {where} ===")
+            timing = payload(await session.call_tool("run_analysis", {
+                "analysis": "trigger_timing", **pileup,
+                "output_dir": str(outdir / "trigger_timing"), **common,
+            }))
+            show_result(timing, analyses["trigger_timing"]["metrics"])
+            if timing["status"] == "success":
+                meta = timing["metadata"]
+                print(f"  left out: first {meta['skipped_events']} event(s); "
+                      f"data fetch {meta['fetch_time_mean_ms']:.3g} ms/event "
+                      f"(whole event {meta['full_event_time_mean_ms']:.3g} ms)")
+                for path, ms in meta["path_time_ms"].items():
+                    print(f"  {path:<28} {ms:9.3g} ms/event")
+                # Every module in the order it ran. n_seen falls along a path
+                # as its filters (and prescale) stop events; a module shared
+                # by paths is charged to the first one that ran it.
+                print(f"\n  {'path:module':<52} {'n_seen':>7} {'ms/run':>8} "
+                      f"{'ms/event':>9}")
+                for row in meta["modules"]:
+                    name = f"{row['path']}:{row['label']}"
+                    note = "" if row["counted"] else "  (fetch, not counted)"
+                    print(f"  {name:<52} {row['n_seen']:>7} "
+                          f"{row['mean_ms']:>8.3g} {row['ms_per_event']:>9.3g}{note}")
+            failed |= timing["status"] != "success"
+
         if edep is None or args.no_chain:
             return 1 if failed else 0
 
-        # 5. Chain: the nts.*.root edep wrote is what the sensitivity reads.
+        # 6. Chain: the nts.*.root edep wrote is what the sensitivity reads.
         ntuples = [f for f in edep["files"] if Path(f).name.startswith("nts.")]
         if not ntuples:
             print("\nNo nts.*.root in edep's output, nothing to chain.")

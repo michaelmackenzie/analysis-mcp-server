@@ -158,6 +158,8 @@ class AnalysisSpec:
         combines_files: root_file analyses only — takes data_files too, and
             combines the files into one result. art_files analyses always
             take a list, as one mu2e -S job.
+        default_inputs: Supplies the input when no data_file(s) are passed.
+        default_inputs_hint: What those default inputs are, for agents.
     """
 
     name: str
@@ -174,6 +176,11 @@ class AnalysisSpec:
     # the configured code and resolved per environment by list_analyses.
     fcl: Path | None = None
     combines_files: bool = False
+    # Inputs used when the caller passes no data_file(s): returns the paths,
+    # or raises ValueError saying why there are none. Described for agents by
+    # default_inputs_hint.
+    default_inputs: Callable[[], list[Path]] | None = None
+    default_inputs_hint: str = ""
 
     @property
     def takes_file_list(self) -> bool:
@@ -192,6 +199,8 @@ class AnalysisSpec:
         }
         if self.produced_by:
             entry["produced_by"] = list(self.produced_by)
+        if self.default_inputs is not None:
+            entry["default_inputs"] = self.default_inputs_hint
         if self.fcl is not None:
             env = current_env()
             entry["fcl"] = str(env.resolve_fcl(self.fcl))

@@ -8,10 +8,12 @@ mu2e -c <the analysis' fcl> -s <data file>     # one file
 mu2e -c <the analysis' fcl> -S <file list>     # several, one path per line
 ```
 
-or a Python computation over a ROOT file. Five analyses ship: energy
+or a Python computation over a ROOT file. Eight analyses ship: energy
 deposition (`edep`), event counts (`count`), muon stopping rate
-(`muon_stop_rate`), approximate CE sensitivity (`approx_ce_sensitivity`) and
-muon stops per material (`stop_materials`). Adding more is one small module each.
+(`muon_stop_rate`), approximate CE sensitivity (`approx_ce_sensitivity`),
+muon stops per material (`stop_materials`), and the online trigger's
+efficiency, rate and processing time (`trigger_efficiency`, `trigger_rate`,
+`trigger_timing`). Adding more is one small module each.
 
 Built to the same pattern as
 [`spectra-mcp-server`](https://github.com/HEP-KE/spectra-mcp-server), so the
@@ -52,6 +54,11 @@ tools/
     muon_stop_rate.py          stopping rate: count.py + POT scaling
     approx_ce_sensitivity.py   CE sensitivity from the EdepAna tree
     stop_materials.py          stops per material from <module>/stopmat
+    trigger.py                 the trigger job (paths + prescales) and its
+                               parsing, shared by the three below
+    trigger_efficiency.py      fraction of signal events triggered
+    trigger_rate.py            trigger rate on pileup, overall and per path
+    trigger_timing.py          trigger processing time per event on pileup
   analysis_tools.py   the MCP tools: list_analyses, run_analysis
   __init__.py         __all__ — ONLY these names become tools
 analysis_mcp_server/  generic drop-in wrapper (FastMCP): server.py, cli.py
@@ -91,6 +98,9 @@ workflow can chain several runs and collect `metadata` uniformly.
 | `muon_stop_rate` | `sim.*.TargetStops.*.art` | stopped muons per generated event and per POT, from the file's event count, generated-event count and output prescale |
 | `approx_ce_sensitivity` | `nts.*.root` from `edep` | `S/sqrt(B)` for the best momentum window, with the window and its signal/DIO/cosmic counts |
 | `stop_materials` | `nts.*.root` file(s) from the stop-finding job (e.g. MuBeam) | muon stops per material, and per generated event for the `n_gen_events` you supply |
+| `trigger_efficiency` | signal digi art file(s) | fraction of events passing any of the given trigger paths, and per path |
+| `trigger_rate` | pileup digi art file(s); default: mu2e-trig-config's CI sample | trigger rate in Hz averaged over the cycle (duty factor from `batch_mode`) and on spill, overall and per path |
+| `trigger_timing` | pileup digi art file(s); default: mu2e-trig-config's CI sample | trigger processing time per event: mean, median, tail; per path and per module |
 
 `approx_ce_sensitivity` declares `produced_by = ["edep"]`, so chaining is
 discoverable: run `edep`, then pass the `nts.*.root` from its `files` to the
@@ -143,7 +153,11 @@ sensitivity is unchanged.
 
 ### Inputs
 
-Pass **exactly one** of:
+Pass **exactly one** of the following — or neither, for an analysis that
+`list_analyses` shows with `default_inputs` (`trigger_rate` and
+`trigger_timing`, which then run over the files in the configured code's
+`mu2e-trig-config/ci/data_files.txt`, found by following its `backing`
+links):
 
 - `data_file` — a single absolute art file path → `mu2e -s <file>`
 - `data_files` — a list of absolute art file paths → written one per line to
@@ -302,6 +316,75 @@ doubling it, so unlabelled empty bins are normal and are dropped. Content in
 an unlabelled bin or in the under/overflow is kept out of the total and
 reported as `unnamed_stops`, with the details per file in `per_file`
 (`unlabelled_bins`, `underflow`, `overflow`).
+
+## The trigger analyses
+
+`trigger_efficiency`, `trigger_rate` and `trigger_timing` run the online
+trigger menu's paths over art files, as one job each, built in
+`tools/analyses/trigger.py`. All three take `trigger_paths`, the paths and
+their prescales:
+
+```python
+parameters={"trigger_paths": "tpr_TrkDe_80m70p:1, cpr_TrkDe_80m70p:10, apr_TrkDe_80m70p"}
+```
+
+A path without `:N` has prescale 1. The job is `fcl/trigger.fcl`, which
+builds on `mu2e-trig-config/test/timingTest.fcl` (the physics menu with a
+Prefetch module, so reading the data is not charged to the first
+reconstruction module). Each run writes `trigger_job.fcl` into `output_dir`:
+that text with `physics.trigger_paths` and each path's prescale filter set.
+FHiCL can only `#include` through `FHICL_FILE_PATH`, not an absolute path,
+so the base is copied in rather than included.
+
+- **Prescales are applied in the job**, by each path's `PrescaleEvent` filter
+  (`event % prescale == 0`), as online. The overall count therefore carries
+  the real overlap between prescaled paths, and a prescaled-away path costs
+  no time. The filter's label follows the menu generator's convention
+  (`tpr_TrkDe_80m70p` → `TprTrkDe80m70pPS`); a test checks it against every
+  path in the published menu.
+- **Counts** come from art's TrigReport: events, events passing any path,
+  and each path's passes. Fractions carry the width of a uniform-prior
+  posterior as their uncertainty, so a path that never fired on a short
+  sample is not reported as exactly zero ± 0.
+- **`trigger_efficiency`** is relative to the events in the input: fold in
+  any filtering the sample already had (e.g. a "Triggerable" sample) yourself.
+- **`trigger_rate`** turns the accept fraction into Hz with the online event
+  rate: the on-spill microbunch rate (`microbunch_rate_hz`, one per 1695 ns)
+  times the spill duty factor. The duty factor follows `batch_mode` —
+  `1BB` (default) 0.322, `2BB` 0.246 — unless `duty_factor` is given. `rate_hz`
+  is averaged over the accelerator cycle, what the online system sees;
+  `onspill_rate_hz` is the rate during the spill. The event rate, duty factor
+  and microbunch rate are returned with every result.
+- **`trigger_timing`** reads the per-event times from the TimeTracker
+  database the job writes (`triggerTiming.db`, returned in `files`). An
+  event's time is the **sum of its modules' times without fetching the
+  data**: the Prefetch module (`PrefetchDAQData`) and the input source, which
+  TimeTracker times apart, are left out, as `mu2eTimingPlotsMaker` totals an
+  event. TimeTracker's own whole-event time includes the fetch, about 1 ms of
+  ~6 ms per event on the CI pileup sample, so it is reported only for
+  comparison (`metadata.fetch_time_mean_ms`, `metadata.full_event_time_mean_ms`).
+  The first `skip_events` (default 1) are left out too: the first event
+  carries the database and geometry initialization the running trigger
+  does not pay, ~1 s against a few ms per event, and would double the mean
+  of a few hundred events.
+  `metadata.modules` lists every module in the order it ran, with **N(seen)**
+  (`n_seen`, the timed events it ran on after the filters and prescale
+  upstream of it in its path, and `seen_fraction`), its time per run (mean,
+  median, rms, max) and per timed event (`ms_per_event`). The data fetch is
+  listed with `counted: false`. A module shared by several paths runs once
+  per event, charged to whichever path reached it first, so its runs can be
+  split over rows (e.g. `CaloHitMakerFast` under `calo_photon` on the events
+  that path's prescale let through, under `apr_` on the rest);
+  `n_seen_all_paths` and `ms_per_event_all_paths` add those up. `metadata.path_time_ms` is
+  what each path adds: TimeTracker charges a module shared by several paths
+  to the first that ran it. The times are wall-clock on whatever node runs
+  the job, so they compare configurations run on the same node, not
+  absolute online budgets.
+
+Per-path results are in `metadata.paths`: prescale, passes, and the
+efficiency or rate with its uncertainty. An unknown path name fails the job
+with art's `Unknown path ... has been specified in 'trigger_paths'`, carried
+in `metadata.stdout_tail`.
 
 ## approx_ce_sensitivity
 
@@ -468,7 +551,7 @@ goes to `mu2e`, art resolves it on `FHICL_FILE_PATH`, `fcl_exists` comes back
 python3 tests/test_tools.py
 ```
 
-72 tests, none of which start a mu2e job. (The `ana` env has no pytest, so
+84 tests, none of which start a mu2e job. (The `ana` env has no pytest, so
 these are bare asserts.)
 
 ## Run the server
@@ -554,6 +637,20 @@ Other flags: `--output-dir` (defaults to `output/example`), `--sig-eff`
 (handed to `approx_ce_sensitivity`), `--timeout-s`. There is no default input
 file: `edep` runs over any art file with the right products, while
 `approx_ce_sensitivity` only means anything for a CE signal sample.
+
+The trigger analyses run only with `--trigger` (`--batch-mode 2BB` for the
+two-batch duty factor in the rate; the timing prints the module table). Rate and timing then run
+over the server's default pileup sample (or `--trigger-pileup-file`), and the
+efficiency over `--trigger-signal-file` when given. The default
+`--trigger-paths` are `cpr_TrkDe_80m70p` and `apr_TrkDe_80m70p`: the TPR path
+is left out as the costliest to run (about 3.9 against 1.2 ms per event on
+the CI pileup sample), so name it explicitly when you want it:
+
+```bash
+python3 examples/simple_client.py --trigger --max-events 1000 \
+    --trigger-signal-file /pnfs/.../dig.mu2e.CeEndpointOnSpill.<...>.art \
+    [--trigger-paths 'tpr_TrkDe_80m70p, cpr_TrkDe_80m70p:10, apr_TrkDe_80m70p']
+```
 
 ## Use it from a client
 

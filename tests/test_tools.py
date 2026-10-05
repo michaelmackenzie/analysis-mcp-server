@@ -25,6 +25,10 @@ from tools.analyses.count import (CountsError, dataset_description,
                                   wrong_dataset)
 from tools.analyses.muon_stop_rate import PRESCALE_FILTER, stop_rates
 from tools.analyses.stop_materials import combine_tables, material_rates
+from tools.analyses import trigger as trig
+from tools.analyses.trigger_efficiency import efficiency_metrics
+from tools.analyses.trigger_rate import duty_factor, rate_metrics
+from tools.analyses.trigger_timing import timing_metrics
 from tools.mu2e_env import EnvError, Mu2eEnv, configure, current
 from tools.mu2e_job import (build_input_args, root_snapshot,
                             validate_input_paths, written_root_files)
@@ -72,11 +76,37 @@ GenEventCount total: 12500 events in 1 SubRuns
 Art has completed and will exit with status 0.
 """
 
+# The end of a trigger job's stdout: art's TrigReport, verbatim from a run of
+# three menu paths (cpr_ at prescale 3) over 200 CE digi events.
+SAMPLE_TRIGGER_STDOUT = """\
+Full event                                                           0.00106055     0.0163061      1.10655      0.0102812     0.077483        200
+TrigReport ---------- Event summary -------------
+TrigReport Events total = 200 passed = 182 failed = 18
+
+TrigReport ---------- Trigger-path summary ------------
+TrigReport    Path ID        Run     Passed     Failed      Error Name
+TrigReport        110        200        181         19          0 tpr_TrkDe_80m70p
+TrigReport        160        200         40        160          0 cpr_TrkDe_80m70p
+TrigReport        210        200        171         29          0 apr_TrkDe_80m70p
+
+TrigReport ---------- End-path summary ---------
+TrigReport        Run    Success      Error
+
+TrigReport ---------- Modules in path: apr_TrkDe_80m70p ------------
+TrigReport    Path ID    Visited     Passed     Failed      Error Name
+TrigReport        210        200        200          0          0 Prefetch
+
+Art has completed and will exit with status 0.
+"""
+
 # One stdout sample per art_files analysis, so the registry test can exercise
 # each parser. Add an entry when adding such an analysis.
 SAMPLE_STDOUT = {"edep": SAMPLE_EDEP_STDOUT,
                  "count": SAMPLE_COUNTS_STDOUT,
-                 "muon_stop_rate": SAMPLE_COUNTS_STDOUT}
+                 "muon_stop_rate": SAMPLE_COUNTS_STDOUT,
+                 "trigger_efficiency": SAMPLE_TRIGGER_STDOUT,
+                 "trigger_rate": SAMPLE_TRIGGER_STDOUT,
+                 "trigger_timing": SAMPLE_TRIGGER_STDOUT}
 
 
 # --- the edep parser ---------------------------------------------------------
@@ -496,6 +526,248 @@ def test_sensitivity_runs_on_the_tree_with_the_selection_it_is_given(tmp_dir):
     assert typo.status == "error" and "unknown variable" in typo.message
 
 
+# --- the trigger ---------------------------------------------------------------
+
+def test_trigger_paths_take_prescales_and_default_to_one():
+    assert trig.parse_trigger_paths(
+        "tpr_TrkDe_80m70p:1, cpr_TrkDe_80m70p:10 apr_TrkDe_80m70p") == [
+        ("tpr_TrkDe_80m70p", 1), ("cpr_TrkDe_80m70p", 10), ("apr_TrkDe_80m70p", 1)]
+
+
+def test_trigger_paths_refuse_what_cannot_be_run():
+    for bad, words in (("", "no trigger paths"),
+                       ("tpr_TrkDe:0", "at least 1"),
+                       ("tpr_TrkDe:x", "whole number"),
+                       ("tpr_TrkDe:2.5", "whole number"),
+                       ("tpr_TrkDe, tpr_TrkDe:2", "listed twice"),
+                       ('bad"name', "does not name"),
+                       ("1abc", "does not name")):
+        try:
+            trig.parse_trigger_paths(bad)
+        except trig.TriggerError as exc:
+            assert words in str(exc), (bad, str(exc))
+        else:
+            raise AssertionError(f"{bad!r} should have been refused")
+
+
+def test_prescale_module_follows_the_menu_generator():
+    assert trig.prescale_module("tpr_TrkDe_80m70p") == "TprTrkDe80m70pPS"
+    assert trig.prescale_module("apr_TrkDe_80m70p_D0200") == "AprTrkDe80m70pD0200PS"
+    assert trig.prescale_module("calo_photon") == "CaloPhotonPS"
+
+
+def test_prescale_module_names_every_path_in_the_published_menu():
+    """Against the generated menu itself, where it is on disk."""
+    gen = Path("/cvmfs/mu2e.opensciencegrid.org/Musings/SimJob/MDC2025ay/build/"
+               "al9-prof-e29-p107/mu2e-trig-config/gen")
+    menu, ps = gen / "trig_physMenu_OnSpill.fcl", gen / "trig_physMenuPSConfig_OnSpill.fcl"
+    if not (menu.exists() and ps.exists()):
+        return
+    import re
+    paths = re.findall(r'"\d+:(\w+)"', menu.read_text())
+    labels = set(re.findall(r"^\s*(\w+PS):", ps.read_text(), re.M))
+    assert paths and {trig.prescale_module(p) for p in paths} <= labels
+
+
+def test_job_fcl_sets_the_paths_and_their_prescales(tmp_dir):
+    base = Path(tmp_dir) / "base.fcl"
+    base.write_text('#include "mu2e-trig-config/test/timingTest.fcl"\n')
+    text = trig.job_fcl_text([("tpr_TrkDe_80m70p", 1), ("cpr_TrkDe_80m70p", 10)], base)
+    assert text.startswith('#include "mu2e-trig-config/test/timingTest.fcl"')
+    assert 'physics.trigger_paths : [ "tpr_TrkDe_80m70p", "cpr_TrkDe_80m70p" ]' in text
+    assert ("physics.filters.CprTrkDe80m70pPS.eventModeConfig : [ "
+            "{ eventMode: OnSpill prescale: 10 }, "
+            "{ eventMode: OffSpill prescale: 10 } ]") in text
+    # the shipped base is the one runs use
+    assert trig.FCL.exists() and "timingTest.fcl" in trig.FCL.read_text()
+
+
+def test_trig_report_parses_events_and_every_path():
+    report = trig.parse_trig_report(SAMPLE_TRIGGER_STDOUT)
+    assert (report.n_events, report.n_passed) == (200, 182)
+    assert list(report.paths) == ["tpr_TrkDe_80m70p", "cpr_TrkDe_80m70p",
+                                  "apr_TrkDe_80m70p"]
+    assert report.paths["cpr_TrkDe_80m70p"] == trig.PathCounts(200, 40, 160, 0)
+    # the per-module blocks after it are not mistaken for paths
+    assert "Prefetch" not in report.paths
+    assert trig.parse_trig_report("Art has completed and will exit with status 1.") is None
+
+
+def test_binomial_is_never_exactly_certain():
+    p, err = trig.binomial(0, 150)
+    assert p == 0.0 and 0.0 < err < 0.02
+    p, err = trig.binomial(150, 150)
+    assert p == 1.0 and 0.0 < err < 0.02
+    p, err = trig.binomial(500, 1000)
+    assert abs(err - (0.25 / 1000) ** 0.5) < 1e-3       # the usual, mid-range
+    assert trig.binomial(0, 0) == (0.0, 0.0)
+
+
+def test_rate_scales_the_accept_fraction_by_the_duty_cycled_event_rate():
+    report = trig.TrigReport(n_events=1000, n_passed=10)
+    metrics = rate_metrics(report, 5.0e5, 0.3)
+    assert metrics["accept_fraction"] == 0.01
+    assert abs(metrics["onspill_rate_hz"] - 5000.0) < 1e-9
+    assert abs(metrics["event_rate_hz"] - 1.5e5) < 1e-6
+    assert abs(metrics["rate_hz"] - 1500.0) < 1e-9          # averaged over the cycle
+    assert abs(metrics["rate_hz_err"] - metrics["accept_fraction_err"] * 1.5e5) < 1e-9
+    assert metrics["duty_factor"] == 0.3
+
+
+def test_duty_factor_comes_from_the_batch_mode_unless_given():
+    assert duty_factor("1BB", 0.0) == 0.322
+    assert duty_factor("2bb", 0.0) == 0.246
+    assert duty_factor("2BB", 0.5) == 0.5                   # given: overrides
+    try:
+        duty_factor("3BB", 0.0)
+    except trig.TriggerError as exc:
+        assert "1BB" in str(exc) and "duty_factor" in str(exc)
+    else:
+        raise AssertionError("an unknown batch mode should be refused")
+    params = ANALYSES["trigger_rate"].resolve_params({"trigger_paths": "apr_TrkDe_80m70p"})
+    assert params["batch_mode"] == "1BB" and params["duty_factor"] == 0.0
+
+
+def _write_timing_db(path: Path) -> None:
+    """Event 7 is the slow first one, then three ordinary events. Each runs a
+    2 ms Prefetch, then module A (tpr) and B (apr) for its processing time;
+    module C (apr, behind a filter) runs only on events 9 and 10, for 4 ms.
+    TimeTracker's whole-event time adds 1 ms of framework on top."""
+    import sqlite3
+    with sqlite3.connect(path) as con:
+        con.execute("CREATE TABLE TimeEvent(Run, SubRun, Event, Time)")
+        con.execute("CREATE TABLE TimeModule(Run, SubRun, Event, Path, "
+                    "ModuleLabel, ModuleType, Time)")
+        for event, t in ((7, 1.0), (8, 0.010), (9, 0.020), (10, 0.030)):
+            c = 0.004 if event in (9, 10) else 0.0
+            con.execute("INSERT INTO TimeEvent VALUES (1, 0, ?, ?)",
+                        (event, t + c + 0.002 + 0.001))
+            con.execute("INSERT INTO TimeModule VALUES (1, 0, ?, 'apr', "
+                        "'Prefetch', 'PrefetchDAQData', 0.002)", (event,))
+            con.execute("INSERT INTO TimeModule VALUES (1, 0, ?, 'tpr', 'A', "
+                        "'TypeA', ?)", (event, t * 0.75))
+            con.execute("INSERT INTO TimeModule VALUES (1, 0, ?, 'apr', 'B', "
+                        "'TypeB', ?)", (event, t * 0.25))
+            if c:
+                con.execute("INSERT INTO TimeModule VALUES (1, 0, ?, 'apr', "
+                            "'C', 'TypeC', ?)", (event, c))
+
+
+def test_timing_leaves_out_the_data_fetch_and_the_warm_up_events(tmp_dir):
+    db = Path(tmp_dir) / "triggerTiming.db"
+    _write_timing_db(db)
+    timed = trig.read_timing_db(db, skip_events=1)
+    assert timed.n_skipped == 1
+    # processing only: no Prefetch, no framework time
+    assert np.allclose(timed.times, [0.010, 0.024, 0.034])
+    assert np.allclose(timed.fetch_times, 0.002)
+    assert np.allclose(timed.full_event_times, [0.013, 0.027, 0.037])
+    assert abs(timed.per_path["tpr"] - 0.015) < 1e-12     # 0.75 * mean 0.020
+    assert abs(timed.per_path["apr"] - (0.005 + 0.008 / 3)) < 1e-12  # no Prefetch
+    everything = trig.read_timing_db(db, skip_events=0)
+    assert everything.times.size == 4 and everything.times[0] == 1.0
+    metrics = timing_metrics(timed.times)
+    assert abs(metrics["mean_time_ms"] - 68.0 / 3) < 1e-9
+    assert abs(metrics["median_time_ms"] - 24.0) < 1e-9
+    assert abs(metrics["max_time_ms"] - 34.0) < 1e-9
+    try:
+        trig.read_timing_db(Path(tmp_dir) / "missing.db", 1)
+    except trig.TriggerError as exc:
+        assert "no timing database" in str(exc)
+    else:
+        raise AssertionError("a missing database should be reported")
+
+
+def test_module_timing_counts_the_events_each_module_ran_on(tmp_dir):
+    db = Path(tmp_dir) / "triggerTiming.db"
+    _write_timing_db(db)
+    table = trig.read_timing_db(db, skip_events=1).module_table()
+    # every module, in the order they first ran, the fetch included but flagged
+    assert [(r["path"], r["label"]) for r in table] == [
+        ("apr", "Prefetch"), ("tpr", "A"), ("apr", "B"), ("apr", "C")]
+    rows = {r["label"]: r for r in table}
+    assert rows["Prefetch"]["counted"] is False and rows["A"]["counted"] is True
+    # C sat behind a filter: it ran on 2 of the 3 timed events
+    assert rows["A"]["n_seen"] == 3 and rows["C"]["n_seen"] == 2
+    assert abs(rows["C"]["seen_fraction"] - 2 / 3) < 1e-12
+    assert abs(rows["C"]["mean_ms"] - 4.0) < 1e-9          # per event it ran on
+    assert abs(rows["C"]["ms_per_event"] - 8.0 / 3) < 1e-9  # per timed event
+    assert abs(rows["A"]["max_ms"] - 22.5) < 1e-9 and rows["A"]["median_ms"] == 15.0
+    # the warm-up event is not counted as a run of anything
+    assert rows["Prefetch"]["n_seen"] == 3
+
+
+def test_a_shared_module_is_added_up_over_the_paths_that_ran_it(tmp_dir):
+    """CaloHit runs once per event, charged to whichever path got there first."""
+    import sqlite3
+    db = Path(tmp_dir) / "triggerTiming.db"
+    with sqlite3.connect(db) as con:
+        con.execute("CREATE TABLE TimeEvent(Run, SubRun, Event, Time)")
+        con.execute("CREATE TABLE TimeModule(Run, SubRun, Event, Path, "
+                    "ModuleLabel, ModuleType, Time)")
+        for event in range(1, 6):
+            con.execute("INSERT INTO TimeEvent VALUES (1, 0, ?, 0.01)", (event,))
+            first = "calo_photon" if event % 2 == 0 else "apr"
+            con.execute("INSERT INTO TimeModule VALUES (1, 0, ?, ?, 'CaloHit', "
+                        "'CaloHitMakerFast', 0.001)", (event, first))
+    rows = trig.read_timing_db(db, skip_events=1).module_table()
+    split = {r["path"]: r for r in rows}
+    assert split["calo_photon"]["n_seen"] == 2 and split["apr"]["n_seen"] == 2
+    for row in rows:
+        assert row["n_seen_all_paths"] == 4
+        assert abs(row["ms_per_event_all_paths"] - 1.0) < 1e-12
+
+
+def test_code_files_are_found_down_the_backing_chain(tmp_dir):
+    root = Path(tmp_dir)
+    area, musing, offline = root / "area", root / "musing", root / "offline"
+    for d in (area, musing, offline):
+        d.mkdir()
+    (area / "backing").symlink_to(musing)
+    (musing / "backing").symlink_to(offline)
+    target = musing / "mu2e-trig-config" / "ci"
+    target.mkdir(parents=True)
+    (target / "data_files.txt").write_text("/data/a.art\n\n# note\n/data/b.art\n")
+
+    env = Mu2eEnv.for_work_area(area)
+    found = env.find_code_file("mu2e-trig-config/ci/data_files.txt")
+    assert found == area / "backing" / "mu2e-trig-config/ci/data_files.txt"
+    assert env.find_code_file("nowhere/at/all.txt") is None
+
+    before = current()
+    try:
+        configure(env)
+        assert trig.default_pileup_inputs() == [Path("/data/a.art"), Path("/data/b.art")]
+        configure(Mu2eEnv.for_work_area(offline))
+        try:
+            trig.default_pileup_inputs()
+        except trig.TriggerError as exc:
+            assert "pass data_file" in str(exc)
+        else:
+            raise AssertionError("no CI file list should be reported")
+    finally:
+        configure(None)
+        assert current().describe() == before.describe()
+
+
+def test_a_musing_is_searched_from_its_published_directory():
+    env = Mu2eEnv.for_musing("SimJob MDC2025ay")
+    found = env.find_code_file(trig.DEFAULT_PILEUP_LIST)
+    musing_dir = Path("/cvmfs/mu2e.opensciencegrid.org/Musings/SimJob/MDC2025ay")
+    if musing_dir.is_dir():
+        assert found == musing_dir / trig.DEFAULT_PILEUP_LIST
+
+
+def test_only_analyses_with_default_inputs_run_without_data_files(tmp_dir):
+    result = run_analysis(analysis="trigger_efficiency", output_dir=tmp_dir,
+                          parameters={"trigger_paths": "tpr_TrkDe_80m70p"})
+    assert result.status == "error" and "exactly one of" in result.message
+    listed = list_analyses().metadata["analyses"]
+    assert "default_inputs" in listed["trigger_rate"]
+    assert "default_inputs" in listed["trigger_timing"]
+    assert "default_inputs" not in listed["trigger_efficiency"]
+
+
 # --- stop_materials ----------------------------------------------------------
 
 # A MuBeam-stage ntuple with TargetMuonFinder/, PolyMuonFinder/ and
@@ -653,6 +925,17 @@ def test_every_art_analysis_parser_matches_its_declared_metrics():
             parsed = stop_rates(parse_counts(sample, PRESCALE_FILTER),
                                 upstream_eff=1.0)
             assert tuple(parsed) == spec.metrics
+        elif name == "trigger_efficiency":
+            report = trig.parse_trig_report(sample)
+            assert tuple(efficiency_metrics(report)) == spec.metrics
+        elif name == "trigger_rate":
+            report = trig.parse_trig_report(sample)
+            assert tuple(rate_metrics(report, 1.0, 0.5)) == spec.metrics
+        elif name == "trigger_timing":
+            # its numbers come from the timing database, not stdout
+            assert tuple(timing_metrics(np.array([0.01, 0.02]))) == spec.metrics
+        else:
+            raise AssertionError(f"{name}: add its parser to this test")
 
 
 def test_list_analyses_reports_every_registered_analysis():
@@ -992,7 +1275,7 @@ def test_one_bad_path_in_data_files_is_reported(tmp_dir):
     assert "good.art" not in result.message  # the valid one isn't flagged
 
 
-def test_neither_input_is_rejected(tmp_dir):
+def test_neither_input_is_rejected_without_default_inputs(tmp_dir):
     result = run_analysis(analysis="edep", output_dir=tmp_dir)
     assert result.status == "error"
     assert "exactly one" in result.message
@@ -1002,7 +1285,7 @@ def test_both_inputs_at_once_are_rejected(tmp_dir):
     result = run_analysis(analysis="edep", data_file="/a.art",
                           data_files=["/b.art"], output_dir=tmp_dir)
     assert result.status == "error"
-    assert "exactly one" in result.message
+    assert "not both" in result.message
 
 
 def test_root_file_analysis_rejects_a_file_list(tmp_dir):

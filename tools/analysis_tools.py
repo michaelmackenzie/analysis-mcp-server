@@ -31,7 +31,8 @@ def list_analyses() -> ArtifactResult:
     server runs mu2e jobs in — a muse work area, a Musing, or a code tarball —
     which is fixed when the server starts. `input_kind` says what to feed it:
 
-      "art_files"  mu2e art file(s) — pass data_file or data_files
+      "art_files"  mu2e art file(s) — pass data_file or data_files, or
+                   neither where `default_inputs` says what is used instead
       "root_file"  a ROOT file, written by an earlier analysis (see
                    `produced_by`) or by a production job (see
                    `input_hint`) — pass data_file, or data_files where
@@ -92,7 +93,9 @@ def run_analysis(
             overwrites the previous run's output rather than failing. Use a
             fresh directory per run only when you want the outputs kept apart.
         data_file: Absolute path to one input file. Pass exactly one of
-            data_file or data_files.
+            data_file or data_files — or neither, for an analysis that lists
+            `default_inputs` (e.g. the trigger rate and timing default to
+            mu2e-trig-config's pileup sample).
         data_files: Absolute paths to several input files, analyzed together
             into one result: one mu2e job for "art_files" analyses, combined
             histograms for a "root_file" analysis that takes them (see
@@ -116,10 +119,18 @@ def run_analysis(
             metadata={"analysis": analysis, **extra},
         )
 
-    if (data_file is None) == (data_files is None):
-        return fail("pass exactly one of data_file (one input file) or "
-                    "data_files (a list of input files).",
+    if data_file is not None and data_files is not None:
+        return fail("pass one of data_file (one input file) or data_files "
+                    "(a list of input files), not both.",
                     data_file=data_file, data_files=data_files)
+    if data_file is None and data_files is None:
+        if spec.default_inputs is None:
+            return fail("pass exactly one of data_file (one input file) or "
+                        "data_files (a list of input files).")
+        try:
+            data_files = [str(p) for p in spec.default_inputs()]
+        except ValueError as exc:
+            return fail(str(exc))
 
     if spec.input_kind == "root_file":
         if data_files is not None and not spec.combines_files:
