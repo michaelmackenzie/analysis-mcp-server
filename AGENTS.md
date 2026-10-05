@@ -89,10 +89,19 @@ python3 -m analysis_mcp_server --transport stdio [--work-area DIR | --musing 'Si
   TimeTracker sqlite database, not stdout: an event's time is the sum of its
   module times without the data fetch (`FETCH_MODULE_TYPES`, i.e. Prefetch;
   the source is timed apart), and the first event (DB setup) is skipped.
+- **Never use `tpr_` or `mpr_` paths** in defaults, tests or examples: they
+  are in the trigger menu but not meant for the real trigger. Use `apr_`,
+  `cpr_` and `calo_` paths.
 - **Default inputs.** An `AnalysisSpec` with `default_inputs` runs without
   `data_file(s)`; the trigger rate and timing default to
   `mu2e-trig-config/ci/data_files.txt`, found with `Mu2eEnv.find_code_file`
   down the configured code's `backing` chain.
+- **EventNtuple track variables** (`trigger_efficiency_ntuple.py`) are
+  vectorized with awkward and read by leaf name (`filter_name`; uproot's
+  `arrays()` would parse a dotted name as an expression). `*_front` is the
+  downstream-going TT_Front crossing, and fit parameters are taken at the
+  TT_Mid segment's index. Add a variable to both `TRACK_VARIABLES` and
+  `track_variables`; a test checks that every advertised one is usable.
 - **`approx_ce_sensitivity` has a numerics trap.** Window sums run outward
   from each window's own edge, never as differences of prefix sums: the DIO
   spectrum spans ~18 orders of magnitude, and cancellation silently zeroes

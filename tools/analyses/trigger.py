@@ -15,7 +15,7 @@ carries the real correlation between prescaled paths, and a prescaled-away
 path costs no reconstruction time. The filter's label follows the menu
 generator's convention (generateMenuFromJSON.py): the path name's
 underscore-separated words capitalized and joined, then "PS", e.g.
-tpr_TrkDe_80m70p -> TprTrkDe80m70pPS.
+apr_TrkDe_80m70p -> AprTrkDe80m70pPS.
 
 Counts come from art's TrigReport (events, events passing any path, and each
 path's run/passed/failed/error). Times come from the TimeTracker database the
@@ -68,7 +68,7 @@ class TriggerError(ValueError):
 # --- the request -------------------------------------------------------------
 
 def parse_trigger_paths(text: str) -> list[tuple[str, int]]:
-    """'tpr_TrkDe_80m70p:1, cpr_TrkDe_80m70p:10' -> [(path, prescale), ...].
+    """'apr_TrkDe_80m70p:1, cpr_TrkDe_80m70p:10' -> [(path, prescale), ...].
 
     Entries are separated by commas or whitespace; a path without ':N' has
     prescale 1. Raises TriggerError naming the bad entry.
@@ -97,7 +97,7 @@ def parse_trigger_paths(text: str) -> list[tuple[str, int]]:
 
 
 def prescale_module(path: str) -> str:
-    """The PrescaleEvent filter's label in a menu path, e.g. TprTrkDe80m70pPS."""
+    """The PrescaleEvent filter's label in a menu path, e.g. AprTrkDe80m70pPS."""
     return "".join(word[:1].upper() + word[1:] for word in path.split("_")) + "PS"
 
 
@@ -139,10 +139,11 @@ def trigger_paths_param() -> ParamSpec:
         description=(
             "Trigger paths to run, each with its prescale: "
             "'path:prescale' entries separated by commas, e.g. "
-            "'tpr_TrkDe_80m70p:1, cpr_TrkDe_80m70p:10, apr_TrkDe_80m70p'. "
+            "'apr_TrkDe_80m70p:1, cpr_TrkDe_80m70p:10, calo_photon'. "
             "A path without ':N' has prescale 1. Names are the menu's paths "
-            "(mu2e-trig-config physMenu, e.g. tpr_/cpr_/apr_ track paths, "
-            "calo_photon); an unknown one fails the job with art's "
+            "(mu2e-trig-config physMenu, e.g. apr_/cpr_ track paths, "
+            "calo_photon; the menu's tpr_ and mpr_ paths are not meant for "
+            "the real trigger); an unknown one fails the job with art's "
             "'Unknown path' message. Prescales are applied in the job, as "
             "online (event number % prescale == 0)."
         ),

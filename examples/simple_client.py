@@ -13,7 +13,11 @@ What it does, in the order an agent would:
   6. `run_analysis`   -- the trigger, only if you pass --trigger:
                          `trigger_rate` and `trigger_timing` on pileup, and
                          `trigger_efficiency` on --trigger-signal-file
-  7. `run_analysis`   -- `approx_ce_sensitivity` over the nts.*.root step 3
+  7. `run_analysis`   -- `trigger_efficiency_ntuple`, if you pass
+                         --trigger-ntuple: the trigger efficiency read from
+                         EventNtuple trig_<path> branches, for a track
+                         selection -- no mu2e job
+  8. `run_analysis`   -- `approx_ce_sensitivity` over the nts.*.root step 3
                          wrote, which is what `produced_by` is for
 
 Environment (the `ana` python already has the mcp SDK; no installs needed):
@@ -54,6 +58,16 @@ over the server's default pileup sample (mu2e-trig-config's CI files) unless
         [--trigger-signal-file /pnfs/.../dig.mu2e.CeEndpointOnSpill.....art] \
         [--trigger-paths 'cpr_TrkDe_80m70p:1, apr_TrkDe_80m70p:1'] \
         [--max-events 1000]
+
+The trigger efficiency from EventNtuple file(s), which needs no mu2e job:
+the decisions are read from the ntuple's trig_<path> branches, for the events
+with a track passing the server's default selection (a converged downstream
+e- fit, p > 80 MeV/c at the tracker front, >= 15 active hits, chi2/dof < 5)
+or --ntuple-selection. --trigger-paths applies, without the prescales:
+
+    python3 examples/simple_client.py \
+        --trigger-ntuple /pnfs/mu2e/tape/phy-nts/nts/mu2e/CeMLeadingLogMix1BB/MDC2025au_best_v1_1-001/root/a8/50/nts.mu2e.CeMLeadingLogMix1BB.MDC2025au_best_v1_1-001.001430_00000000.root \
+        [--ntuple-selection 'status == 1 and pdg == 11 and downstream and 100 < p_front < 110']
 
 A quick smoke test that does not wait for a full mu2e job (per-gen-event
 metrics are meaningless with --max-events, so skip the chained sensitivity):
@@ -99,9 +113,8 @@ REPO = Path(__file__).resolve().parent.parent
 WORK_AREA = "/exp/mu2e/app/users/mmackenz/mu2eopt"
 
 # The trigger paths --trigger runs by default: the calorimeter-seeded and
-# agnostic track paths. The TPR path is left out; it is the costliest to run
-# (its time-cluster finder dominates the event time), so name it with
-# --trigger-paths when you want it.
+# agnostic track paths. The menu's TPR and MPR paths are left out: they are
+# not meant for the real trigger.
 DEFAULT_TRIGGER_PATHS = "cpr_TrkDe_80m70p:1, apr_TrkDe_80m70p:1"
 
 
@@ -221,6 +234,17 @@ def parse_args() -> argparse.Namespace:
              "out, the server uses its default, mu2e-trig-config's CI files.",
     )
     parser.add_argument(
+        "--trigger-ntuple", nargs="+", metavar="FILE",
+        help="EventNtuple file(s) with trig_<path> branches. Given any, the "
+             "client also runs trigger_efficiency_ntuple over them for "
+             "--trigger-paths (prescales dropped), combining several files.",
+    )
+    parser.add_argument(
+        "--ntuple-selection",
+        help="Track selection for --trigger-ntuple. Left out, the server's "
+             "default applies.",
+    )
+    parser.add_argument(
         "--timeout-s", type=int, default=1800,
         help="Kill the mu2e job after this many seconds.",
     )
@@ -231,9 +255,12 @@ def parse_args() -> argparse.Namespace:
     )
     args = parser.parse_args()
     if not (args.data_file or args.stops_file or args.stopmat_file
-            or args.trigger):
+            or args.trigger or args.trigger_ntuple):
         parser.error("name something to run: an art file for edep, "
-                     "--stops-file, --stopmat-file, or --trigger")
+                     "--stops-file, --stopmat-file, --trigger, or "
+                     "--trigger-ntuple")
+    if args.ntuple_selection is not None and not args.trigger_ntuple:
+        parser.error("--ntuple-selection needs --trigger-ntuple")
     if (args.trigger_signal_file or args.trigger_pileup_file) and not args.trigger:
         parser.error("--trigger-signal-file and --trigger-pileup-file need "
                      "--trigger")
@@ -306,7 +333,9 @@ def show_trigger_paths(result: dict[str, Any], value: str) -> None:
         return
     print(f"  {'path':<28} {'prescale':>8} {'passed':>7} {value:>24}")
     for name, row in result["metadata"]["paths"].items():
-        print(f"  {name:<28} {row['prescale']:>8} {row['passed']:>7} "
+        # an ntuple's decisions were made already: no prescale to show
+        prescale = row.get("prescale", "-")
+        print(f"  {name:<28} {prescale:>8} {row['passed']:>7} "
               f"{row[value]:>12.4g} +- {row[value + '_err']:<9.2g}")
 
 
@@ -357,8 +386,9 @@ async def main() -> int:
     stopmat_files = [absolute(f) for f in args.stopmat_file or []]
     signal_files = [absolute(f) for f in args.trigger_signal_file or []]
     pileup_files = [absolute(f) for f in args.trigger_pileup_file or []]
+    ntuple_files = [absolute(f) for f in args.trigger_ntuple or []]
     for path in (data_file, stops_file, *stopmat_files, *signal_files,
-                 *pileup_files):
+                 *pileup_files, *ntuple_files):
         if path is not None and not path.exists():
             print(f"No such input file: {path}", file=sys.stderr)
             return 2
@@ -509,10 +539,35 @@ async def main() -> int:
                           f"{row['mean_ms']:>8.3g} {row['ms_per_event']:>9.3g}{note}")
             failed |= timing["status"] != "success"
 
+        # 6. The trigger efficiency from EventNtuples: the decisions the
+        #    production trigger made, read from trig_<path> branches, so the
+        #    paths are names only -- prescales do not apply after the fact.
+        #    The selection is passed only when set, else the server's default.
+        if ntuple_files:
+            names = ", ".join(p.split(":")[0].strip()
+                              for p in args.trigger_paths.split(","))
+            what = (str(ntuple_files[0]) if len(ntuple_files) == 1
+                    else f"{len(ntuple_files)} files")
+            print(f"\n=== run_analysis: trigger_efficiency_ntuple on {what} ===")
+            parameters = {"trigger_paths": names}
+            if args.ntuple_selection is not None:
+                parameters["selection"] = args.ntuple_selection
+            ntuple_eff = payload(await session.call_tool("run_analysis", {
+                "analysis": "trigger_efficiency_ntuple",
+                **files_arg(ntuple_files),
+                "output_dir": str(outdir / "trigger_efficiency_ntuple"),
+                "parameters": parameters,
+            }))
+            show_result(ntuple_eff, analyses["trigger_efficiency_ntuple"]["metrics"])
+            if ntuple_eff["status"] == "success":
+                print(f"  selection: {ntuple_eff['metadata']['selection']}")
+            show_trigger_paths(ntuple_eff, "efficiency")
+            failed |= ntuple_eff["status"] != "success"
+
         if edep is None or args.no_chain:
             return 1 if failed else 0
 
-        # 6. Chain: the nts.*.root edep wrote is what the sensitivity reads.
+        # 7. Chain: the nts.*.root edep wrote is what the sensitivity reads.
         ntuples = [f for f in edep["files"] if Path(f).name.startswith("nts.")]
         if not ntuples:
             print("\nNo nts.*.root in edep's output, nothing to chain.")

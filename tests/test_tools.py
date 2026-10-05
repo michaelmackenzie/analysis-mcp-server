@@ -27,6 +27,7 @@ from tools.analyses.muon_stop_rate import PRESCALE_FILTER, stop_rates
 from tools.analyses.stop_materials import combine_tables, material_rates
 from tools.analyses import trigger as trig
 from tools.analyses.trigger_efficiency import efficiency_metrics
+from tools.analyses import trigger_efficiency_ntuple as ntrig
 from tools.analyses.trigger_rate import duty_factor, rate_metrics
 from tools.analyses.trigger_timing import timing_metrics
 from tools.mu2e_env import EnvError, Mu2eEnv, configure, current
@@ -76,8 +77,8 @@ GenEventCount total: 12500 events in 1 SubRuns
 Art has completed and will exit with status 0.
 """
 
-# The end of a trigger job's stdout: art's TrigReport, verbatim from a run of
-# three menu paths (cpr_ at prescale 3) over 200 CE digi events.
+# The end of a trigger job's stdout: art's TrigReport, in the format of a run
+# of three menu paths (cpr_ at prescale 3) over 200 CE digi events.
 SAMPLE_TRIGGER_STDOUT = """\
 Full event                                                           0.00106055     0.0163061      1.10655      0.0102812     0.077483        200
 TrigReport ---------- Event summary -------------
@@ -85,7 +86,7 @@ TrigReport Events total = 200 passed = 182 failed = 18
 
 TrigReport ---------- Trigger-path summary ------------
 TrigReport    Path ID        Run     Passed     Failed      Error Name
-TrigReport        110        200        181         19          0 tpr_TrkDe_80m70p
+TrigReport        400        200        181         19          0 calo_photon
 TrigReport        160        200         40        160          0 cpr_TrkDe_80m70p
 TrigReport        210        200        171         29          0 apr_TrkDe_80m70p
 
@@ -530,16 +531,16 @@ def test_sensitivity_runs_on_the_tree_with_the_selection_it_is_given(tmp_dir):
 
 def test_trigger_paths_take_prescales_and_default_to_one():
     assert trig.parse_trigger_paths(
-        "tpr_TrkDe_80m70p:1, cpr_TrkDe_80m70p:10 apr_TrkDe_80m70p") == [
-        ("tpr_TrkDe_80m70p", 1), ("cpr_TrkDe_80m70p", 10), ("apr_TrkDe_80m70p", 1)]
+        "calo_photon:1, cpr_TrkDe_80m70p:10 apr_TrkDe_80m70p") == [
+        ("calo_photon", 1), ("cpr_TrkDe_80m70p", 10), ("apr_TrkDe_80m70p", 1)]
 
 
 def test_trigger_paths_refuse_what_cannot_be_run():
     for bad, words in (("", "no trigger paths"),
-                       ("tpr_TrkDe:0", "at least 1"),
-                       ("tpr_TrkDe:x", "whole number"),
-                       ("tpr_TrkDe:2.5", "whole number"),
-                       ("tpr_TrkDe, tpr_TrkDe:2", "listed twice"),
+                       ("apr_TrkDe:0", "at least 1"),
+                       ("apr_TrkDe:x", "whole number"),
+                       ("apr_TrkDe:2.5", "whole number"),
+                       ("apr_TrkDe, apr_TrkDe:2", "listed twice"),
                        ('bad"name', "does not name"),
                        ("1abc", "does not name")):
         try:
@@ -551,7 +552,7 @@ def test_trigger_paths_refuse_what_cannot_be_run():
 
 
 def test_prescale_module_follows_the_menu_generator():
-    assert trig.prescale_module("tpr_TrkDe_80m70p") == "TprTrkDe80m70pPS"
+    assert trig.prescale_module("cpr_TrkDe_80m70p") == "CprTrkDe80m70pPS"
     assert trig.prescale_module("apr_TrkDe_80m70p_D0200") == "AprTrkDe80m70pD0200PS"
     assert trig.prescale_module("calo_photon") == "CaloPhotonPS"
 
@@ -564,7 +565,9 @@ def test_prescale_module_names_every_path_in_the_published_menu():
     if not (menu.exists() and ps.exists()):
         return
     import re
-    paths = re.findall(r'"\d+:(\w+)"', menu.read_text())
+    # tpr_/mpr_ paths are in the menu but not meant for the real trigger
+    paths = [p for p in re.findall(r'"\d+:(\w+)"', menu.read_text())
+             if not p.startswith(("tpr_", "mpr_"))]
     labels = set(re.findall(r"^\s*(\w+PS):", ps.read_text(), re.M))
     assert paths and {trig.prescale_module(p) for p in paths} <= labels
 
@@ -572,9 +575,9 @@ def test_prescale_module_names_every_path_in_the_published_menu():
 def test_job_fcl_sets_the_paths_and_their_prescales(tmp_dir):
     base = Path(tmp_dir) / "base.fcl"
     base.write_text('#include "mu2e-trig-config/test/timingTest.fcl"\n')
-    text = trig.job_fcl_text([("tpr_TrkDe_80m70p", 1), ("cpr_TrkDe_80m70p", 10)], base)
+    text = trig.job_fcl_text([("apr_TrkDe_80m70p", 1), ("cpr_TrkDe_80m70p", 10)], base)
     assert text.startswith('#include "mu2e-trig-config/test/timingTest.fcl"')
-    assert 'physics.trigger_paths : [ "tpr_TrkDe_80m70p", "cpr_TrkDe_80m70p" ]' in text
+    assert 'physics.trigger_paths : [ "apr_TrkDe_80m70p", "cpr_TrkDe_80m70p" ]' in text
     assert ("physics.filters.CprTrkDe80m70pPS.eventModeConfig : [ "
             "{ eventMode: OnSpill prescale: 10 }, "
             "{ eventMode: OffSpill prescale: 10 } ]") in text
@@ -585,7 +588,7 @@ def test_job_fcl_sets_the_paths_and_their_prescales(tmp_dir):
 def test_trig_report_parses_events_and_every_path():
     report = trig.parse_trig_report(SAMPLE_TRIGGER_STDOUT)
     assert (report.n_events, report.n_passed) == (200, 182)
-    assert list(report.paths) == ["tpr_TrkDe_80m70p", "cpr_TrkDe_80m70p",
+    assert list(report.paths) == ["calo_photon", "cpr_TrkDe_80m70p",
                                   "apr_TrkDe_80m70p"]
     assert report.paths["cpr_TrkDe_80m70p"] == trig.PathCounts(200, 40, 160, 0)
     # the per-module blocks after it are not mistaken for paths
@@ -630,7 +633,7 @@ def test_duty_factor_comes_from_the_batch_mode_unless_given():
 
 def _write_timing_db(path: Path) -> None:
     """Event 7 is the slow first one, then three ordinary events. Each runs a
-    2 ms Prefetch, then module A (tpr) and B (apr) for its processing time;
+    2 ms Prefetch, then module A (cpr) and B (apr) for its processing time;
     module C (apr, behind a filter) runs only on events 9 and 10, for 4 ms.
     TimeTracker's whole-event time adds 1 ms of framework on top."""
     import sqlite3
@@ -644,7 +647,7 @@ def _write_timing_db(path: Path) -> None:
                         (event, t + c + 0.002 + 0.001))
             con.execute("INSERT INTO TimeModule VALUES (1, 0, ?, 'apr', "
                         "'Prefetch', 'PrefetchDAQData', 0.002)", (event,))
-            con.execute("INSERT INTO TimeModule VALUES (1, 0, ?, 'tpr', 'A', "
+            con.execute("INSERT INTO TimeModule VALUES (1, 0, ?, 'cpr', 'A', "
                         "'TypeA', ?)", (event, t * 0.75))
             con.execute("INSERT INTO TimeModule VALUES (1, 0, ?, 'apr', 'B', "
                         "'TypeB', ?)", (event, t * 0.25))
@@ -662,7 +665,7 @@ def test_timing_leaves_out_the_data_fetch_and_the_warm_up_events(tmp_dir):
     assert np.allclose(timed.times, [0.010, 0.024, 0.034])
     assert np.allclose(timed.fetch_times, 0.002)
     assert np.allclose(timed.full_event_times, [0.013, 0.027, 0.037])
-    assert abs(timed.per_path["tpr"] - 0.015) < 1e-12     # 0.75 * mean 0.020
+    assert abs(timed.per_path["cpr"] - 0.015) < 1e-12     # 0.75 * mean 0.020
     assert abs(timed.per_path["apr"] - (0.005 + 0.008 / 3)) < 1e-12  # no Prefetch
     everything = trig.read_timing_db(db, skip_events=0)
     assert everything.times.size == 4 and everything.times[0] == 1.0
@@ -684,7 +687,7 @@ def test_module_timing_counts_the_events_each_module_ran_on(tmp_dir):
     table = trig.read_timing_db(db, skip_events=1).module_table()
     # every module, in the order they first ran, the fetch included but flagged
     assert [(r["path"], r["label"]) for r in table] == [
-        ("apr", "Prefetch"), ("tpr", "A"), ("apr", "B"), ("apr", "C")]
+        ("apr", "Prefetch"), ("cpr", "A"), ("apr", "B"), ("apr", "C")]
     rows = {r["label"]: r for r in table}
     assert rows["Prefetch"]["counted"] is False and rows["A"]["counted"] is True
     # C sat behind a filter: it ran on 2 of the 3 timed events
@@ -760,12 +763,117 @@ def test_a_musing_is_searched_from_its_published_directory():
 
 def test_only_analyses_with_default_inputs_run_without_data_files(tmp_dir):
     result = run_analysis(analysis="trigger_efficiency", output_dir=tmp_dir,
-                          parameters={"trigger_paths": "tpr_TrkDe_80m70p"})
+                          parameters={"trigger_paths": "apr_TrkDe_80m70p"})
     assert result.status == "error" and "exactly one of" in result.message
     listed = list_analyses().metadata["analyses"]
     assert "default_inputs" in listed["trigger_rate"]
     assert "default_inputs" in listed["trigger_timing"]
     assert "default_inputs" not in listed["trigger_efficiency"]
+
+
+# --- trigger efficiency from EventNtuples -------------------------------------
+
+# A CE EventNtuple with trig_<path> branches; tests using it are skipped where
+# it is not on disk.
+NTUPLE_FILE = Path("/pnfs/mu2e/tape/phy-nts/nts/mu2e/CeMLeadingLogMix1BB/"
+                   "MDC2025au_best_v1_1-001/root/a8/50/nts.mu2e.CeMLeadingLogMix1BB."
+                   "MDC2025au_best_v1_1-001.001430_00000000.root")
+
+
+def test_ntuple_trigger_names_drop_the_prefix_and_refuse_typos():
+    assert ntrig.parse_trigger_names("apr_TrkDe_80m70p, trig_cpr_TrkDe_80m70p") == [
+        "apr_TrkDe_80m70p", "cpr_TrkDe_80m70p"]
+    for bad in ("", "apr_TrkDe, trig_apr_TrkDe", "bad-name"):
+        try:
+            ntrig.parse_trigger_names(bad)
+        except ntrig.NtupleError:
+            pass
+        else:
+            raise AssertionError(f"{bad!r} should have been refused")
+
+
+def _ntuple_arrays():
+    """Two events in the EventNtuple's layout. Event 0: a downstream e- that
+    crosses TT_Front twice (upstream leg first), at 104 MeV/c, plus a track
+    with no segments at all. Event 1: an upstream-going e+."""
+    import awkward as ak
+
+    def seg(sid, px, py, pz, time, momerr=0.2):
+        return {"mom": {"fCoordinates": {"fX": px, "fY": py, "fZ": pz}},
+                "time": time, "momerr": momerr, "sid": sid}
+
+    def pars(d0, t0err):
+        return {"d0": d0, "maxr": 600.0, "tanDip": 0.7, "rad": 250.0,
+                "t0": 900.0, "t0err": t0err}
+
+    good = [seg(0, 0.0, 30.0, -80.0, 850.0),        # upstream-going TT_Front leg
+            seg(0, 0.0, 80.0, 66.4529, 900.0),       # downstream TT_Front: p = 104
+            seg(1, 0.0, 79.0, 66.0, 902.0)]          # TT_Mid, pz > 0
+    upstream = [seg(1, 0.0, 70.0, -60.0, 700.0)]
+    tracks = {
+        "trk.status": [[1, 1], [1]], "trk.goodfit": [[1, 0], [1]],
+        "trk.pdg": [[11, 11], [-11]], "trk.nactive": [[30, 5], [25]],
+        "trk.chisq": [[40.0, 9.0], [30.0]], "trk.ndof": [[30, 3], [20]],
+        "trkqual.result": [[0.9, 0.1], [0.8]], "trkpid.result": [[0.7, 0.0], [0.6]],
+        "trkcalohit.did": [[12, -1], [-1]], "trkcalohit.edep": [[95.0, 0.0], [0.0]],
+        "trkcalohit.dt": [[1.5, 0.0], [0.0]],
+        "trksegs": [[good, []], [upstream]],
+        "trksegpars_lh": [[[pars(10.0, 9.0), pars(20.0, 9.0), pars(30.0, 0.5)], []],
+                          [[pars(40.0, 0.4)]]],
+        "event": [5, 6], "run": [1, 1], "subrun": [0, 0],
+    }
+    for name in ntrig._TRK_FIELDS:
+        tracks.setdefault(f"trk.{name}", [[0, 0], [0]])
+    return {name: ak.Array(values) for name, values in tracks.items()}
+
+
+def test_ntuple_track_variables_take_the_downstream_front_and_the_mid_fit():
+    v = ntrig.track_variables(_ntuple_arrays())
+    assert v["_event"].tolist() == [0, 0, 1]
+    assert abs(v["p_front"][0] - 104.0) < 0.01               # not the upstream leg
+    assert v["t_front"][0] == 900.0 and v["downstream"].tolist() == [True, False, False]
+    assert abs(v["tandip_front"][0] - 66.4529 / 80.0) < 1e-6
+    assert v["d0"][0] == 30.0 and v["t0err"][0] == 0.5       # the TT_Mid entry
+    assert np.isnan(v["p_front"][1]) and np.isnan(v["d0"][1])  # no segments
+    assert np.isnan(v["p_front"][2]) and v["d0"][2] == 40.0  # upstream: no front
+    assert v["has_calo"].tolist() == [True, False, False]
+    assert v["calo_edep"][0] == 95.0 and np.isnan(v["calo_edep"][1])
+    assert v["charge"].tolist() == [-1.0, -1.0, 1.0]
+    assert v["ntrk"].tolist() == [2.0, 2.0, 1.0] and v["event"].tolist() == [5, 5, 6]
+    assert set(v) - {"_event"} == set(ntrig.TRACK_VARIABLES)
+    for name in ntrig.TRACK_VARIABLES:            # every advertised one is usable
+        apply_selection(f"{name} == {name}", v, v["_event"].size)
+
+
+def test_ntuple_efficiency_is_over_events_with_a_selected_track():
+    v = ntrig.track_variables(_ntuple_arrays())
+    triggers = {"a": np.array([True, True]), "b": np.array([False, True])}
+    counts = ntrig.efficiency_counts(v, triggers, 2, ntrig.DEFAULT_SELECTION)
+    assert counts["n_selected"] == 1 and counts["n_tracks_selected"] == 1
+    assert counts["n_triggered"] == 1 and counts["per_path"] == {"a": 1, "b": 0}
+    everything = ntrig.efficiency_counts(v, triggers, 2, "")
+    assert everything["n_selected"] == 2 and everything["per_path"]["b"] == 1
+    metrics = ntrig.efficiency_metrics(counts)
+    assert metrics["efficiency"] == 1.0 and metrics["efficiency_err"] > 0.0
+
+
+def test_ntuple_trigger_efficiency_on_a_real_file(tmp_dir):
+    if not NTUPLE_FILE.exists():
+        return
+    result = run_analysis(analysis="trigger_efficiency_ntuple",
+                          data_file=str(NTUPLE_FILE), output_dir=tmp_dir,
+                          parameters={"trigger_paths": "apr_TrkDe_80m70p, "
+                                                       "trig_cpr_TrkDe_80m70p"})
+    assert result.status == "success", result.message
+    meta = result.metadata
+    assert meta["n_events"] == 8212 and 0 < meta["n_selected"] < meta["n_events"]
+    assert meta["n_triggered"] <= meta["n_selected"]
+    for row in meta["paths"].values():                       # OR >= each path
+        assert row["passed"] <= meta["n_triggered"]
+    missing = run_analysis(analysis="trigger_efficiency_ntuple",
+                           data_file=str(NTUPLE_FILE), output_dir=tmp_dir,
+                           parameters={"trigger_paths": "not_a_path"})
+    assert missing.status == "error" and "It has: " in missing.message
 
 
 # --- stop_materials ----------------------------------------------------------
