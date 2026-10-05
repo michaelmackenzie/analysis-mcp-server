@@ -47,6 +47,18 @@ class Spectrum:
             entries=float(obj.member("fEntries")),
         )
 
+    @classmethod
+    def from_values(cls, x: np.ndarray, nbins: int, xmin: float, xmax: float,
+                    weights: np.ndarray | None = None, name: str = "",
+                    title: str = "") -> "Spectrum":
+        """Fill a histogram as TH1::Fill would: entries counts every fill,
+        including those off the axis, whose weight is then dropped."""
+        x = np.asarray(x, dtype=np.float64)
+        values, _ = np.histogram(x, bins=nbins, range=(xmin, xmax), weights=weights)
+        return cls(values=values.astype(np.float64), xmin=float(xmin),
+                   width=(xmax - xmin) / nbins, name=name, title=title,
+                   entries=float(x.size))
+
     @property
     def nbins(self) -> int:
         return int(self.values.size)

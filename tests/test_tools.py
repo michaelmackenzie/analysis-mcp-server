@@ -17,6 +17,7 @@ import numpy as np
 
 from tools import ANALYSES, list_analyses, run_analysis
 from tools.analyses import approx_ce_sensitivity as sens
+from tools.analyses import edep as edep_mod
 from tools.analyses.edep import parse_edep_summary
 from tools.analyses.count import (CountsError, dataset_description,
                                   dataset_hint, parse_counts,
@@ -27,8 +28,9 @@ from tools.analyses.stop_materials import combine_tables, material_rates
 from tools.mu2e_env import EnvError, Mu2eEnv, configure, current
 from tools.mu2e_job import (build_input_args, root_snapshot,
                             validate_input_paths, written_root_files)
+from tools.selection import SelectionError, apply_selection
 from tools.spectrum import Kernel, Spectrum
-from tools.spec import ParamSpec
+from tools.spec import FCL_DIR, ParamSpec
 
 # Verbatim shape of the block EdepAna_module.cc prints, with art's usual
 # surrounding noise.
@@ -339,8 +341,8 @@ def test_scan_keeps_a_tiny_window_count_against_a_huge_spectrum_total():
     assert abs(best["dio"] - 0.2 * 10) < 1e-6 or best["dio"] > 0.1, best
 
 
-def test_sensitivity_rejects_a_file_without_the_histograms(tmp_dir):
-    """A non-EdepAna ROOT file must be reported clearly, not crash."""
+def test_sensitivity_rejects_a_file_without_the_tree(tmp_dir):
+    """A non-EdepAna ROOT file (or a pre-tree one) is reported, not a crash."""
     import uproot
     path = Path(tmp_dir) / "empty.root"
     with uproot.recreate(path) as f:
@@ -348,7 +350,150 @@ def test_sensitivity_rejects_a_file_without_the_histograms(tmp_dir):
     result = run_analysis(analysis="approx_ce_sensitivity", data_file=str(path),
                           output_dir=tmp_dir, parameters={"sig_eff": 0.1})
     assert result.status == "error"
-    assert "trk_front_energy" in result.message
+    assert "EDepAna/tree" in result.message
+
+
+# --- selections and the EdepAna tree ------------------------------------------
+
+def test_selection_takes_python_and_root_spellings_alike():
+    x = {"a": np.array([1.0, 5.0, 20.0]), "b": np.array([0.0, 1.0, 2.0])}
+    expect = [False, True, False]
+    assert apply_selection("a > 2 and a < 10", x, 3).tolist() == expect
+    assert apply_selection("a > 2 && a < 10", x, 3).tolist() == expect
+    assert apply_selection("2 < a < 10", x, 3).tolist() == expect
+    assert apply_selection("!(a <= 2 || a >= 10)", x, 3).tolist() == expect
+    assert apply_selection("abs(a - 2*b) > 10", x, 3).tolist() == [False, False, True]
+    assert apply_selection("b != 1", x, 3).tolist() == [True, False, True]
+    assert apply_selection("", x, 3).all()                  # no cut at all
+
+
+def test_selection_fails_a_cut_on_a_missing_value():
+    x = {"a": np.array([np.nan, 5.0])}
+    assert apply_selection("a > 0", x, 2).tolist() == [False, True]
+    assert apply_selection("a <= 0", x, 2).tolist() == [False, False]
+
+
+def test_selection_refuses_what_it_should_not_run():
+    x = {"a": np.array([1.0, 2.0])}
+    for bad, words in (("a > ", "does not parse"),
+                       ("c > 1", "unknown variable"),
+                       ("a.__class__ > 1", "not allowed"),
+                       ("__import__('os') > 1", "unknown variable"),
+                       ("a + 1", "true/false")):
+        try:
+            apply_selection(bad, x, 2)
+        except SelectionError as exc:
+            assert words in str(exc), (bad, str(exc))
+        else:
+            raise AssertionError(f"{bad!r} should have been refused")
+
+
+def _edep_branches():
+    """Three events: one with no primary, one that never reached the tracker
+    front, one that did — raw branches as uproot hands them over."""
+    def per_event(*values):
+        out = np.empty(len(values), dtype=object)
+        out[:] = [np.asarray(v, dtype=np.float32) for v in values]
+        return out
+    branches = {
+        "nprimaries": np.array([0, 1, 2]),
+        "event_calo_edep": np.array([0.0, 30.0, 90.0]),
+        "event_calo_edep_vis": np.array([0.0, 25.0, 80.0]),
+        "event_trk_edep": np.array([0.0, 0.1, 0.2]),
+        "weight": np.ones(3), "run": np.ones(3), "subrun": np.ones(3),
+        "event": np.arange(3), "ngen": np.array([5, 5, 5]),
+    }
+    first = {"primary_start_x": -3904.0 + 30.0, "primary_start_y": 40.0,
+             "primary_start_z": 5500.0, "primary_start_px": 0.0,
+             "primary_start_py": 0.0, "primary_start_pz": 104.0,
+             "primary_start_e": 104.97, "primary_start_m": 0.511,
+             "primary_start_pdg": 11, "primary_calo_edep": 80.0,
+             "primary_calo_edep_vis": 75.0}
+    for name, value in first.items():
+        branches[name] = per_event([], [value], [value, 0.0])
+    branches["primary_trk_front_p"] = per_event([], [0.0], [103.0, 0.0])
+    branches["primary_trk_front_energy"] = per_event([], [0.0], [103.5, 0.0])
+    return branches
+
+
+def test_edep_variables_take_the_first_primary_and_mark_what_is_missing():
+    v = edep_mod.edep_variables(_edep_branches())
+    assert np.isnan(v["primary_start_e"][0])                # no primary
+    assert v["primary_start_e"][2] == np.float32(104.97)    # first primary's
+    assert v["has_trk_front"].tolist() == [False, False, True]
+    assert np.isnan(v["primary_trk_front_energy"][1])       # never got there
+    assert abs(v["primary_trk_front_energy_diff"][2] - (103.5 - 104.97)) < 1e-4
+    assert abs(v["primary_start_r"][1] - 50.0) < 1e-3       # detector frame
+    assert set(v) == set(edep_mod.EDEP_VARIABLES)
+    # every advertised variable is usable in a selection
+    for name in edep_mod.EDEP_VARIABLES:
+        edep_mod.select_events(v, f"{name} == {name}")
+
+
+def test_edep_selection_counts_weighted_events_per_gen_event():
+    v = edep_mod.edep_variables(_edep_branches())
+    assert edep_mod.selected_metrics(v, "event_calo_edep_vis > 50", 10.0) == {
+        "n_events_selected": 1.0, "selected_per_gen_event": 0.1}
+    assert edep_mod.selected_metrics(v, "", 10.0)["n_events_selected"] == 3.0
+
+
+def _write_edep_tree(path: Path, n: int = 4000) -> None:
+    """A CE-like EdepAna tree: ~105 MeV electrons losing a little on the way."""
+    import awkward as ak
+    import uproot
+    rng = np.random.default_rng(1)
+    e0 = np.full(n, 104.97, dtype=np.float32)
+    front = (e0 - rng.exponential(0.6, n)).astype(np.float32)
+    calo = rng.uniform(0.0, 100.0, n).astype(np.float32)
+    def one(values):
+        return ak.unflatten(values, np.ones(n, dtype=np.int64))
+    tree = {
+        "nprimaries": np.ones(n, dtype=np.int32),
+        "event_calo_edep": calo, "event_calo_edep_vis": calo,
+        "event_trk_edep": np.zeros(n, dtype=np.float32),
+        "weight": np.ones(n, dtype=np.float32),
+        "run": np.ones(n, dtype=np.int32), "subrun": np.ones(n, dtype=np.int32),
+        "event": np.arange(n, dtype=np.int32), "ngen": np.full(n, n, dtype=np.int64),
+        "primary_trk_front_p": one(front), "primary_trk_front_energy": one(front),
+        "primary_start_e": one(e0), "primary_start_pdg": one(np.full(n, 11, np.int32)),
+    }
+    zeros = np.zeros(n, dtype=np.float32)
+    for name in ("x", "y", "z", "px", "py", "pz", "m"):
+        tree[f"primary_start_{name}"] = one(zeros)
+    for name in ("primary_calo_edep", "primary_calo_edep_vis"):
+        tree[name] = one(calo)
+    # mktree, not assignment: this uproot writes a dict as an RNTuple
+    types = {name: ("var * " + str(values.layout.content.dtype)
+                    if isinstance(values, ak.Array) else values.dtype)
+             for name, values in tree.items()}
+    with uproot.recreate(path) as f:
+        f.mktree("EDepAna/tree", types).extend(tree)
+
+
+def test_sensitivity_runs_on_the_tree_with_the_selection_it_is_given(tmp_dir):
+    path = Path(tmp_dir) / "nts.owner.edep.test.root"
+    _write_edep_tree(path)
+    results = {}
+    for cut in ("event_calo_edep_vis > 10", "event_calo_edep_vis > 50"):
+        result = run_analysis(analysis="approx_ce_sensitivity",
+                              data_file=str(path), output_dir=tmp_dir,
+                              parameters={"sig_eff": 0.5, "selection": cut})
+        assert result.status == "success", result.message
+        results[cut] = result.metadata
+    loose, tight = results.values()
+    # the shape normalization is per selected event, so the selection matters
+    assert loose["n_events_selected"] > tight["n_events_selected"] > 0
+    assert loose["selection"] == sens.DEFAULT_SELECTION
+
+    nothing = run_analysis(analysis="approx_ce_sensitivity", data_file=str(path),
+                           output_dir=tmp_dir,
+                           parameters={"sig_eff": 0.5,
+                                       "selection": "event_calo_edep_vis > 1000"})
+    assert nothing.status == "error" and "0 of 4000" in nothing.message
+    typo = run_analysis(analysis="approx_ce_sensitivity", data_file=str(path),
+                        output_dir=tmp_dir,
+                        parameters={"sig_eff": 0.5, "selection": "calo > 10"})
+    assert typo.status == "error" and "unknown variable" in typo.message
 
 
 # --- stop_materials ----------------------------------------------------------
@@ -471,10 +616,10 @@ def test_every_spec_is_self_consistent():
             assert metric in spec.metrics, f"{name}: unit for unknown '{metric}'"
         for param in spec.parameters:
             assert param.description.strip(), f"{name}: {param.name} needs a description"
-        # art_files analyses name an fcl relative to the configured code;
+        # art_files analyses run an fcl shipped in this repo's fcl/;
         # root_file ones must not claim one at all
         if spec.input_kind == "art_files":
-            assert spec.fcl is not None and not spec.fcl.is_absolute(), name
+            assert spec.fcl is not None and spec.fcl.parent == FCL_DIR, name
             assert current().missing_fcl(spec.fcl) is None, \
                 f"{name}: {current().missing_fcl(spec.fcl)}"
         else:
@@ -499,7 +644,9 @@ def test_every_art_analysis_parser_matches_its_declared_metrics():
         sample = SAMPLE_STDOUT.get(name)
         assert sample is not None, f"{name}: add a sample stdout to SAMPLE_STDOUT"
         if name == "edep":
-            assert tuple(parse_edep_summary(sample)) == spec.metrics
+            # the summary block, then what the selection adds from the tree
+            assert (tuple(parse_edep_summary(sample)) + edep_mod._SELECTION_METRICS
+                    == spec.metrics)
         elif name == "count":
             assert tuple(saved_rates(parse_counts(sample))) == spec.metrics
         elif name == "muon_stop_rate":
@@ -516,20 +663,20 @@ def test_list_analyses_reports_every_registered_analysis():
 
     edep = catalogue["edep"]
     assert edep["input_kind"] == "art_files"
-    assert edep["fcl"].endswith("Mu2eOptAna/fcl/edep.fcl")
+    assert edep["fcl"] == str(FCL_DIR / "edep.fcl")
     assert edep["fcl_exists"] is True
     assert edep["units"]["avg_calo_edep_per_event_mev"] == "MeV"
 
     stops = catalogue["muon_stop_rate"]
     assert stops["input_kind"] == "art_files"
-    assert stops["fcl"].endswith("Mu2eOptAna/fcl/print_counts.fcl")
+    assert stops["fcl"] == str(FCL_DIR / "print_counts.fcl")
     assert stops["fcl_exists"] is True
     assert stops["parameters"]["upstream_eff"]["required"] is True
     assert stops["units"]["stops_per_pot"] == "stops / POT"
 
     counts = catalogue["count"]
     assert counts["input_kind"] == "art_files"
-    assert counts["fcl"].endswith("Mu2eOptAna/fcl/print_counts.fcl")
+    assert counts["fcl"] == str(FCL_DIR / "print_counts.fcl")
     assert counts["fcl_exists"] is True
     # the whole point of `count`: naming a prescale filter is optional
     assert counts["parameters"]["prescale_filter"]["required"] is False
@@ -707,6 +854,14 @@ def test_a_musing_sets_itself_up_and_leaves_the_fcl_to_art(tmp_dir):
     assert env.missing_fcl(fcl, Path(tmp_dir)) is None
 
 
+def test_a_shipped_fcl_is_used_as_is_and_checked_under_a_musing(tmp_dir):
+    env = Mu2eEnv.for_musing("SimJob MDC2025au")
+    fcl = FCL_DIR / "edep.fcl"
+    assert env.resolve_fcl(fcl, Path(tmp_dir)) == fcl
+    assert env.missing_fcl(fcl, Path(tmp_dir)) is None
+    assert "not found" in env.missing_fcl(FCL_DIR / "nope.fcl", Path(tmp_dir))
+
+
 def test_a_work_area_is_set_up_in_place_and_resolves_its_own_fcl(tmp_dir):
     area = Path(tmp_dir)
     (area / "Mu2eOptAna" / "fcl").mkdir(parents=True)
@@ -767,8 +922,9 @@ def test_configured_environment_is_what_analyses_see(tmp_dir):
         assert "musing SimJob MDC2025au" in catalogue.message
         assert catalogue.metadata["environment"] == "musing SimJob MDC2025au"
         edep = catalogue.metadata["analyses"]["edep"]
-        assert edep["fcl"] == "Mu2eOptAna/fcl/edep.fcl"   # relative, art resolves it
-        assert edep["fcl_exists"] is None                 # unknowable from here
+        # shipped with the server, so the same file under any environment
+        assert edep["fcl"] == str(FCL_DIR / "edep.fcl")
+        assert edep["fcl_exists"] is True
     finally:
         configure(None)
         assert current().describe() == before.describe()

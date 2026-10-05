@@ -1,19 +1,165 @@
-"""Energy deposition: the EdepAna analyzer (Mu2eOptAna/fcl/edep.fcl).
+"""Energy deposition: the EdepAna analyzer (fcl/edep.fcl).
 
 Average calorimeter and tracker energy deposition per event and per generated
-event. The parser reads the summary block EdepAna_module.cc prints at endJob
-(see Mu2eOptAna/src/EdepAna_module.cc:520-528).
+event, plus the number and rate of events passing a configurable selection.
+The averages come from the summary block EdepAna prints at endJob; the
+selection is applied to the per-event TTree it writes (EDepAna/tree). The
+module lives in Offline (Offline/Analyses/src/EdepAna_module.cc, from
+v13_39_00), so it comes with the configured Musing or its backing.
+
+This module also owns the reading of that tree — `read_edep_tree` and
+`EDEP_VARIABLES` — so every analysis of EdepAna output selects events the
+same way, with the same variable names.
 """
 
 import re
 from pathlib import Path
 
-from ..mu2e_job import run_mu2e_job
-from ..spec import AnalysisSpec, RunContext, RunOutcome
+import numpy as np
 
-# Relative: resolved against the configured code (a work area or an
-# unpacked tarball), or left to art's FHICL_FILE_PATH for a Musing.
-FCL = Path("Mu2eOptAna/fcl/edep.fcl")
+from ..mu2e_job import run_mu2e_job
+from ..selection import SelectionError, apply_selection
+from ..spec import FCL_DIR, AnalysisSpec, ParamSpec, RunContext, RunOutcome
+
+FCL = FCL_DIR / "edep.fcl"
+
+# The analyzer's label in edep.fcl, and the tree it books.
+TREE_PATH = "EDepAna/tree"
+
+# What the >50 MeV count in the summary block used to be fixed to.
+DEFAULT_SELECTION = "event_calo_edep_vis > 50"
+
+# DetectorSystem's origin in the Mu2e frame: x_det = x + 3904 mm. EdepAna's
+# primary_start_r histogram is the start radius in the detector frame.
+DETECTOR_ORIGIN_X_MM = -3904.0
+
+# --- the EdepAna tree --------------------------------------------------------
+
+_EVENT_BRANCHES = ("event_calo_edep", "event_calo_edep_vis", "event_trk_edep",
+                   "weight", "run", "subrun", "event", "nprimaries", "ngen")
+_PRIMARY_BRANCHES = (
+    "primary_start_x", "primary_start_y", "primary_start_z",
+    "primary_start_px", "primary_start_py", "primary_start_pz",
+    "primary_start_e", "primary_start_m", "primary_start_pdg",
+    "primary_calo_edep", "primary_calo_edep_vis",
+    "primary_trk_front_p", "primary_trk_front_energy",
+)
+
+# The variables a selection may use, and what each one is. Per-primary
+# branches are the *first* primary's value, as EdepAna's histograms use it;
+# NaN for an event with no primary, or with no tracker-front step for the
+# primary_trk_front_* ones, so any cut on them fails for such an event.
+EDEP_VARIABLES: dict[str, str] = {
+    "event_calo_edep": "total calo energy deposited in the event (MeV)",
+    "event_calo_edep_vis": "total visible (Birks) calo energy in the event (MeV)",
+    "event_trk_edep": "total tracker ionizing energy in the event (MeV)",
+    "weight": "event weight",
+    "run": "run number", "subrun": "subrun number", "event": "event number",
+    "nprimaries": "number of primary particles",
+    "primary_start_x": "primary start x, Mu2e frame (mm)",
+    "primary_start_y": "primary start y, Mu2e frame (mm)",
+    "primary_start_z": "primary start z, Mu2e frame (mm)",
+    "primary_start_r": "primary start radius, detector frame (mm)",
+    "primary_start_px": "primary start px (MeV/c)",
+    "primary_start_py": "primary start py (MeV/c)",
+    "primary_start_pz": "primary start pz (MeV/c)",
+    "primary_start_p": "primary start momentum (MeV/c)",
+    "primary_start_e": "primary start energy (MeV)",
+    "primary_start_m": "primary mass (MeV)",
+    "primary_start_pdg": "primary PDG id",
+    "primary_calo_edep": "calo energy from the primary and descendants (MeV)",
+    "primary_calo_edep_vis": "visible calo energy from the primary and descendants (MeV)",
+    "has_trk_front": "the primary reached the tracker front (true/false)",
+    "primary_trk_front_p": "primary momentum at the tracker front (MeV/c)",
+    "primary_trk_front_energy": "primary energy at the tracker front (MeV)",
+    "primary_trk_front_energy_diff":
+        "tracker-front energy minus start energy (MeV, <= 0)",
+    "primary_energy_edep_diff": "primary visible calo edep minus start energy (MeV)",
+    "primary_trk_front_energy_edep_diff":
+        "primary visible calo edep minus tracker-front energy (MeV)",
+}
+
+
+class EdepTreeError(RuntimeError):
+    """The input is not an EdepAna file with the tree, worded for the caller."""
+
+
+def edep_variables(branches: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+    """Every EDEP_VARIABLES column from the tree's raw branches.
+
+    `branches` holds the event branches as flat arrays and the primary
+    branches as one array per event (uproot's library="np").
+    """
+    nprim = np.asarray(branches["nprimaries"])
+    has_primary = nprim > 0
+    out: dict[str, np.ndarray] = {
+        name: np.asarray(branches[name], dtype=np.float64)
+        for name in _EVENT_BRANCHES if name != "ngen"
+    }
+    for name in _PRIMARY_BRANCHES:
+        first = np.full(nprim.size, np.nan)
+        if has_primary.any():
+            first[has_primary] = [entry[0] for entry in branches[name][has_primary]]
+        out[name] = first
+
+    # EdepAna stores 0 where the primary never reached the tracker front.
+    has_front = out["primary_trk_front_p"] > 0.0
+    for name in ("primary_trk_front_p", "primary_trk_front_energy"):
+        out[name] = np.where(has_front, out[name], np.nan)
+    out["has_trk_front"] = has_front
+
+    out["primary_start_r"] = np.hypot(out["primary_start_x"] - DETECTOR_ORIGIN_X_MM,
+                                      out["primary_start_y"])
+    out["primary_start_p"] = np.sqrt(out["primary_start_px"] ** 2
+                                     + out["primary_start_py"] ** 2
+                                     + out["primary_start_pz"] ** 2)
+    out["primary_trk_front_energy_diff"] = (out["primary_trk_front_energy"]
+                                            - out["primary_start_e"])
+    out["primary_energy_edep_diff"] = (out["primary_calo_edep_vis"]
+                                       - out["primary_start_e"])
+    out["primary_trk_front_energy_edep_diff"] = (out["primary_calo_edep_vis"]
+                                                 - out["primary_trk_front_energy"])
+    return out
+
+
+def read_edep_tree(paths: list[Path] | Path) -> dict[str, np.ndarray]:
+    """EDEP_VARIABLES for every event in the EdepAna file(s), concatenated."""
+    import uproot
+
+    paths = [paths] if isinstance(paths, Path) else list(paths)
+    parts = []
+    for path in paths:
+        try:
+            with uproot.open(path) as rootfile:
+                tree = rootfile[TREE_PATH]
+                branches = tree.arrays(_EVENT_BRANCHES + _PRIMARY_BRANCHES,
+                                       library="np")
+        except KeyError as exc:
+            raise EdepTreeError(
+                f"{path}: no {TREE_PATH} with the EdepAna branches ({exc}) — is "
+                "this an nts.*.root from EdepAna in Offline v13_39_00 or later? "
+                "Rerun the 'edep' analysis to make one."
+            ) from None
+        parts.append(edep_variables(branches))
+    return {name: np.concatenate([part[name] for part in parts])
+            for name in parts[0]}
+
+
+def select_events(variables: dict[str, np.ndarray], selection: str) -> np.ndarray:
+    """The mask of events passing `selection`, a cut over EDEP_VARIABLES."""
+    nevents = variables["event_calo_edep_vis"].size
+    return apply_selection(selection, variables, nevents)
+
+
+def selection_help() -> str:
+    """The parameter description shared by every analysis taking a selection."""
+    return (
+        "Event selection applied to the EdepAna tree, e.g. "
+        "'event_calo_edep_vis > 10 && primary_start_z > 5400'. Comparisons, "
+        "arithmetic, and/or/not (or &&/||/!) and abs/sqrt/hypot/min/max/log/"
+        "exp over: " + ", ".join(EDEP_VARIABLES) + ". Per-primary variables "
+        "are the first primary's. An empty string selects every event."
+    )
 
 # Matches the block EdepAna_module.cc prints, e.g.:
 #   EdepAna summary:
@@ -42,8 +188,11 @@ _SUMMARY_FIELDS = [
      re.compile(rf"Average tracker energy deposition per gen event:\s*({_NUM})\s*MeV")),
 ]
 
+_SELECTION_METRICS = ("n_events_selected", "selected_per_gen_event")
+
 METRIC_UNITS = {
     "event_rate": "events / gen event",
+    "selected_per_gen_event": "events / gen event",
     "avg_calo_edep_per_event_mev": "MeV",
     "avg_calo_edep_per_gen_event_mev": "MeV",
     "avg_trk_edep_per_event_mev": "MeV",
@@ -68,16 +217,29 @@ def parse_edep_summary(stdout: str) -> dict[str, float] | None:
     return metrics
 
 
+def selected_metrics(variables: dict[str, np.ndarray], selection: str,
+                     n_gen_events: float) -> dict[str, float]:
+    """Weighted count of events passing `selection`, and that per gen event."""
+    mask = select_events(variables, selection)
+    selected = float(variables["weight"][mask].sum())
+    return {
+        "n_events_selected": selected,
+        "selected_per_gen_event": selected / n_gen_events if n_gen_events > 0 else -1.0,
+    }
+
+
 def summarize_edep(metrics: dict[str, float]) -> str:
     return (
         f"saw {metrics['n_events']:g} events ({metrics['n_gen_events']:g} gen): "
         f"avg calo edep {metrics['avg_calo_edep_per_event_mev']:.4g} MeV/event, "
-        f"avg tracker edep {metrics['avg_trk_edep_per_event_mev']:.4g} MeV/event."
+        f"avg tracker edep {metrics['avg_trk_edep_per_event_mev']:.4g} MeV/event; "
+        f"{metrics['n_events_selected']:g} selected "
+        f"({metrics['selected_per_gen_event']:.4g} / gen event)."
     )
 
 
 def run(context: RunContext) -> RunOutcome:
-    """Run edep.fcl over the input art file(s) and parse the summary block."""
+    """Run edep.fcl, parse the summary block, and apply the selection."""
     outcome = run_mu2e_job(
         fcl=FCL,
         input_paths=context.input_paths,
@@ -110,6 +272,20 @@ def run(context: RunContext) -> RunOutcome:
             files=outcome.written_root_files, log_path=outcome.log_path, extra=extra,
             error="EdepAna summary block not found in mu2e output",
         )
+
+    selection = context.params["selection"]
+    extra["selection"] = selection
+    ntuples = [Path(f) for f in outcome.written_root_files]
+    if not ntuples:
+        return RunOutcome(log_path=outcome.log_path, extra=extra,
+                          error="mu2e wrote no ROOT file, so there is no "
+                                f"{TREE_PATH} to apply the selection to")
+    try:
+        metrics.update(selected_metrics(read_edep_tree(ntuples), selection,
+                                        metrics["n_gen_events"]))
+    except (EdepTreeError, SelectionError) as exc:
+        return RunOutcome(files=outcome.written_root_files,
+                          log_path=outcome.log_path, extra=extra, error=str(exc))
     return RunOutcome(metrics=metrics, files=outcome.written_root_files,
                       log_path=outcome.log_path, extra=extra)
 
@@ -121,10 +297,20 @@ SPEC = AnalysisSpec(
     run=run,
     description=(
         "Average calorimeter and tracker energy deposition per event and per "
-        "generated event (EdepAna)."
+        "generated event (EdepAna), and the number and rate per generated "
+        "event of events passing a configurable selection."
     ),
-    metrics=tuple(name for name, _ in _SUMMARY_FIELDS),
+    metrics=tuple(name for name, _ in _SUMMARY_FIELDS) + _SELECTION_METRICS,
     units=METRIC_UNITS,
+    parameters=(
+        ParamSpec(
+            name="selection",
+            description=selection_help() + " The default, "
+                        f"'{DEFAULT_SELECTION}', is the cut behind "
+                        "n_events_calo_edep_above_50mev.",
+            default=DEFAULT_SELECTION, kind="text", allow_empty=True,
+        ),
+    ),
     summarize=summarize_edep,
     input_hint=(
         "art file(s) holding compressDetStepMCs, CaloClusterMaker and "

@@ -1,0 +1,42 @@
+# Print prescale and event rate information
+
+#include "Offline/fcl/minimalMessageService.fcl"
+#include "Offline/fcl/standardServices.fcl"
+
+process_name : Print
+
+services : {
+  message : @local::default_message
+  GlobalConstantsService  : { inputFile      : "Offline/GlobalConstantsService/data/globalConstants_01.txt" }
+  TFileService : { # required for gen count reader
+    fileName : "/dev/null"
+  }
+}
+
+physics :{
+  analyzers: {
+    printModule : {
+      module_type : PrintModule
+      PrescaleFilterFractionPrinter : {
+	verbose : 1
+      }
+      verbose : 0
+    }
+    genCountReader : {
+      module_type: GenEventCountReader
+    }
+    eventCount : {
+      module_type : RunSubrunEvent
+      printSam    : false
+      printRun    : false
+      printSubrun : false
+      printEvent  : false
+    }
+  }
+
+  ana       : [ printModule, genCountReader, eventCount ]
+  end_paths : [ ana ]
+}
+
+services.message.destinations.log.categories.ArtSummary.limit : 0
+services.message.destinations.statistics.stats : @local::mf_null

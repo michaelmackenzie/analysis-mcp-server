@@ -13,21 +13,18 @@ supported, one per `kind`:
 All three source `setupmu2e-art.sh` first, in a fresh bash for every job, so
 the server does not care what its own shell had.
 
-The difference that matters to an analysis is where its fcl lives. A work area
-or an unpacked tarball is a directory on disk, so `Mu2eOptAna/fcl/edep.fcl`
-can be checked before a job is started; a Musing is whatever `muse setup` puts
-on `FHICL_FILE_PATH`, so the relative path is handed to `mu2e` and art
-resolves it — or says plainly that it cannot. Analyses therefore declare their
-fcl *relative*, and this module turns it into whatever the environment can
-offer.
+The analyses here ship their fcl with the server (`spec.FCL_DIR`) and name
+it by absolute path, which every environment uses as is. An fcl may also be
+named *relative* to the configured code: a work area or an unpacked tarball is
+a directory on disk, so it can be checked before a job is started; a Musing is
+whatever `muse setup` puts on `FHICL_FILE_PATH`, so the relative path is
+handed to `mu2e` and art resolves it — or says plainly that it cannot.
 
-> **Why the work area matters for the analyses that ship here**: `EdepAna` is
-> a locally built module, not in any release. Its library comes from
-> `build/<platform>/Mu2eOptAna/lib`, which only lands on `CET_PLUGIN_PATH`
-> when `muse setup` runs in the area holding it. Point the server at a bare
-> Musing and art dies with `Library specification "EdepAna" does not
-> correspond to any library` — the analysis is simply not available in that
-> environment.
+> **What the analyses that ship here need**: `EdepAna` is in Offline from
+> v13_39_00 (`SimJob MDC2025ay` and later), so any of the three kinds built on
+> such a release runs `edep`. On an older Offline art dies with `Library
+> specification "EdepAna" does not correspond to any library` — the analysis
+> is simply not available in that environment.
 
 Configured once, when the server starts (`--work-area`, `--musing`,
 `--code-tarball`, or the MU2E_WORK_AREA / MU2E_MUSING / MU2E_CODE_TARBALL

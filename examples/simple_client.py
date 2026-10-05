@@ -81,10 +81,9 @@ from mcp.client.streamable_http import streamablehttp_client
 
 REPO = Path(__file__).resolve().parent.parent
 
-# The muse work area these examples were written against: a local build of
-# Mu2eOptAna over a Run-1B backing release, which is what `edep` (the locally
-# built EdepAna module) needs. --musing or --code-tarball point the server
-# somewhere else instead.
+# The muse work area these examples were written against, backed by SimJob
+# MDC2025ay (Offline v13_39_00, the first with EdepAna, which `edep` needs).
+# --musing or --code-tarball point the server somewhere else instead.
 WORK_AREA = "/exp/mu2e/app/users/mmackenz/mu2eopt"
 
 
@@ -121,9 +120,8 @@ def parse_args() -> argparse.Namespace:
     )
     code.add_argument(
         "--musing", metavar="'NAME VERSION'",
-        help="Set up a published Musing instead, e.g. 'SimJob MDC2025au'. "
-             "Note edep needs the locally built EdepAna, which a bare Musing "
-             "does not have.",
+        help="Set up a published Musing instead, e.g. 'SimJob MDC2025ay'. "
+             "edep needs EdepAna, in Offline from v13_39_00 (MDC2025ay).",
     )
     code.add_argument(
         "--code-tarball",

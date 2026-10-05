@@ -1,20 +1,23 @@
 """Approximate Run-1A CE sensitivity: signal = CE, background = DIO + cosmics.
 
 A Python conversion of Mu2eOptAna/scripts/rough_run1a_sensitivity.C. It reads
-the histograms EdepAna writes (nts.*.root) and estimates S/sqrt(B) for the
-best momentum window.
+the per-event tree EdepAna writes (nts.*.root, EDepAna/tree), fills the
+macro's histograms from the events passing a selection, and estimates
+S/sqrt(B) for the best momentum window.
 
 The chain, following the original macro:
 
-1. Signal shape: `trk_front_energy` from the "edep 10 MeV" histogram set —
-   the energy of the primary at the front of the tracker for events leaving
-   >10 MeV in the calorimeter. Rebinned x2 and scaled to a rate for NPOT
-   protons at the assumed branching ratio and signal efficiency.
+1. Signal shape: the energy of the primary at the front of the tracker
+   (`primary_trk_front_energy`) for the selected events. The default
+   selection, `event_calo_edep_vis > 10`, is the macro's: EdepAna's fixed
+   "edep 10 MeV" histogram set. Binned as EdepAna's `trk_front_energy`,
+   rebinned x2 and scaled to a rate for NPOT protons at the assumed branching
+   ratio and signal efficiency.
 2. Signal smearing: convolved with a Gaussian tracker resolution.
 3. DIO background: the Heeck/Szafron theoretical spectrum, scaled to a rate,
-   then convolved with the *measured* energy-loss response
-   (`trk_front_energy_diff`, energy at the tracker minus energy at birth) and
-   the same tracker resolution.
+   then convolved with the *measured* energy-loss response of the same
+   selected events (`primary_trk_front_energy_diff`, energy at the tracker
+   minus energy at birth) and the same tracker resolution.
 4. Cosmic background: flat in momentum at a rough rate per second per MeV/c
    (the `cosmic_rate_per_s_per_mev` parameter), scaled by the live on-spill
    time implied by NPOT.
@@ -30,8 +33,11 @@ from pathlib import Path
 
 import numpy as np
 
+from ..selection import SelectionError
 from ..spectrum import Kernel, Spectrum
 from ..spec import AnalysisSpec, ParamSpec, RunContext, RunOutcome
+from .edep import (TREE_PATH, EdepTreeError, read_edep_tree, select_events,
+                   selection_help)
 
 # --- assumptions carried over from the macro ---------------------------------
 
@@ -52,12 +58,21 @@ DIO_TABLE = Path(
 )
 DIO_NBINS, DIO_EMIN, DIO_EMAX = 11000, 0.0, 110.0
 
-# Where the histograms live in the EdepAna output. hist_2 is the "edep 10 MeV"
-# set (see EdepAna_module.cc bookHistograms).
-HIST_DIR = "EDepAna/hist_2"
-SIGNAL_HIST = "trk_front_energy"
-RESPONSE_HIST = "trk_front_energy_diff"
-EXTRA_PLOT_HISTS = ("primary_start_z", "primary_start_r")
+# The cut EdepAna's "edep 10 MeV" histogram set (hist_2) was fixed to, which
+# the macro read its shapes from.
+DEFAULT_SELECTION = "event_calo_edep_vis > 10"
+
+# Tree variable -> (nbins, xmin, xmax): the binning of the EdepAna histogram
+# each one replaces (EdepAna_module.cc bookHistograms).
+SIGNAL_VAR = "primary_trk_front_energy"
+RESPONSE_VAR = "primary_trk_front_energy_diff"
+BINNING = {
+    SIGNAL_VAR: (1500, 0.0, 150.0),
+    RESPONSE_VAR: (500, -100.0, 0.0),
+    "primary_start_z": (500, 3000.0, 8000.0),
+    "primary_start_r": (100, 0.0, 200.0),
+}
+EXTRA_PLOT_VARS = ("primary_start_z", "primary_start_r")
 
 
 class SensitivityError(RuntimeError):
@@ -250,48 +265,46 @@ def _write_plots(outdir: Path, signal: Spectrum, dio_reco: Spectrum,
 
 # --- the runner --------------------------------------------------------------
 
-def _read_hist(rootfile, path: str, required: bool = True) -> Spectrum | None:
-    try:
-        obj = rootfile[path]
-    except KeyError:
-        if required:
-            raise SensitivityError(
-                f"histogram '{path}' not found — is this an EdepAna nts.*.root file?"
-            )
-        return None
-    return Spectrum.from_uproot(obj, name=path.rsplit("/", 1)[-1])
+def selected_hist(variables: dict[str, np.ndarray], mask: np.ndarray,
+                  name: str) -> Spectrum:
+    """`name` for the selected events where it is defined, weighted, binned
+    as the EdepAna histogram it replaces."""
+    values = variables[name]
+    keep = mask & np.isfinite(values)
+    nbins, xmin, xmax = BINNING[name]
+    return Spectrum.from_values(values[keep], nbins, xmin, xmax,
+                                weights=variables["weight"][keep], name=name)
 
 
 def run(context: RunContext) -> RunOutcome:
     """Compute the approximate CE sensitivity for one EdepAna ROOT file."""
-    import uproot
-
     sig_eff = context.params["sig_eff"]
     npot = context.params["npot"]
     cosmic_rate_per_s_per_mev = context.params["cosmic_rate_per_s_per_mev"]
     mean_pot_per_event = context.params["mean_pot_per_event"]
+    selection = context.params["selection"]
     outdir = context.outdir
     outdir.mkdir(parents=True, exist_ok=True)
 
     try:
-        with uproot.open(context.input_path) as rootfile:
-            signal = _read_hist(rootfile, f"{HIST_DIR}/{SIGNAL_HIST}")
-            response = _read_hist(rootfile, f"{HIST_DIR}/{RESPONSE_HIST}")
-            extras = {
-                name: hist
-                for name in EXTRA_PLOT_HISTS
-                if (hist := _read_hist(rootfile, f"{HIST_DIR}/{name}", required=False))
-                is not None
-            }
+        variables = read_edep_tree(context.input_path)
+        mask = select_events(variables, selection)
+        n_selected = int(mask.sum())
+        signal = selected_hist(variables, mask, SIGNAL_VAR)
+        response = selected_hist(variables, mask, RESPONSE_VAR)
+        extras = {name: selected_hist(variables, mask, name)
+                  for name in EXTRA_PLOT_VARS}
 
         # Both normalizations divide by the entry count, so empty input is a
         # clean error rather than a division by zero.
-        for hist, label in ((signal, SIGNAL_HIST), (response, RESPONSE_HIST)):
+        for hist in (signal, response):
             if hist.entries <= 0:
                 raise SensitivityError(
-                    f"'{HIST_DIR}/{label}' has no entries: no event in this file "
-                    "left >10 MeV in the calorimeter, so there is no signal "
-                    "shape to work with. Run this on a CE (signal) sample."
+                    f"no selected event has '{hist.name}': {n_selected} of "
+                    f"{mask.size} events pass '{selection}', and none of them "
+                    "reached the tracker front, so there is no signal shape to "
+                    "work with. Run this on a CE (signal) sample, or loosen "
+                    "the selection."
                 )
 
         # 1-2. signal shape -> rate, then smeared by the tracker resolution
@@ -325,8 +338,8 @@ def run(context: RunContext) -> RunOutcome:
 
         # 5. best window
         best, top = scan_signal_box(signal_reco, dio_reco, cosmic)
-    except SensitivityError as exc:
-        return RunOutcome(error=str(exc))
+    except (SensitivityError, EdepTreeError, SelectionError) as exc:
+        return RunOutcome(error=str(exc), extra={"selection": selection})
 
     metrics = {
         "sensitivity": float(best["sensitivity"]),
@@ -348,6 +361,7 @@ def run(context: RunContext) -> RunOutcome:
     lines = [
         "approx_ce_sensitivity",
         f"  input            {context.input_path}",
+        f"  selection        {selection or '(none)'}: {n_selected} of {mask.size} events",
         f"  sig_eff          {sig_eff:g}",
         f"  NPOT             {npot:g}",
         f"  signal BR        {SIGNAL_BR:.4g}  (R_mue = 1e-9)",
@@ -381,6 +395,8 @@ def run(context: RunContext) -> RunOutcome:
         log_path=log_path,
         extra={
             "sig_eff": sig_eff,
+            "selection": selection,
+            "n_events_selected": n_selected,
             "signal_br": SIGNAL_BR,
             "cosmic_rate_per_mev": cosmic_rate,
             "onspill_seconds": onspill_seconds,
@@ -405,7 +421,8 @@ SPEC = AnalysisSpec(
     name="approx_ce_sensitivity",
     description=(
         "Approximate Run-1A conversion-electron sensitivity S/sqrt(B) from "
-        "EdepAna histograms, with DIO and cosmic backgrounds."
+        "the EdepAna tree, with DIO and cosmic backgrounds, for a "
+        "configurable event selection."
     ),
     input_kind="root_file",
     produced_by=("edep",),
@@ -448,11 +465,19 @@ SPEC = AnalysisSpec(
                         "that npot and mean npot per event implies.",
             default=COSMIC_RATE_PER_SECOND_PER_MEV, minimum=0.0,
         ),
+        ParamSpec(
+            name="selection",
+            description=selection_help() + " Selects the events the signal "
+                        "shape and energy-loss response are taken from. The "
+                        f"default, '{DEFAULT_SELECTION}', is the fixed cut "
+                        "the original macro's histograms had.",
+            default=DEFAULT_SELECTION, kind="text", allow_empty=True,
+        ),
     ),
     input_hint=(
-        "An EdepAna nts.*.root file from a CE (signal) sample — it must have "
-        f"{HIST_DIR}/{SIGNAL_HIST} and /{RESPONSE_HIST} filled, i.e. events "
-        "leaving >10 MeV in the calorimeter."
+        "An EdepAna nts.*.root file from a CE (signal) sample, holding "
+        f"{TREE_PATH} (EdepAna in Offline v13_39_00 or later), with events "
+        "passing the selection that reach the tracker front."
     ),
     run=run,
     summarize=summarize,

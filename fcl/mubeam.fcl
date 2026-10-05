@@ -1,0 +1,25 @@
+#include "Production/JobConfig/pileup/MuBeamResampler.fcl"
+
+physics.producers.g4run.physics.physicsListName: "FTFP_BERT"
+physics.filters.TargetStopPrescaleFilter.nPrescale: 1
+
+physics.producers.compressDetStepMCs.compressionOptions.keepNGenerations: -1
+
+outputs.EarlyFlashOutput.fileName: "dts.owner.EarlyMuBeamFlash.version.sequencer.art"
+outputs.FlashOutput.fileName: "dts.owner.MuBeamFlash.version.sequencer.art"
+outputs.IPAStopOutput.fileName: "sim.owner.IPAStops.version.sequencer.art"
+outputs.TargetStopOutput.fileName: "sim.owner.TargetStops.version.sequencer.art"
+services.TFileService.fileName: "nts.owner.mubeam.version.sequencer.root"
+
+services.SeedService.baseSeed: 1
+services.GeometryService.inputFile: "Offline/Mu2eG4/geom/geom_common.txt"
+services.GeometryService.bFieldFile: "Offline/Mu2eG4/geom/bfgeom_v01.txt"
+
+physics.filters.beamResampler.mu2e.MaxEventsToSkip: 319542
+physics.filters.beamResampler.fileNames: [
+    "xroot://fndcadoor.fnal.gov//pnfs/fnal.gov/usr/mu2e/tape/phy-sim/sim/mu2e/MuBeamCat/Run1Baa/art/1b/09/sim.mu2e.MuBeamCat.Run1Baa.001430_00000000.art"
+]
+
+source.firstRun: 1800
+source.maxEvents: 12500
+source.firstSubRun: 0

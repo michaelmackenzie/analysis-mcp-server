@@ -1,4 +1,4 @@
-"""Event counts from Mu2eOptAna/fcl/print_counts.fcl.
+"""Event counts from fcl/print_counts.fcl.
 
 `print_counts.fcl` prints three things, and this parses all three:
 
@@ -43,11 +43,9 @@ import re
 from pathlib import Path
 
 from ..mu2e_job import run_mu2e_job
-from ..spec import AnalysisSpec, ParamSpec, RunContext, RunOutcome
+from ..spec import FCL_DIR, AnalysisSpec, ParamSpec, RunContext, RunOutcome
 
-# Relative: resolved against the configured code (a work area or an
-# unpacked tarball), or left to art's FHICL_FILE_PATH for a Musing.
-FCL = Path("Mu2eOptAna/fcl/print_counts.fcl")
+FCL = FCL_DIR / "print_counts.fcl"
 
 # Module labels end in this; what comes before it names the stream.
 FILTER_SUFFIX = "PrescaleFilter"

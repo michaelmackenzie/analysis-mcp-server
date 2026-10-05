@@ -43,17 +43,19 @@ tools/
   mu2e_env.py         where Offline comes from: work area, Musing, or tarball
   mu2e_job.py         running mu2e: -s/-S inputs, logs, timeouts
   spectrum.py         bin contents on a uniform grid: rebin, regrid, smear
+  selection.py        event selections: a safe cut expression over arrays
   registry.py         the catalogue: name -> AnalysisSpec
   analyses/
     edep.py                    energy deposition: fcl + summary parser
     count.py                   events, gen events, optional prescale + the
                                parsing/job muon_stop_rate builds on
     muon_stop_rate.py          stopping rate: count.py + POT scaling
-    approx_ce_sensitivity.py   CE sensitivity from EdepAna histograms
+    approx_ce_sensitivity.py   CE sensitivity from the EdepAna tree
     stop_materials.py          stops per material from <module>/stopmat
   analysis_tools.py   the MCP tools: list_analyses, run_analysis
   __init__.py         __all__ — ONLY these names become tools
 analysis_mcp_server/  generic drop-in wrapper (FastMCP): server.py, cli.py
+fcl/                  the fcl the art_files analyses run (spec.FCL_DIR)
 tests/test_tools.py   parsers, registry, input handling — no mu2e, no MCP
 ```
 
@@ -68,7 +70,7 @@ layer needs to know about the difference between them:
 | input_kind | what it consumes | what its runner does |
 |---|---|---|
 | `art_files` | mu2e art file(s) | runs an fcl with `mu2e`, parses the job's stdout |
-| `root_file` | a ROOT file from an earlier analysis | Python computation over its histograms |
+| `root_file` | a ROOT file from an earlier analysis | Python computation over its histograms or tree |
 
 ## Tools
 
@@ -84,7 +86,7 @@ workflow can chain several runs and collect `metadata` uniformly.
 
 | analysis | input | reports |
 |---|---|---|
-| `edep` | art file(s) | average calo/tracker energy deposition per event and per generated event |
+| `edep` | art file(s) | average calo/tracker energy deposition per event and per generated event, and the events passing a `selection` |
 | `count` | any art file with subrun bookkeeping | events kept per generated event, dividing out a prescale only if you name the filter |
 | `muon_stop_rate` | `sim.*.TargetStops.*.art` | stopped muons per generated event and per POT, from the file's event count, generated-event count and output prescale |
 | `approx_ce_sensitivity` | `nts.*.root` from `edep` | `S/sqrt(B)` for the best momentum window, with the window and its signal/DIO/cosmic counts |
@@ -110,7 +112,34 @@ run_analysis(analysis="approx_ce_sensitivity",
 whether it is required; unknown, missing, or out-of-range values come back as
 a plain error naming the offender. A parameter is a number unless its `kind`
 is `"text"`, which is for the ones that name something in the job's output —
-`muon_stop_rate`'s `prescale_filter` is the only one so far.
+like `muon_stop_rate`'s `prescale_filter` — or, as with `selection`, are an
+expression.
+
+### Selections
+
+`edep` and `approx_ce_sensitivity` take a `selection`: a cut over the
+per-event tree EdepAna writes (`EDepAna/tree`), applied by `tools/selection.py`
+and read by `read_edep_tree` in `tools/analyses/edep.py`, which also lists the
+variables (`EDEP_VARIABLES`, repeated in each parameter's description):
+
+```python
+parameters={"selection": "event_calo_edep_vis > 10 && primary_start_z > 5400"}
+```
+
+Comparisons, arithmetic, `and`/`or`/`not` (or `&&`/`||`/`!`) and
+`abs`/`sqrt`/`hypot`/`min`/`max`/`log`/`exp` are allowed. The expression is
+parsed with `ast` and walked against a whitelist, never `eval`ed. Per-primary
+variables are the first primary's, as EdepAna's own histograms use; derived
+ones (`primary_start_r` in the detector frame, `primary_trk_front_energy_diff`,
+`has_trk_front`, ...) are computed in Python. A missing value (no primary, or
+no tracker-front step) is NaN, so any cut on it fails. `""` selects every event.
+
+The defaults reproduce the fixed cuts the module's histograms and summary had:
+`event_calo_edep_vis > 50` for `edep` (so `n_events_selected` equals
+`n_events_calo_edep_above_50mev`) and `event_calo_edep_vis > 10` (the
+`hist_2` set) for `approx_ce_sensitivity`. On the Run-1B CE sample the
+histograms rebuilt from the tree match `hist_0`..`hist_3` bin for bin, and the
+sensitivity is unchanged.
 
 ### Inputs
 
@@ -158,6 +187,8 @@ last 20 log lines, so an agent can diagnose without re-running.
 | `n_events_calo_edep_above_50mev` | | `Events with calo Edep > 50 MeV` |
 | `avg_trk_edep_per_event_mev` | MeV | `Average tracker energy deposition per event` |
 | `avg_trk_edep_per_gen_event_mev` | MeV | `... per gen event` |
+| `n_events_selected` | | weighted count of tree events passing `selection` |
+| `selected_per_gen_event` | events / gen event | `n_events_selected / n_gen_events` |
 
 `count` runs `print_counts.fcl` and reports what any art file with subrun
 bookkeeping can say about itself:
@@ -278,13 +309,16 @@ A Python conversion of `Mu2eOptAna/scripts/rough_run1a_sensitivity.C`. Signal
 is CE, background is DIO plus cosmics, and it estimates S/sqrt(B) for the best
 momentum window:
 
-1. **Signal shape** — `EDepAna/hist_2/trk_front_energy` (energy at the front of
-   the tracker for events leaving >10 MeV in the calorimeter), rebinned x2 and
+1. **Signal shape** — `primary_trk_front_energy` (energy at the front of the
+   tracker) for the events passing `selection` (default: >10 MeV visible in
+   the calorimeter, the macro's `hist_2` cut), filled from `EDepAna/tree` with
+   the binning of EdepAna's `trk_front_energy` histogram, rebinned x2 and
    scaled to a rate for `npot` protons at `SIGNAL_BR` (R_mue = 1e-9) and
    `sig_eff`, then smeared by a Gaussian tracker resolution (sigma = 0.2 MeV).
 2. **DIO** — the Heeck/Szafron theoretical spectrum, scaled to a rate, then
    smeared by the *measured* energy-loss response
-   (`hist_2/trk_front_energy_diff`) and the same resolution.
+   of the same events (`primary_trk_front_energy_diff`) and the same
+   resolution.
 3. **Cosmics** — flat in momentum at `cosmic_rate_per_s_per_mev` (default:
    the rough Run-1A mu- -> e- rate), scaled by the on-spill live time implied
    by `npot`.
@@ -293,8 +327,11 @@ momentum window:
 
 The numbers are rough by construction: this is a figure of merit for comparing
 beamline configurations, not a sensitivity calculation. Note it needs a **CE
-signal** sample — given a beam file where nothing leaves >10 MeV in the
-calorimeter it reports that plainly instead of dividing by zero.
+signal** sample — given a file where no event passes the selection and
+reaches the tracker it reports that plainly instead of dividing by zero. It
+also needs an ntuple from EdepAna in Offline v13_39_00 or later: older ones
+have only the histograms, and are refused with a message saying to rerun
+`edep`.
 
 Three deviations from the macro, all deliberate:
 
@@ -333,7 +370,7 @@ def run(context: RunContext) -> RunOutcome:
 SPEC = AnalysisSpec(
     name="stops",
     input_kind="art_files",
-    fcl=MUSE_WORKAREA / "Mu2eOptAna" / "fcl" / "stops.fcl",
+    fcl=FCL_DIR / "stops.fcl",          # i.e. fcl/stops.fcl in this repo
     description="Muon stops per POT.",
     metrics=("n_stops", "stops_per_pot"),
     units={"stops_per_pot": "stops / POT"},
@@ -378,13 +415,13 @@ server starts — `tools/mu2e_env.py` is the only place that knows how:
 | flag | environment variable | what a job runs |
 |---|---|---|
 | `--work-area <dir>` | `MU2E_WORK_AREA` | `cd <dir> && muse setup` |
-| `--musing 'SimJob MDC2025au'` | `MU2E_MUSING` | `muse setup SimJob MDC2025au` |
+| `--musing 'SimJob MDC2025ay'` | `MU2E_MUSING` | `muse setup SimJob MDC2025ay` |
 | `--code-tarball <file>` | `MU2E_CODE_TARBALL` | unpack it, then `muse setup` in the tree |
 
 ```bash
 python3 -m analysis_mcp_server --transport stdio \
     --work-area /exp/mu2e/app/users/mmackenz/mu2eopt
-python3 -m analysis_mcp_server --transport stdio --musing 'SimJob MDC2025au'
+python3 -m analysis_mcp_server --transport stdio --musing 'SimJob MDC2025ay'
 python3 -m analysis_mcp_server --transport stdio --code-tarball ~/code.tar
 ```
 
@@ -405,22 +442,25 @@ explicitly when it holds something else.
 
 ### Which analyses a given environment can run
 
-Analyses name their fcl **relative** to that code — `Mu2eOptAna/fcl/edep.fcl`.
-For a work area or an unpacked tarball that is a path on disk, so a missing
-fcl is caught before the job starts and `list_analyses` reports `fcl_exists`.
-A Musing has no directory of ours to look in: the relative path goes to
-`mu2e` and art resolves it on `FHICL_FILE_PATH`, `fcl_exists` comes back
+The analyses here ship their fcl with the server, in `fcl/` (`FCL_DIR` in
+`tools/spec.py`), and name it by absolute path — the same file whichever
+environment is configured, checked before the job starts and reported by
+`list_analyses` as `fcl_exists`. Its `#include`s (`Offline/...`,
+`Production/...`) are resolved by art on `FHICL_FILE_PATH`.
+
+An analysis may instead name its fcl **relative** to the configured code. For
+a work area or an unpacked tarball that is a path on disk and is checked the
+same way; a Musing has no directory of ours to look in, so the relative path
+goes to `mu2e`, art resolves it on `FHICL_FILE_PATH`, `fcl_exists` comes back
 `null`, and a fcl that is not there fails in the job with art's own
 `Can't find file "..."`, which the result carries in `metadata.stdout_tail`.
 
-> **Why the analyses here want the work area**: `EdepAna` is a locally built
-> module (not in any Offline release). Its library comes from
-> `build/al9-prof-e29-p103/Mu2eOptAna/lib/`, which only lands on
-> `CET_PLUGIN_PATH` when `muse setup` runs in the area holding `backing`, and
-> `Mu2eOptAna/fcl/*.fcl` only lives there too. Run `edep` or `muon_stop_rate`
-> against a bare `SimJob` Musing and the job fails plainly — tarball that work
-> area up (`tar -cf code.tar backing build Mu2eOptAna`) and `--code-tarball`
-> gives the same results as `--work-area`.
+> **What the analyses here need from the environment**: `EdepAna` is in
+> Offline (`Offline/Analyses/src/EdepAna_module.cc`) from v13_39_00, so any
+> Musing built on it — `SimJob MDC2025ay` and later — or a work area backed by
+> one runs `edep` as is. With an older Offline, art stops with `Library
+> specification "EdepAna" does not correspond to any library`, and the result
+> carries it in `metadata.stdout_tail`.
 
 ## Test
 
@@ -428,7 +468,7 @@ A Musing has no directory of ours to look in: the relative path goes to
 python3 tests/test_tools.py
 ```
 
-59 tests, none of which start a mu2e job. (The `ana` env has no pytest, so
+72 tests, none of which start a mu2e job. (The `ana` env has no pytest, so
 these are bare asserts.)
 
 ## Run the server
