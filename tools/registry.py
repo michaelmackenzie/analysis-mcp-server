@@ -14,7 +14,8 @@ from .spec import AnalysisSpec
 # Module names under tools.analyses, each exposing SPEC.
 _ANALYSIS_MODULES = ("edep", "count", "muon_stop_rate", "approx_ce_sensitivity",
                      "stop_materials", "trigger_efficiency", "trigger_rate",
-                     "trigger_timing", "trigger_efficiency_ntuple")
+                     "trigger_timing", "trigger_efficiency_ntuple",
+                     "ce_sensitivity", "flash_edep_per_pot", "nts_momentum")
 
 
 def _load() -> dict[str, AnalysisSpec]:

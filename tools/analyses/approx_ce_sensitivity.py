@@ -276,18 +276,17 @@ def selected_hist(variables: dict[str, np.ndarray], mask: np.ndarray,
                                 weights=variables["weight"][keep], name=name)
 
 
-def run(context: RunContext) -> RunOutcome:
-    """Compute the approximate CE sensitivity for one EdepAna ROOT file."""
-    sig_eff = context.params["sig_eff"]
-    npot = context.params["npot"]
-    cosmic_rate_per_s_per_mev = context.params["cosmic_rate_per_s_per_mev"]
-    mean_pot_per_event = context.params["mean_pot_per_event"]
-    selection = context.params["selection"]
-    outdir = context.outdir
+def compute(nts_path: Path, outdir: Path, *, sig_eff: float, npot: float,
+            mean_pot_per_event: float, cosmic_rate_per_s_per_mev: float,
+            selection: str = DEFAULT_SELECTION, dio_table: Path = DIO_TABLE,
+            dio_fraction: float = 1.0 - MUON_CAPTURE_RATE) -> RunOutcome:
+    """The sensitivity scan on one EdepAna ROOT file. `run` is this with the
+    analysis' parameters; `ce_sensitivity` calls it on the file its own
+    EdepAna job wrote."""
     outdir.mkdir(parents=True, exist_ok=True)
 
     try:
-        variables = read_edep_tree(context.input_path)
+        variables = read_edep_tree(nts_path)
         mask = select_events(variables, selection)
         n_selected = int(mask.sum())
         signal = selected_hist(variables, mask, SIGNAL_VAR)
@@ -320,7 +319,7 @@ def run(context: RunContext) -> RunOutcome:
 
         # 3. DIO: theory spectrum -> rate, smeared by the energy loss and then
         # by the resolution on its own fine binning, then put on signal's bins.
-        dio_true = load_dio_spectrum().scaled((1. - MUON_CAPTURE_RATE) * sig_eff * npot)
+        dio_true = load_dio_spectrum(dio_table).scaled(dio_fraction * sig_eff * npot)
         resolution = Kernel.gaussian(dio_true.width, TRK_RESOLUTION_SIGMA_MEV)
         dio_reco = (dio_true
                     .smear(Kernel.from_density(response, dio_true.width))
@@ -360,13 +359,14 @@ def run(context: RunContext) -> RunOutcome:
     log_path = outdir / "approx_ce_sensitivity.log"
     lines = [
         "approx_ce_sensitivity",
-        f"  input            {context.input_path}",
+        f"  input            {nts_path}",
         f"  selection        {selection or '(none)'}: {n_selected} of {mask.size} events",
         f"  sig_eff          {sig_eff:g}",
         f"  NPOT             {npot:g}",
         f"  signal BR        {SIGNAL_BR:.4g}  (R_mue = 1e-9)",
         f"  cosmic rate      {cosmic_rate_per_s_per_mev:.4g} per s per MeV/c "
         f"-> {cosmic_rate:.4g} per MeV/c ({onspill_seconds:.4g} s on-spill)",
+        f"  DIO              {dio_table} (fraction {dio_fraction:g})",
         f"  signal entries   {signal.entries:g}",
         f"  MPV / FWHM       {mpv:.3f} / {fwhm:.3f} MeV",
         "",
@@ -401,8 +401,23 @@ def run(context: RunContext) -> RunOutcome:
             "cosmic_rate_per_mev": cosmic_rate,
             "onspill_seconds": onspill_seconds,
             "signal_hist_entries": float(signal.entries),
-            "dio_table": str(DIO_TABLE),
+            "dio_table": str(dio_table),
+            "dio_fraction": dio_fraction,
         },
+    )
+
+
+def run(context: RunContext) -> RunOutcome:
+    """Compute the approximate CE sensitivity for one EdepAna ROOT file."""
+    params = context.params
+    return compute(
+        context.input_path, context.outdir,
+        sig_eff=params["sig_eff"], npot=params["npot"],
+        mean_pot_per_event=params["mean_pot_per_event"],
+        cosmic_rate_per_s_per_mev=params["cosmic_rate_per_s_per_mev"],
+        selection=params["selection"],
+        dio_table=Path(params["dio_table"]),
+        dio_fraction=params["dio_fraction"],
     )
 
 
@@ -472,6 +487,21 @@ SPEC = AnalysisSpec(
                         f"default, '{DEFAULT_SELECTION}', is the fixed cut "
                         "the original macro's histograms had.",
             default=DEFAULT_SELECTION, kind="text", allow_empty=True,
+        ),
+        ParamSpec(
+            name="dio_table",
+            description="The DIO spectrum table: (energy, weight) rows on a "
+                        "0.01 MeV grid. The default is the Heeck/Szafron "
+                        "table this analysis has always read.",
+            default=str(DIO_TABLE), kind="text",
+        ),
+        ParamSpec(
+            name="dio_fraction",
+            description="Fraction of stopped muons that decay in orbit, "
+                        "normalizing the DIO spectrum. The default is 1 minus "
+                        "the capture rate (0.391); the original macro used "
+                        "0.39.",
+            default=1.0 - MUON_CAPTURE_RATE, minimum=0.0, maximum=1.0,
         ),
     ),
     input_hint=(

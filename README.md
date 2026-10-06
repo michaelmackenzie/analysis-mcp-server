@@ -105,6 +105,9 @@ workflow can chain several runs and collect `metadata` uniformly.
 | `trigger_rate` | pileup digi art file(s); default: mu2e-trig-config's CI sample | trigger rate in Hz averaged over the cycle (duty factor from `batch_mode`) and on spill, overall and per path |
 | `trigger_timing` | pileup digi art file(s); default: mu2e-trig-config's CI sample | trigger processing time per event: mean, median, tail; per path and per module |
 | `trigger_efficiency_ntuple` | EventNtuple file(s) with `trig_<path>` branches | of events with a track passing a selection, the fraction any given path accepted, and per path |
+| `ce_sensitivity` | one configuration's `sim.*.TargetStops.*.art` and `dts.*.CeEndpoint.*.art`, in one list | `S/sqrt(B)` with the absolute CE efficiency worked out from the files themselves (`count` + `edep`, then the `approx_ce_sensitivity` scan) |
+| `flash_edep_per_pot` | early-flash art file(s) (`dts.*.EarlyEleBeamFlash.*.art`) | tracker energy per proton on target: `edep`'s per-generated-event average over `pot_per_electron` |
+| `nts_momentum` | EventNtuple file(s) | `p_front` of the tracks passing a selection, as a histogram (PNG) plus counts, median and mean |
 
 `approx_ce_sensitivity` declares `produced_by = ["edep"]`, so chaining is
 discoverable: run `edep`, then pass the `nts.*.root` from its `files` to the
@@ -444,7 +447,9 @@ momentum window:
    the binning of EdepAna's `trk_front_energy` histogram, rebinned x2 and
    scaled to a rate for `npot` protons at `SIGNAL_BR` (R_mue = 1e-9) and
    `sig_eff`, then smeared by a Gaussian tracker resolution (sigma = 0.2 MeV).
-2. **DIO** — the Heeck/Szafron theoretical spectrum, scaled to a rate, then
+2. **DIO** — the Heeck/Szafron theoretical spectrum (`dio_table`), scaled
+   to a rate for the fraction `dio_fraction` of stopped muons that decay in
+   orbit (default 1 minus the capture rate), then
    smeared by the *measured* energy-loss response
    of the same events (`primary_trk_front_energy_diff`) and the same
    resolution.
@@ -477,6 +482,45 @@ Three deviations from the macro, all deliberate:
   response is interpolated rather than snapped to the nearest bin. On the
   Run-1B CE sample that moves `dio_background` by ~2% and `sensitivity` by
   0.01%.
+
+`compute()` is the same calculation as a function, for an analysis that has
+the ntuple and the efficiency in hand (`ce_sensitivity`).
+
+## ce_sensitivity
+
+The whole chain behind `approx_ce_sensitivity` for one configuration of the
+stopping target, from the files its simulation wrote, so the signal
+efficiency is measured rather than supplied:
+
+1. `count` over the target-stop files: the mu- stops they hold, the MuBeam
+   events generated to make them, and `TargetStopPrescaleFilter`'s prescale.
+2. `edep` over the CE files: the CE events seen, the CE events generated,
+   and the ntuple.
+3. The absolute CE efficiency, `input_correction * stops / (generated *
+   prescale) * ce_seen / ce_generated`, where `input_correction` is the
+   generated MuBeam events per POT upstream of the stops' stage.
+4. `approx_ce_sensitivity.compute()` on that ntuple with that efficiency and
+   the caller's cosmic rate, DIO table and fraction, and selection.
+
+Both kinds of file arrive as one `data_files` list and are told apart by
+name. The denominators are the files' own generated-event counts, so
+`max_events` is refused. Each failure names the step it happened in.
+
+## flash_edep_per_pot
+
+`edep` over early-flash files gives the tracker StrawGasStep energy per
+generated event. Each generated event is one resampled beam electron, so
+dividing by `pot_per_electron` (protons on target per resampled electron, a
+property of the electron-beam dataset) gives energy per POT. `edep`'s own
+metrics follow. The average needs every event, so `max_events` is refused.
+
+## nts_momentum
+
+`p_front` (|p| at the downstream-going TT_Front crossing) of the tracks
+passing `selection`, read with `trigger_efficiency_ntuple`'s track
+variables, so both analyses read a track the same way. The default, `pdg ==
+11 and has_front`, keeps every e- fit with such a crossing. Several files
+combine into one histogram, `nts_momentum.png`.
 
 ## Adding an analysis
 
@@ -597,7 +641,7 @@ goes to `mu2e`, art resolves it on `FHICL_FILE_PATH`, `fcl_exists` comes back
 python3 tests/test_tools.py
 ```
 
-91 tests, none of which start a mu2e job. (The `ana` env has no pytest, so
+111 tests, none of which start a mu2e job. (The `ana` env has no pytest, so
 these are bare asserts.)
 
 ## Run the server

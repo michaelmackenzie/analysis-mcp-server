@@ -17,6 +17,9 @@ import numpy as np
 
 from tools import ANALYSES, list_analyses, run_analysis
 from tools.analyses import approx_ce_sensitivity as sens
+from tools.analyses import ce_sensitivity as cs
+from tools.analyses import flash_edep_per_pot as fl
+from tools.analyses import nts_momentum as nm
 from tools.analyses import edep as edep_mod
 from tools.analyses.edep import parse_edep_summary
 from tools.analyses.count import (CountsError, dataset_description,
@@ -35,7 +38,7 @@ from tools.mu2e_job import (build_input_args, root_snapshot,
                             validate_input_paths, written_root_files)
 from tools.selection import SelectionError, apply_selection
 from tools.spectrum import Kernel, Spectrum
-from tools.spec import FCL_DIR, ParamSpec
+from tools.spec import FCL_DIR, ParamSpec, RunOutcome
 
 # Verbatim shape of the block EdepAna_module.cc prints, with art's usual
 # surrounding noise.
@@ -107,7 +110,9 @@ SAMPLE_STDOUT = {"edep": SAMPLE_EDEP_STDOUT,
                  "muon_stop_rate": SAMPLE_COUNTS_STDOUT,
                  "trigger_efficiency": SAMPLE_TRIGGER_STDOUT,
                  "trigger_rate": SAMPLE_TRIGGER_STDOUT,
-                 "trigger_timing": SAMPLE_TRIGGER_STDOUT}
+                 "trigger_timing": SAMPLE_TRIGGER_STDOUT,
+                 "ce_sensitivity": SAMPLE_EDEP_STDOUT,
+                 "flash_edep_per_pot": SAMPLE_EDEP_STDOUT}
 
 
 # --- the edep parser ---------------------------------------------------------
@@ -978,6 +983,407 @@ def test_stop_materials_names_the_file_in_a_list_that_lacks_the_histogram(tmp_di
     assert str(bad) in result.message and str(STOPMAT_FILE) not in result.message
 
 
+# --- approx_ce_sensitivity: compute() and the DIO table and fraction -----------
+
+def test_sensitivity_dio_parameters_default_to_todays_behaviour():
+    ce = list_analyses().metadata["analyses"]["approx_ce_sensitivity"]
+    table = ce["parameters"]["dio_table"]
+    fraction = ce["parameters"]["dio_fraction"]
+    assert table["required"] is False
+    assert table["default"] == str(sens.DIO_TABLE)
+    assert fraction["required"] is False
+    assert fraction["default"] == 1.0 - sens.MUON_CAPTURE_RATE
+
+
+def test_sensitivity_dio_background_scales_with_dio_fraction(tmp_dir):
+    if not sens.DIO_TABLE.exists():
+        return
+    nts = Path(tmp_dir) / "nts.owner.edep.test.root"
+    _write_edep_tree(nts)
+    got = {}
+    for fraction in (0.2, 0.4):
+        result = run_analysis(
+            analysis="approx_ce_sensitivity", data_file=str(nts),
+            output_dir=str(Path(tmp_dir) / f"f{fraction}"),
+            parameters={"sig_eff": 0.01, "dio_fraction": fraction})
+        assert result.status == "success", result.message
+        assert result.metadata["dio_fraction"] == fraction
+        got[fraction] = result.metadata
+    low, high = got[0.2], got[0.4]
+    assert low["dio_background"] > 0.0, low
+    # the same signal, twice the DIO: compare in one window, the 0.2 one
+    window = (low["signal_box_low_mev"], low["signal_box_high_mev"])
+    redone = sens.compute(
+        nts, Path(tmp_dir) / "again", sig_eff=0.01, npot=sens.NPOT,
+        mean_pot_per_event=sens.MEAN_POT_PER_EVENT,
+        cosmic_rate_per_s_per_mev=0.0, dio_fraction=0.2)
+    doubled = sens.compute(
+        nts, Path(tmp_dir) / "twice", sig_eff=0.01, npot=sens.NPOT,
+        mean_pot_per_event=sens.MEAN_POT_PER_EVENT,
+        cosmic_rate_per_s_per_mev=0.0, dio_fraction=0.4)
+    assert redone.error is None and doubled.error is None
+    if (redone.metrics["signal_box_low_mev"], redone.metrics["signal_box_high_mev"]) == \
+            (doubled.metrics["signal_box_low_mev"], doubled.metrics["signal_box_high_mev"]):
+        ratio = doubled.metrics["dio_background"] / redone.metrics["dio_background"]
+        assert abs(ratio - 2.0) < 1e-9, (ratio, window)
+
+
+def test_sensitivity_reports_a_missing_dio_table(tmp_dir):
+    nts = Path(tmp_dir) / "nts.owner.edep.test.root"
+    _write_edep_tree(nts)
+    missing = Path(tmp_dir) / "no_such.tbl"
+    result = run_analysis(
+        analysis="approx_ce_sensitivity", data_file=str(nts),
+        output_dir=str(Path(tmp_dir) / "out"),
+        parameters={"sig_eff": 0.01, "dio_table": str(missing)})
+    assert result.status == "error"
+    assert "DIO spectrum table not found" in result.message, result.message
+
+
+def test_compute_is_what_run_computes(tmp_dir):
+    if not sens.DIO_TABLE.exists():
+        return
+    nts = Path(tmp_dir) / "nts.owner.edep.test.root"
+    _write_edep_tree(nts)
+    via_tool = run_analysis(
+        analysis="approx_ce_sensitivity", data_file=str(nts),
+        output_dir=str(Path(tmp_dir) / "a"), parameters={"sig_eff": 0.01})
+    assert via_tool.status == "success", via_tool.message
+    direct = sens.compute(
+        nts, Path(tmp_dir) / "b", sig_eff=0.01, npot=sens.NPOT,
+        mean_pot_per_event=sens.MEAN_POT_PER_EVENT,
+        cosmic_rate_per_s_per_mev=sens.COSMIC_RATE_PER_SECOND_PER_MEV)
+    assert direct.error is None, direct.error
+    assert direct.metrics["sensitivity"] == via_tool.metadata["sensitivity"]
+    assert direct.extra["dio_table"] == str(sens.DIO_TABLE)
+    assert direct.extra["selection"] == sens.DEFAULT_SELECTION
+
+
+# --- ce_sensitivity ----------------------------------------------------------
+
+CE_PARAMS = {"input_correction": 0.01278168,
+             "cosmic_rate_per_s_per_mev": 2e4 / 1.1e7,
+             "dio_fraction": 0.39, "dio_table": str(sens.DIO_TABLE)}
+
+
+def _art(tmp_dir, name):
+    path = Path(tmp_dir) / name
+    path.write_text("")
+    return path
+
+
+def _ce_inputs(tmp_dir):
+    return [_art(tmp_dir, "sim.t.TargetStops.c.001800_00000000.art"),
+            _art(tmp_dir, "sim.t.TargetStops.c.001800_00000001.art"),
+            _art(tmp_dir, "dts.t.CeEndpoint.c.001801_00000000.art")]
+
+
+def _fake_ce_jobs(*, count_error=None, edep_error=None, root_files=1):
+    """Stand-ins for ce_sensitivity's two mu2e jobs, with a real
+    configuration's counts. Returns (calls, restore)."""
+    calls = []
+
+    def count_job(context, filter_label):
+        calls.append(("count", sorted(p.name for p in context.input_paths),
+                      filter_label, context.outdir.name,
+                      context.wants_file_list, dict(context.params)))
+        if count_error:
+            return RunOutcome(error=count_error)
+        return RunOutcome(
+            metrics={"n_events": 97520.0, "n_gen_events": 3.0e6,
+                     "prescale": 1.0},
+            log_path=context.outdir / "mu2e.log", extra={})
+
+    def edep_job(context):
+        calls.append(("edep", sorted(p.name for p in context.input_paths),
+                      None, context.outdir.name, context.wants_file_list,
+                      dict(context.params)))
+        if edep_error:
+            return RunOutcome(error=edep_error)
+        context.outdir.mkdir(parents=True, exist_ok=True)
+        files = []
+        for i in range(root_files):
+            path = context.outdir / f"nts{i}.root"
+            _write_edep_tree(path)
+            files.append(str(path))
+        metrics = {**parse_edep_summary(SAMPLE_EDEP_STDOUT),
+                   "n_events": 588681.0, "n_gen_events": 1.125e6}
+        return RunOutcome(metrics=metrics, files=files,
+                          log_path=context.outdir / "mu2e.log", extra={})
+
+    saved = (cs.count_job, cs.edep_job)
+    cs.count_job, cs.edep_job = count_job, edep_job
+
+    def restore():
+        cs.count_job, cs.edep_job = saved
+    return calls, restore
+
+
+def test_ce_sensitivity_splits_its_inputs_by_stream(tmp_dir):
+    stops, ce = cs.split_inputs(_ce_inputs(tmp_dir))
+    assert [p.name for p in stops] == [
+        "sim.t.TargetStops.c.001800_00000000.art",
+        "sim.t.TargetStops.c.001800_00000001.art"]
+    assert [p.name for p in ce] == ["dts.t.CeEndpoint.c.001801_00000000.art"]
+
+
+def test_ce_sensitivity_refuses_a_file_of_another_stream_or_a_missing_one(tmp_dir):
+    inputs = _ce_inputs(tmp_dir)
+    other = _art(tmp_dir, "dts.t.EarlyEleBeamFlash.c.001803_00000000.art")
+    for paths, needle in ((inputs + [other], "EarlyEleBeamFlash"),
+                          (inputs[:2], "no CeEndpoint file"),
+                          (inputs[2:], "no TargetStops file")):
+        try:
+            cs.split_inputs(paths)
+        except cs.InputError as exc:
+            assert needle in str(exc), exc
+        else:
+            raise AssertionError(f"accepted {[p.name for p in paths]}")
+
+
+def test_ce_efficiency_is_stops_per_pot_times_ce_seen_per_generated():
+    # a real configuration's counts; the same formula gave 2.174141844862464e-4
+    eff = cs.ce_efficiency(input_correction=0.01278168, muminus_stops=97520,
+                           mubeam_sim_total=3.0e6, prescale=1.0,
+                           ce_seen=588681, ce_simulated_events=1.125e6)
+    assert abs(eff / 2.174141844862464e-4 - 1.0) < 1e-12, eff
+
+
+def test_ce_efficiency_divides_out_the_prescale():
+    base = dict(input_correction=0.01, muminus_stops=100, mubeam_sim_total=1e5,
+                ce_seen=500, ce_simulated_events=1000)
+    full = cs.ce_efficiency(prescale=1.0, **base)
+    tenth = cs.ce_efficiency(prescale=0.1, **base)
+    assert abs(tenth / full - 10.0) < 1e-12
+
+
+def test_ce_efficiency_refuses_zero_counts_and_an_efficiency_above_one():
+    base = dict(input_correction=0.01, muminus_stops=100, mubeam_sim_total=1e5,
+                prescale=1.0, ce_seen=500, ce_simulated_events=1000)
+    for key in ("muminus_stops", "mubeam_sim_total", "prescale", "ce_seen",
+                "ce_simulated_events"):
+        try:
+            cs.ce_efficiency(**{**base, key: 0})
+        except cs.InputError as exc:
+            assert key in str(exc), exc
+        else:
+            raise AssertionError(f"accepted {key}=0")
+    try:
+        cs.ce_efficiency(**{**base, "input_correction": 1e6})
+    except cs.InputError as exc:
+        assert "outside (0, 1]" in str(exc), exc
+    else:
+        raise AssertionError("accepted an efficiency above 1")
+
+
+def test_ce_sensitivity_runs_both_jobs_then_the_scan(tmp_dir):
+    if not sens.DIO_TABLE.exists():
+        return
+    calls, restore = _fake_ce_jobs()
+    try:
+        result = run_analysis(analysis="ce_sensitivity",
+                              data_files=[str(p) for p in _ce_inputs(tmp_dir)],
+                              output_dir=str(Path(tmp_dir) / "out"),
+                              parameters=CE_PARAMS)
+    finally:
+        restore()
+    assert result.status == "success", result.message
+    assert calls == [
+        ("count", ["sim.t.TargetStops.c.001800_00000000.art",
+                   "sim.t.TargetStops.c.001800_00000001.art"],
+         "TargetStopPrescaleFilter", "count", True, {}),
+        ("edep", ["dts.t.CeEndpoint.c.001801_00000000.art"], None, "edep",
+         True, {"selection": edep_mod.DEFAULT_SELECTION}),
+    ], calls
+    meta = result.metadata
+    assert abs(meta["ce_abs_eff"] / 2.174141844862464e-4 - 1.0) < 1e-12
+    assert (meta["muminus_stops"], meta["mubeam_sim_total"], meta["ce_seen"],
+            meta["ce_simulated_events"]) == (97520.0, 3.0e6, 588681.0, 1.125e6)
+    assert meta["s_over_sqrt_b"] > 0.0
+    assert meta["sensitivity"]["dio_fraction"] == 0.39
+    assert meta["sensitivity"]["selection"] == sens.DEFAULT_SELECTION
+    assert any(f.endswith("nts0.root") for f in result.files), result.files
+
+
+def test_ce_sensitivity_reports_which_job_failed(tmp_dir):
+    for kwargs, needle in (({"count_error": "mu2e exited 1"},
+                            "counting the TargetStops files: mu2e exited 1"),
+                           ({"edep_error": "mu2e exited 2"},
+                            "EdepAna on the CeEndpoint files: mu2e exited 2"),
+                           ({"root_files": 2}, "wrote 2 ROOT files")):
+        calls, restore = _fake_ce_jobs(**kwargs)
+        try:
+            result = run_analysis(
+                analysis="ce_sensitivity",
+                data_files=[str(p) for p in _ce_inputs(tmp_dir)],
+                output_dir=str(Path(tmp_dir) / "out"), parameters=CE_PARAMS)
+        finally:
+            restore()
+        assert result.status == "error", kwargs
+        assert needle in result.message, result.message
+
+
+def test_ce_sensitivity_refuses_max_events(tmp_dir):
+    calls, restore = _fake_ce_jobs()
+    try:
+        result = run_analysis(analysis="ce_sensitivity",
+                              data_files=[str(p) for p in _ce_inputs(tmp_dir)],
+                              output_dir=str(Path(tmp_dir) / "out"),
+                              parameters=CE_PARAMS, max_events=10)
+    finally:
+        restore()
+    assert result.status == "error"
+    assert "max_events" in result.message
+    assert calls == []
+
+
+def test_ce_sensitivity_parameters():
+    params = list_analyses().metadata["analyses"]["ce_sensitivity"]["parameters"]
+    assert sorted(params) == sorted([*CE_PARAMS, "selection"])
+    assert all(params[name]["required"] for name in CE_PARAMS), params
+    assert params["selection"]["default"] == sens.DEFAULT_SELECTION
+
+
+def test_ce_sensitivity_reports_a_failed_sensitivity_scan(tmp_dir):
+    """Both mu2e jobs succeed but the scan itself fails (here: a dio_table
+    that does not exist)."""
+    calls, restore = _fake_ce_jobs()
+    try:
+        result = run_analysis(
+            analysis="ce_sensitivity",
+            data_files=[str(p) for p in _ce_inputs(tmp_dir)],
+            output_dir=str(Path(tmp_dir) / "out"),
+            parameters={**CE_PARAMS, "dio_table": str(Path(tmp_dir) / "no.tbl")})
+    finally:
+        restore()
+    assert result.status == "error", result.message
+    assert "sensitivity scan:" in result.message, result.message
+    assert "DIO spectrum table not found" in result.message, result.message
+
+
+# --- flash_edep_per_pot ------------------------------------------------------
+
+# An EdepAna summary printed at full precision (setprecision(15)): a count
+# above 1e6 in full, and every average to 15 significant figures.
+SAMPLE_EDEP_FULL_PRECISION_STDOUT = """\
+EdepAna summary:
+  Saw 2709370 events (2925000 gen events) --> output rate = 0.926280341880342 events / gen event
+  Average calo energy deposition per event: 12.3456789012345 MeV
+  Average calo energy deposition per gen event: 11.4353290196581 MeV
+  Events with calo Edep > 50 MeV: 42
+  Average tracker energy deposition per event: 2.21651238766154e-06 MeV
+  Average tracker energy deposition per gen event: 2.05303999999999e-06 MeV
+Art has completed and will exit with status 0.
+"""
+
+
+def _flash_edep_metrics(**changes):
+    return {**parse_edep_summary(SAMPLE_EDEP_FULL_PRECISION_STDOUT),
+            "n_events_selected": 42.0, "selected_per_gen_event": 42.0 / 2925000,
+            **changes}
+
+
+def test_edep_reads_a_full_precision_summary():
+    metrics = parse_edep_summary(SAMPLE_EDEP_FULL_PRECISION_STDOUT)
+    assert metrics["n_events"] == 2709370.0
+    assert metrics["n_gen_events"] == 2925000.0
+    assert metrics["avg_trk_edep_per_gen_event_mev"] == 2.05303999999999e-06
+
+
+def test_flash_metrics_divide_by_the_pot_per_electron():
+    got = fl.flash_metrics(_flash_edep_metrics(), 11.536718606512062)
+    assert got["flash_edep_per_pot"] == 2.05303999999999e-06 / 11.536718606512062
+    assert got["n_gen_events"] == 2925000.0
+
+
+def _fake_flash_job(metrics=None, error=None):
+    calls = []
+
+    def edep_job(context):
+        calls.append((sorted(p.name for p in context.input_paths),
+                      context.wants_file_list, dict(context.params)))
+        if error:
+            return RunOutcome(error=error)
+        return RunOutcome(metrics=metrics or _flash_edep_metrics(),
+                          files=[], log_path=context.outdir / "mu2e.log",
+                          extra={})
+
+    saved = fl.edep_job
+    fl.edep_job = edep_job
+
+    def restore():
+        fl.edep_job = saved
+    return calls, restore
+
+
+def _flash_inputs(tmp_dir):
+    return [str(_art(tmp_dir, f"dts.t.EarlyEleBeamFlash.c.001803_0000000{i}.art"))
+            for i in range(2)]
+
+
+def test_flash_edep_per_pot_runs_edepana_over_every_file(tmp_dir):
+    calls, restore = _fake_flash_job()
+    try:
+        result = run_analysis(analysis="flash_edep_per_pot",
+                              data_files=_flash_inputs(tmp_dir),
+                              output_dir=str(Path(tmp_dir) / "out"),
+                              parameters={"pot_per_electron": 11.536718606512062})
+    finally:
+        restore()
+    assert result.status == "success", result.message
+    assert calls == [(["dts.t.EarlyEleBeamFlash.c.001803_00000000.art",
+                       "dts.t.EarlyEleBeamFlash.c.001803_00000001.art"], True,
+                      {"selection": edep_mod.DEFAULT_SELECTION})], calls
+    assert result.metadata["flash_edep_per_pot"] == \
+        2.05303999999999e-06 / 11.536718606512062
+
+
+def test_flash_edep_per_pot_refuses_what_it_cannot_normalize(tmp_dir):
+    zero_energy = _flash_edep_metrics(avg_trk_edep_per_gen_event_mev=0.0)
+    zero_gen = _flash_edep_metrics(n_gen_events=0.0)
+    for kwargs, params, max_events, needle in (
+            ({"metrics": zero_energy}, {"pot_per_electron": 11.5}, None,
+             "zero tracker energy"),
+            ({"metrics": zero_gen}, {"pot_per_electron": 11.5}, None,
+             "0 generated events"),
+            ({}, {"pot_per_electron": 0.0}, None, "pot_per_electron"),
+            ({}, {"pot_per_electron": 11.5}, 10, "max_events"),
+            ({"error": "mu2e exited 1"}, {"pot_per_electron": 11.5}, None,
+             "mu2e exited 1")):
+        calls, restore = _fake_flash_job(**kwargs)
+        try:
+            result = run_analysis(analysis="flash_edep_per_pot",
+                                  data_files=_flash_inputs(tmp_dir),
+                                  output_dir=str(Path(tmp_dir) / "out"),
+                                  parameters=params, max_events=max_events)
+        finally:
+            restore()
+        assert result.status == "error", (kwargs, params)
+        assert needle in result.message, result.message
+
+
+# --- nts_momentum ------------------------------------------------------------
+
+def test_nts_momentum_takes_p_front_of_the_selected_tracks():
+    v = ntrig.track_variables(_ntuple_arrays())
+    # the default keeps e- fits with a downstream TT_Front crossing: track 0
+    # (104 MeV/c, not its upstream leg); track 1 has no segments, track 2 is
+    # an upstream-going e+
+    p = nm.front_momenta(v, nm.DEFAULT_SELECTION)
+    assert p.size == 1 and abs(p[0] - 104.0) < 0.01, p
+    assert nm.front_momenta(v, "pdg == -11").size == 0   # its p_front is NaN
+
+
+def test_nts_momentum_reports_a_file_that_is_not_an_ntuple(tmp_dir):
+    import uproot
+    path = Path(tmp_dir) / "empty.root"
+    with uproot.recreate(path) as f:
+        f["something_else"] = np.histogram(np.zeros(1), bins=2)
+    result = run_analysis(analysis="nts_momentum", data_file=str(path),
+                          output_dir=tmp_dir)
+    assert result.status == "error" and "EventNtuple" in result.message
+
+
 # --- the registry (loops over every analysis) --------------------------------
 
 def test_registry_includes_every_analysis():
@@ -1042,6 +1448,17 @@ def test_every_art_analysis_parser_matches_its_declared_metrics():
         elif name == "trigger_timing":
             # its numbers come from the timing database, not stdout
             assert tuple(timing_metrics(np.array([0.01, 0.02]))) == spec.metrics
+        elif name == "ce_sensitivity":
+            counts = parse_counts(SAMPLE_COUNTS_STDOUT, PRESCALE_FILTER)
+            scan = {m: 1.0 for m in ANALYSES["approx_ce_sensitivity"].metrics}
+            assembled = cs.assemble_metrics(
+                counts, parse_edep_summary(sample), scan, 1e-4)
+            assert tuple(assembled) == spec.metrics
+        elif name == "flash_edep_per_pot":
+            edep_metrics = {**parse_edep_summary(sample),
+                            "n_events_selected": 1.0,
+                            "selected_per_gen_event": 1.0}
+            assert tuple(fl.flash_metrics(edep_metrics, 1.0)) == spec.metrics
         else:
             raise AssertionError(f"{name}: add its parser to this test")
 
