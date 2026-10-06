@@ -19,6 +19,10 @@ from tools import ANALYSES, list_analyses, run_analysis
 from tools.analyses import approx_ce_sensitivity as sens
 from tools.analyses import edep as edep_mod
 from tools.analyses.edep import parse_edep_summary
+from tools.analyses.fullsim import cuts as fs_cuts
+from tools.analyses.fullsim import limits as fs_limits
+from tools.analyses.fullsim import sensitivity as fs_sens
+from tools.analyses.fullsim.eventntuple import TRIGGERS, origin_codes
 from tools.analyses.count import (CountsError, dataset_description,
                                   dataset_hint, parse_counts,
                                   parse_prescale_filters, saved_rates,
@@ -598,11 +602,287 @@ def test_stop_materials_names_the_file_in_a_list_that_lacks_the_histogram(tmp_di
     assert str(bad) in result.message and str(STOPMAT_FILE) not in result.message
 
 
+# --- fullsim_sensitivity -----------------------------------------------------
+
+def _seg(sid, time=900.0, p=(0.0, 85.0, 60.0), t0err=0.5, maxr=500.0, d0=50.0,
+         tandip=0.7):
+    """One track segment and its loop-helix parameters. The default momentum
+    is CE-like: |p| = 104 MeV/c, p_z/p_T = 0.71."""
+    return ({"sid": sid, "time": time,
+             "mom": {"fCoordinates": {"fX": p[0], "fY": p[1], "fZ": p[2]}}},
+            {"t0err": t0err, "maxr": maxr, "d0": d0, "tanDip": tandip})
+
+
+def _track(pdg=11, nactive=30, qual=0.9, pid=0.9, segs=None, sims=((168, 0, 10.0),)):
+    """A track passing every default cut unless told otherwise. `sims` are
+    (startCode, gen, rho) for the track's particle, then its ancestors."""
+    if segs is None:
+        segs = [_seg(0), _seg(1), _seg(104)]
+    return {"pdg": pdg, "nactive": nactive, "qual": qual, "pid": pid,
+            "segs": segs,
+            "sims": [{"startCode": code, "gen": gen,
+                      "pos": {"fCoordinates": {"fX": rho, "fY": 0.0}}}
+                     for code, gen, rho in sims]}
+
+
+def _eventntuple(events):
+    """EventNtuple groups, as read_eventntuple returns them, from events of
+    {"tracks": [...], "crv": [(time, PEs, nHits, start, end)], "trig": 0/1}.
+    Every event carries a far-off, low-quality coincidence so the CRV arrays
+    have a type."""
+    import awkward as ak
+    far = (-5000.0, 1.0, 1, -5000.0, -4990.0)
+    crv = [ev.get("crv", []) + [far] for ev in events]
+    tracks = [ev["tracks"] for ev in events]
+    return {
+        "evt": ak.Array([{"run": 1, "subrun": 0, "event": i,
+                          **{name: ev.get("trig", 1) for name in TRIGGERS}}
+                         for i, ev in enumerate(events)]),
+        "crv": ak.Array([{f"crvcoincs.{field}": [c[k] for c in coincs]
+                          for k, field in enumerate(("time", "PEs", "nHits",
+                                                     "timeStart", "timeEnd"))}
+                         for coincs in crv]),
+        "trk": ak.Array([{"trk.pdg": [t["pdg"] for t in trks],
+                          "trk.nactive": [t["nactive"] for t in trks],
+                          "trkqual.result": [t["qual"] for t in trks],
+                          "trkpid.result": [t["pid"] for t in trks]}
+                         for trks in tracks]),
+        "trkfit": ak.Array([{"trksegs": [[s for s, _ in t["segs"]] for t in trks],
+                             "trksegpars_lh": [[lh for _, lh in t["segs"]] for t in trks]}
+                            for trks in tracks]),
+        "trkmc": ak.Array([{"trkmcsim": [t["sims"] for t in trks]} for trks in tracks]),
+    }
+
+
+def _failed_cuts(event, active=fs_cuts.DEFAULT_CUTS):
+    masks = fs_cuts.cut_masks(_eventntuple([event]), "minus")
+    active = [fs_cuts.charge_cut_name("minus") if n == "is_reco_lepton" else n
+              for n in active]
+    return sorted(name for name in active if not masks[name][0][0])
+
+
+def test_fullsim_a_ce_like_track_passes_every_default_cut():
+    assert _failed_cuts({"tracks": [_track()]}) == []
+
+
+def test_fullsim_each_default_cut_rejects_what_it_should():
+    cases = {
+        "is_reco_electron": {"tracks": [_track(pdg=-11)]},
+        "has_downstream": {"tracks": [_track(segs=[_seg(0), _seg(1, p=(0, 85, -60)),
+                                                   _seg(104)])]},
+        "has_trk_front_seg": {"tracks": [_track(segs=[_seg(1), _seg(104)])]},
+        "good_trkpid": {"tracks": [_track(pid=0.5)]},
+        "good_trkqual": {"tracks": [_track(qual=0.1)]},
+        "within_t0err": {"tracks": [_track(segs=[_seg(0, t0err=1.5), _seg(1), _seg(104)])]},
+        "has_hits": {"tracks": [_track(nactive=19)]},
+        "has_st": {"tracks": [_track(segs=[_seg(0), _seg(1)])]},
+        "no_opa": {"tracks": [_track(segs=[_seg(0), _seg(1), _seg(104), _seg(95)])]},
+        "pz_over_pt": {"tracks": [_track(segs=[_seg(0, p=(0, 60, 85)), _seg(1), _seg(104)])]},
+        "good_trigger": {"tracks": [_track()], "trig": 0},
+    }
+    for cut, event in cases.items():
+        assert _failed_cuts(event) == [cut], (cut, _failed_cuts(event))
+    # the CRV cuts nest: any coincidence within 150 ns vetoes; only an in-time
+    # one also fails the time-window cut, and a bright one the quality cut
+    dim_early = {"tracks": [_track()], "crv": [(950.0, 5.0, 3, 300.0, 400.0)]}
+    assert _failed_cuts(dim_early) == ["no_crv_veto"]
+    bright = {"tracks": [_track()], "crv": [(950.0, 50.0, 20, 900.0, 1000.0)]}
+    assert _failed_cuts(bright) == ["no_crv_quality", "no_crv_timewindow", "no_crv_veto"]
+    off_time = {"tracks": [_track()], "crv": [(1200.0, 50.0, 20, 1150.0, 1250.0)]}
+    assert _failed_cuts(off_time) == []
+
+
+def test_fullsim_a_segment_cut_applies_only_at_the_tracker_front():
+    # a late time at the ST does not matter; at the front it does
+    st_late = {"tracks": [_track(segs=[_seg(0), _seg(1), _seg(104, time=50.0)])]}
+    front_early = {"tracks": [_track(segs=[_seg(0, time=50.0), _seg(1), _seg(104)])]}
+    active = fs_cuts.DEFAULT_CUTS + ("within_t0",)
+    assert _failed_cuts(st_late, active) == []
+    assert _failed_cuts(front_early, active) == ["within_t0"]
+
+
+def test_fullsim_active_cuts_toggle_by_name_and_refuse_unknown_ones():
+    active = fs_cuts.active_cuts("minus", "within_d0", "has_st, no_opa")
+    assert "within_d0" in active and "has_st" not in active and "no_opa" not in active
+    assert active[0] == "is_reco_electron"
+    assert fs_cuts.active_cuts("plus", "", "")[0] == "is_reco_positron"
+    # the cut flow follows pyCount's order whatever order they are named in
+    assert active == [n for n in fs_cuts.cut_names("minus") if n in active]
+    for enable, needle in (("not_a_cut", "Known:"),
+                           ("is_reco_positron", "with sign='minus' it is is_reco_electron")):
+        try:
+            fs_cuts.active_cuts("minus", enable, "")
+        except fs_cuts.CutError as exc:
+            assert needle in str(exc), exc
+        else:
+            raise AssertionError(f"{enable} was accepted")
+
+
+def test_fullsim_origin_is_the_first_classified_particle_in_the_chain():
+    events = [
+        {"tracks": [_track(sims=[(168, 0, 10.0)])]},              # CE
+        {"tracks": [_track(sims=[(167, 0, 10.0)])]},              # CE endpoint
+        {"tracks": [_track(sims=[(166, 0, 30.0)])]},              # DIO on the ST
+        {"tracks": [_track(sims=[(166, 0, 200.0)])]},             # DIO on the IPA
+        {"tracks": [_track(sims=[(170, 0, 30.0)])]},              # leading-log DIO
+        {"tracks": [_track(sims=[(12, 0, 0.0), (171, 0, 0.0)])]},  # conversion of an iRMC photon
+        {"tracks": [_track(sims=[(12, 44, 0.0)])]},                # cosmic
+        {"tracks": [_track(sims=[(12, 0, 0.0), (13, 0, 0.0)])]},   # nothing known
+    ]
+    origin = origin_codes(_eventntuple(events)["trkmc"]["trkmcsim"])
+    assert origin.tolist() == [168, 168, 166, 0, 166, 171, -1, -2]
+
+
+def test_fullsim_reduce_counts_the_first_selected_track_of_each_event():
+    data = _eventntuple([
+        {"tracks": [_track()]},
+        # the first track fails, so the second (a DIO) represents the event
+        {"tracks": [_track(qual=0.0), _track(segs=[_seg(0, p=(0, 80, 60)), _seg(1),
+                                                    _seg(104)], sims=[(166, 0, 20.0)])]},
+        {"tracks": [_track(nactive=5)]},                            # cut away
+        # selected, but with two front segments, so not counted (a reflected
+        # track would be, but pz_over_pt removes those)
+        {"tracks": [_track(segs=[_seg(0), _seg(0, time=950.0), _seg(1), _seg(104)])]},
+    ])
+    active = fs_cuts.active_cuts("minus", "", "")
+    reduced = fs_sens.reduce_data(data, "minus", active, 0.2, 0.638)
+    assert reduced["n_events"] == 4 and reduced["n_selected"] == 3
+    assert reduced["flow"][-1] == 3 and len(reduced["flow"]) == len(active)
+    assert reduced["origin"].tolist() == [168, 166]
+    assert np.allclose(reduced["p"], [np.hypot(85, 60), 100.0])
+    assert reduced["event"].tolist() == [0, 1]
+    assert reduced["all_p"].size == 4      # every front segment of every track
+
+
+def test_fullsim_window_scan_scores_windows_as_approx_ce_sensitivity_does():
+    """Only windows with S > 0 and B > 0 count, and a tie keeps the first
+    scanned, as in approx_ce_sensitivity.scan_signal_box."""
+    p = np.array([104.0, 104.1, 104.15, 103.25, 104.95])
+    t = np.array([900.0, 900.0, 900.0, 900.0, 600.0])
+    is_signal = np.array([True, True, True, False, False])
+    best, rows = fs_sens.scan_window(p, t, is_signal)
+    # S = 3, B = 1 at [103.2, 104.2] and again at [104.0, 105.0]: first wins.
+    # The windows holding all three and no background score nothing.
+    assert (best["n_signal"], best["n_background"]) == (3, 1)
+    assert (best["mom_low"], best["mom_high"], best["time_low"]) == (103.2, 104.2, 500.0)
+    assert best["s_over_sqrt_b"] == 3.0
+    assert len(rows) == 26 * 21
+    assert all(np.isnan(r["s_over_sqrt_b"]) for r in rows
+               if r["n_signal"] == 0 or r["n_background"] == 0)
+    assert any(r["n_signal"] == 3 and r["n_background"] == 0 for r in rows)
+    # nothing to optimize on: no window has both, so there is no best
+    best, _ = fs_sens.scan_window(p, t, np.zeros(5, dtype=bool))
+    assert best is None
+    best, _ = fs_sens.scan_window(p[:3], t[:3], is_signal[:3])
+    assert best is None
+
+
+def test_fullsim_exposure_uses_approx_ce_sensitivitys_capture_fraction():
+    assert fs_sens.EXPOSURE == fs_sens.STOPPED_MUONS * sens.MUON_CAPTURE_RATE
+    assert abs(fs_sens.EXPOSURE - 3.4e15) / 3.4e15 < 1e-3
+
+
+def test_fullsim_limits_match_pycount_sensitivity_analyzer():
+    """Reference values from RefAna/pyCount SensitivityAnalyzer (its FC is a
+    200,000-point grid from 0 to 20, so agreement is to its 1e-4 spacing)."""
+    for n, b, upper, expected in ((0, 0.0, 2.435912, 2.302582),
+                                  (1, 1.0, 3.357317, 2.823961),
+                                  (5, 4.6, 5.387027, 4.157231)):
+        low, high = fs_limits.fc_interval(n, b, 0.9)
+        assert low == 0.0 and abs(high - upper) < 2e-4, (b, high)
+        assert abs(fs_limits.expected_upper_limit(b, 0.9) - expected) < 1e-5
+    # n well above b excludes zero signal
+    low, high = fs_limits.fc_interval(10, 2.0, 0.9)
+    assert 3.0 < low < 8.0 < high
+    assert abs(fs_limits.fc_table_upper_limit(1.0) - 3.274) < 1e-9
+
+
+def test_fullsim_cls_limits_match_the_run1a_analysis():
+    """Reference values from Run-1A-Analysis/stats/profile2d.py
+    calculate_advanced_2d_cls_limit(b, b_sigma, s_sigma, n_obs), 90% CL."""
+    for b, b_sigma, eff_sigma, expected in (
+            (0, 0.0, 0.0, 2.302585092994076),    # exact Poisson CLs
+            (1, 0.0, 0.0, 3.271812060356269),
+            (16, 0.0, 0.0, 7.984760910395279),
+            (16, 5.2, 0.0, 11.171903500382857),  # profile likelihood, b only
+            (16, 5.2, 0.04, 11.195264672399928),  # b and efficiency
+            (1, 0.2, 0.0, 2.661058909292188),
+            (3, 0.6, 0.05, 3.9245812538954667)):
+        limit = fs_limits.cls_upper_limit(b, float(b), 0.9, b_sigma, eff_sigma)
+        assert abs(limit - expected) < 1e-6, (b, b_sigma, eff_sigma, limit)
+    # With b_sigma = 0 the background stays fixed. profile2d.py lets it float
+    # instead and gets 24.4 here.
+    fixed_b = fs_limits.cls_upper_limit(16, 16.0, 0.9, 0.0, 0.1)
+    assert 7.0 < fixed_b < 8.5, fixed_b
+    # No background, only an efficiency uncertainty. The asymptotic formula
+    # gives q = 2s at n = 0, so the limit is 1.645^2 / 2 = 1.35 (plus a little
+    # for the uncertainty), below the exact 2.30. That is the method, not a bug.
+    no_bkg = fs_limits.cls_upper_limit(0, 0.0, 0.9, 0.0, 0.04)
+    assert 1.3528 < no_bkg < 1.40, no_bkg
+    # an excess pushes the limit up
+    assert fs_limits.cls_upper_limit(10, 2.0, 0.9) > fs_limits.cls_upper_limit(2, 2.0, 0.9)
+    # discovery: Z sqrt(b + sigma_b^2), as stats/profile.py has it
+    assert fs_limits.required_signal(5, 16.0) == 20.0
+    assert abs(fs_limits.required_signal(5, 16.0, 3.0) - 25.0) < 1e-12
+    assert np.isnan(fs_limits.required_signal(5, 0.0))
+
+
+def test_fullsim_run_reports_a_file_that_is_not_an_eventntuple(tmp_dir):
+    path = Path(tmp_dir) / "nts.owner.edep.test.root"
+    _write_edep_tree(path, n=10)
+    result = run_analysis(analysis="fullsim_sensitivity", data_file=str(path),
+                          output_dir=tmp_dir)
+    assert result.status == "error" and "EventNtuple/ntuple" in result.message
+    bad = run_analysis(analysis="fullsim_sensitivity", data_file=str(path),
+                       output_dir=tmp_dir, parameters={"sign": "neutral"})
+    assert bad.status == "error" and "'minus'" in bad.message
+    window = run_analysis(analysis="fullsim_sensitivity", data_file=str(path),
+                          output_dir=tmp_dir,
+                          parameters={"signal_window": "105,104,600,1650"})
+    assert window.status == "error"
+
+
+# Two files of the MDS3c ensemble (Run-1 mix, R_mue = 1e-13), on which
+# pyCount's process.py gave the numbers below; skipped where not on disk.
+MDS3C_FILES = [Path("/exp/mu2e/data/users/mu2epro/ensembles/MDS3/MDS3c/"
+                    f"merged_files_1/nts.mu2e.ensembleMDS3cMix1BB.MDC2025-001.001430_0000000{i}.root")
+               for i in (1, 3)]
+
+
+def test_fullsim_reproduces_pycount_on_mds3c(tmp_dir):
+    if not all(path.exists() for path in MDS3C_FILES):
+        print("     (skipped: MDS3c ensemble files not on disk)")
+        return
+    # pyCount's scan finds no CE in these and keeps its first window
+    result = run_analysis(analysis="fullsim_sensitivity",
+                          data_files=[str(p) for p in MDS3C_FILES], output_dir=tmp_dir,
+                          parameters={"signal_window": "103,104,500,1650"})
+    assert result.status == "success", result.message
+    md = result.metadata
+    assert list(md["cut_flow"].values()) == [19433, 13375, 9127, 9065, 3850, 3103,
+                                             3098, 3030, 821, 794, 764, 761, 761,
+                                             712, 480]
+    assert md["n_events_counted"] == 141
+    assert (md["n_signal_window"], md["n_background_window"]) == (0, 1)
+    assert md["background_window_by_origin"] == {"cosmic": 1}
+    assert md["n_reco_segments_window"] == 1
+    assert abs(md["fc_upper_events"] - 3.357317) < 2e-4
+    # and the Run-1A limit on that background, exact and with systematics
+    assert abs(md["cls_upper_events"] - 3.271812060356269) < 1e-6
+    assert md["discovery_5sigma_events"] == 5.0
+    with_sys = run_analysis(analysis="fullsim_sensitivity",
+                            data_files=[str(p) for p in MDS3C_FILES],
+                            output_dir=tmp_dir,
+                            parameters={"signal_window": "103,104,500,1650",
+                                        "bkg_rel_uncertainty": 0.2})
+    assert abs(with_sys.metadata["cls_upper_events"] - 2.661058909292188) < 1e-6
+
+
 # --- the registry (loops over every analysis) --------------------------------
 
 def test_registry_includes_every_analysis():
-    assert {"edep", "count", "muon_stop_rate",
-            "approx_ce_sensitivity", "stop_materials"} <= set(ANALYSES)
+    assert {"edep", "count", "muon_stop_rate", "approx_ce_sensitivity",
+            "stop_materials", "fullsim_sensitivity"} <= set(ANALYSES)
 
 
 def test_every_spec_is_self_consistent():
