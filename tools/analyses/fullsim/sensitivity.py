@@ -1,8 +1,10 @@
-"""Full-simulation cut-and-count sensitivity from EventNtuple: RefAna/pyCount.
+"""Full-simulation CE sensitivity from EventNtuple: S/sqrt(B) in the best window.
 
-A port of pyCount's process.py `run_count` path: the counting analysis run
-over reconstructed tracks in a mixed MC sample (e.g. an MDS ensemble), with
-the MC truth saying what each selected track was.
+The full-simulation counterpart of approx_ce_sensitivity: the same figure
+of merit, the best S/sqrt(B) over signal windows, with the signal and
+background in it, but counted from reconstructed tracks in a mixed MC
+sample (e.g. an MDS ensemble) instead of folded from theory spectra. The
+selection and window follow RefAna/pyCount's process.py `run_count`.
 
 1. Select CE-like tracks with pyCount's cuts (cuts.py), file by file.
 2. Each surviving event is represented by its first selected track: its
@@ -17,16 +19,9 @@ the MC truth saying what each selected track was.
    wins. A sample with no such window has nothing to optimize, so it falls
    back to the fixed window. For e+ the window is fixed. `signal_window`
    overrides either.
-4. Count true signal and background (everything else) in the window. The
-   background count *is* the expected background: the sample is taken to
-   be the experiment, at the exposure the `exposure` parameter names.
-5. Limits on that background (limits.py), for n_obs = B as Run-1A quotes
-   them: the Run-1A analysis' CLs upper limit (exact Poisson, or profile
-   likelihood when the background or efficiency uncertainty is set) and
-   5 sigma discovery signal Z sqrt(B + sigma_B^2); and, to compare with
-   pyCount, the Feldman-Cousins interval, the expected classical upper
-   limit and the 90% CL FC table value. Each also as a branching ratio,
-   over captured muons x signal efficiency.
+4. Count true signal and background (everything else, split into DIO,
+   cosmic and other) in the window, and report S/sqrt(B) there. The counts
+   are the sample's own: nothing is rescaled.
 """
 
 from pathlib import Path
@@ -34,21 +29,10 @@ from pathlib import Path
 import numpy as np
 
 from ...spec import AnalysisSpec, ParamSpec, RunContext, RunOutcome
-from ..approx_ce_sensitivity import MUON_CAPTURE_RATE
-from . import limits
 from .cuts import (CUT_DESCRIPTIONS, DEFAULT_CUTS, TRKPID_MIN, TRKQUAL_MIN,
                    CutError, active_cuts, apply_cuts, cut_masks, cut_names)
 from .eventntuple import (ORIGIN_NAMES, SID_TT_FRONT, TREE_PATH,
                           EventNtupleError, origin_codes, read_eventntuple)
-
-# pyCount run_count's normalization: captured muons for Run-1A, 28 days at
-# 3.84 kW (Run-1A-Analysis/Normalization.md: 5.58e15 stopped, 3.4e15
-# captured), and a signal efficiency it took as given. The captures use
-# approx_ce_sensitivity's capture fraction, so the two analyses agree on it.
-STOPPED_MUONS = 5.58e15
-EXPOSURE = STOPPED_MUONS * MUON_CAPTURE_RATE
-SIG_EFF = 0.12
-CL = 0.9
 
 # Which origin label is signal, per sign searched for.
 SIGNAL_ORIGIN = {"minus": 168, "plus": 176}
@@ -67,7 +51,10 @@ SCAN_TIME_END = 1650.0                   # ns
 PLOT_MOM_RANGE = {"minus": (95.0, 110.0), "plus": (85.0, 95.0)}
 PLOT_TIME_RANGE = (0.0, 1695.0)
 
-DISCOVERY_SIGMA = 5
+# Background origins reported on their own, as approx_ce_sensitivity
+# reports DIO and cosmics; everything else is "other".
+DIO_ORIGINS = ("DIO", "IPA DIO")
+COSMIC_ORIGINS = ("cosmic",)
 
 
 class FullsimError(RuntimeError):
@@ -271,11 +258,6 @@ def _write_plots(outdir: Path, sign: str, ev: dict, counted: np.ndarray,
 def run(context: RunContext) -> RunOutcome:
     params = context.params
     sign = str(params["sign"]).strip().lower()
-    exposure = float(params["exposure"])
-    sig_eff = float(params["sig_eff"])
-    cl = float(params["cl"])
-    bkg_rel_unc = float(params["bkg_rel_uncertainty"])
-    eff_rel_unc = float(params["sig_eff_rel_uncertainty"])
     outdir = context.outdir
     outdir.mkdir(parents=True, exist_ok=True)
     extra = {"sign": sign}
@@ -326,25 +308,20 @@ def run(context: RunContext) -> RunOutcome:
     n_reco_window = int(np.sum((ev["all_p"] > p_lo) & (ev["all_p"] < p_hi)
                                & (ev["all_t"] > t_lo) & (ev["all_t"] < t_hi)))
 
-    # The background count is an integer, so n_obs = B exactly, as Run-1A
-    # quotes its expected limit.
-    b_sigma = bkg_rel_unc * n_bkg
-    cls_ul = limits.cls_upper_limit(n_bkg, float(n_bkg), cl, b_sigma, eff_rel_unc)
-    cls_method = ("exact Poisson CLs" if b_sigma <= 0 and eff_rel_unc <= 0
-                  else "asymptotic profile-likelihood CLs")
-    fc_low, fc_high = limits.fc_interval(n_bkg, float(n_bkg), cl)
-    expected_ul = limits.expected_upper_limit(float(n_bkg), cl)
-    table_ul = limits.fc_table_upper_limit(float(n_bkg))
-    s_discovery = limits.required_signal(DISCOVERY_SIGMA, float(n_bkg), b_sigma)
-    per_br = exposure * sig_eff
-    ses = 1.0 / per_br if per_br > 0 else float("inf")
-
     def by_origin(mask):
         codes, counts = np.unique(ev["origin"][mask], return_counts=True)
         return {ORIGIN_NAMES.get(int(c), str(int(c))): int(n)
                 for c, n in zip(codes, counts)}
 
+    background = by_origin(in_window & ~is_signal)
+    n_dio = sum(background.get(name, 0) for name in DIO_ORIGINS)
+    n_cosmic = sum(background.get(name, 0) for name in COSMIC_ORIGINS)
+    # As in approx_ce_sensitivity, S/sqrt(B) only means something with both;
+    # a given or fixed window without them reports NaN.
+    sensitivity = n_sig / np.sqrt(n_bkg) if n_sig > 0 and n_bkg > 0 else float("nan")
+
     metrics = {
+        "sensitivity": float(sensitivity),
         "n_events": float(ev["n_events"]),
         "n_events_selected": float(ev["n_selected"]),
         "n_events_counted": float(counted.sum()),
@@ -355,22 +332,9 @@ def run(context: RunContext) -> RunOutcome:
         "window_optimized": float(optimized),
         "n_signal_window": float(n_sig),
         "n_background_window": float(n_bkg),
-        "cls_upper_events": cls_ul,
-        "cls_upper_br": cls_ul * ses,
-        "fc_lower_events": fc_low,
-        "fc_upper_events": fc_high,
-        "fc_upper_br": fc_high * ses,
-        "expected_ul_events": expected_ul,
-        "expected_ul_br": expected_ul * ses,
-        "fc_table_ul90_events": table_ul,
-        "discovery_5sigma_events": s_discovery,
-        "discovery_5sigma_br": s_discovery * ses,
-        "ses": ses,
-        "exposure": exposure,
-        "sig_eff": sig_eff,
-        "cl": cl,
-        "bkg_rel_uncertainty": bkg_rel_unc,
-        "sig_eff_rel_uncertainty": eff_rel_unc,
+        "dio_background": float(n_dio),
+        "cosmic_background": float(n_cosmic),
+        "other_background": float(n_bkg - n_dio - n_cosmic),
     }
 
     descriptions = dict(zip(cut_names(sign), CUT_DESCRIPTIONS.values()))
@@ -395,9 +359,6 @@ def run(context: RunContext) -> RunOutcome:
         "fullsim_sensitivity",
         *(f"  input            {path}" for path in context.input_paths),
         f"  sign             {sign} (signal: {ORIGIN_NAMES[SIGNAL_ORIGIN[sign]]})",
-        f"  exposure         {exposure:.4g} captured muons   sig_eff {sig_eff:g}   CL {cl:g}",
-        f"  uncertainties    background {bkg_rel_unc:g}, signal efficiency "
-        f"{eff_rel_unc:g} (relative)",
         "",
         "Cut flow (events with a track passing every cut so far):",
         *(f"  {name:<20s} {n:>9d}   {desc}" for name, n, desc in flow_rows),
@@ -413,20 +374,11 @@ def run(context: RunContext) -> RunOutcome:
            "(given)" if params["signal_window"].strip() else
            "(fixed: no scanned window had both signal and background)"
            if rows else "(fixed)"),
-        f"  true signal {n_sig}, background {n_bkg}: {by_origin(in_window & ~is_signal)}",
+        f"  S = {n_sig}, DIO = {n_dio}, cosmic = {n_cosmic}, "
+        f"other = {n_bkg - n_dio - n_cosmic} -> B = {n_bkg}, "
+        f"S/sqrt(B) = {sensitivity:.4g}",
+        f"  background by origin: {background}",
         f"  reconstructed front segments in window, all selected tracks: {n_reco_window}",
-        "",
-        f"Run-1A: {cl:g} CL upper limit, {cls_method}, n_obs = b = {n_bkg}"
-        f" (sigma_b = {b_sigma:.4g}): {cls_ul:.4g} events -> BR < {cls_ul * ses:.4g}",
-        f"Run-1A: {DISCOVERY_SIGMA} sigma discovery needs {s_discovery:.4g} signal "
-        f"events -> BR {s_discovery * ses:.4g}",
-        f"SES = 1 / (exposure x sig_eff) = {ses:.4g}",
-        "",
-        "pyCount, no systematics:",
-        f"  FC {cl:g} CL interval for n_obs = {n_bkg}: "
-        f"[{fc_low:.4g}, {fc_high:.4g}] events -> BR < {fc_high * ses:.4g}",
-        f"  Expected upper limit ({cl:g} CL): {expected_ul:.4g} events -> BR {expected_ul * ses:.4g}",
-        f"  FC table 90% CL upper limit: {table_ul:.4g} events",
     ]
     log_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
@@ -436,49 +388,44 @@ def run(context: RunContext) -> RunOutcome:
     extra.update({
         "cut_flow": {name: int(n) for name, n, _ in flow_rows},
         "counted_by_origin": by_origin(counted),
-        "background_window_by_origin": by_origin(in_window & ~is_signal),
+        "background_window_by_origin": background,
         "n_reco_segments_window": n_reco_window,
-        "cls_method": cls_method,
     })
     return RunOutcome(metrics=metrics, files=files, log_path=log_path, extra=extra)
 
 
 def summarize(metrics: dict[str, float]) -> str:
     return (
-        f"{metrics['n_signal_window']:.0f} signal and "
-        f"{metrics['n_background_window']:.0f} background events in "
+        f"S/sqrt(B) = {metrics['sensitivity']:.4g} in "
         f"[{metrics['signal_mom_low_mevc']:g}, {metrics['signal_mom_high_mevc']:g}] MeV/c x "
-        f"[{metrics['signal_time_low_ns']:g}, {metrics['signal_time_high_ns']:g}] ns; "
-        f"{metrics['cl']:g} CL CLs upper limit {metrics['cls_upper_events']:.3g} events "
-        f"(BR < {metrics['cls_upper_br']:.3g}), SES {metrics['ses']:.3g}, for "
-        f"{metrics['exposure']:.3g} captured muons and signal efficiency "
-        f"{metrics['sig_eff']:g}."
+        f"[{metrics['signal_time_low_ns']:g}, {metrics['signal_time_high_ns']:g}] ns "
+        f"(S = {metrics['n_signal_window']:.0f}, "
+        f"B = {metrics['n_background_window']:.0f}: "
+        f"DIO {metrics['dio_background']:.0f}, "
+        f"cosmic {metrics['cosmic_background']:.0f}, "
+        f"other {metrics['other_background']:.0f}) "
+        f"from {metrics['n_events']:.0f} events."
     )
 
 
 SPEC = AnalysisSpec(
     name="fullsim_sensitivity",
     description=(
-        "Full-simulation CE cut-and-count from reconstructed EventNtuple "
-        "files (RefAna/pyCount): select CE-like tracks, count true signal and "
-        "background in a momentum-time window, and give the Run-1A CLs upper "
-        "limit (with optional background and efficiency uncertainties), the "
-        "5 sigma discovery signal and SES, plus pyCount's Feldman-Cousins "
-        "limits for comparison."
+        "Full-simulation CE sensitivity S/sqrt(B) from reconstructed "
+        "EventNtuple files, the counterpart of approx_ce_sensitivity: select "
+        "CE-like tracks (RefAna/pyCount's cuts), find the best momentum-time "
+        "window, and count the true signal and the DIO, cosmic and other "
+        "background in it."
     ),
     input_kind="root_file",
     combines_files=True,
     metrics=(
-        "n_events", "n_events_selected", "n_events_counted",
+        "sensitivity",
         "signal_mom_low_mevc", "signal_mom_high_mevc",
         "signal_time_low_ns", "signal_time_high_ns", "window_optimized",
         "n_signal_window", "n_background_window",
-        "cls_upper_events", "cls_upper_br",
-        "discovery_5sigma_events", "discovery_5sigma_br", "ses",
-        "fc_lower_events", "fc_upper_events", "fc_upper_br",
-        "expected_ul_events", "expected_ul_br", "fc_table_ul90_events",
-        "exposure", "sig_eff", "cl",
-        "bkg_rel_uncertainty", "sig_eff_rel_uncertainty",
+        "dio_background", "cosmic_background", "other_background",
+        "n_events", "n_events_selected", "n_events_counted",
     ),
     units={
         "n_events": "events", "n_events_selected": "events",
@@ -486,15 +433,8 @@ SPEC = AnalysisSpec(
         "signal_mom_low_mevc": "MeV/c", "signal_mom_high_mevc": "MeV/c",
         "signal_time_low_ns": "ns", "signal_time_high_ns": "ns",
         "n_signal_window": "events", "n_background_window": "events",
-        "cls_upper_events": "events",
-        "fc_lower_events": "events", "fc_upper_events": "events",
-        "expected_ul_events": "events", "fc_table_ul90_events": "events",
-        "discovery_5sigma_events": "events",
-        "cls_upper_br": "branching ratio",
-        "fc_upper_br": "branching ratio", "expected_ul_br": "branching ratio",
-        "discovery_5sigma_br": "branching ratio", "ses": "branching ratio",
-        "exposure": "captured muons",
-        "bkg_rel_uncertainty": "fraction", "sig_eff_rel_uncertainty": "fraction",
+        "dio_background": "events", "cosmic_background": "events",
+        "other_background": "events",
     },
     parameters=(
         ParamSpec(
@@ -504,50 +444,6 @@ SPEC = AnalysisSpec(
                         "(mu- -> e+, signal = 169/176). Sets the track charge "
                         "cut, the signal window and the counting range.",
             default="minus", kind="text",
-        ),
-        ParamSpec(
-            name="exposure",
-            description="Captured muons the input sample is equivalent to (the "
-                        "conversion rate is normalized to captures). The "
-                        "background counted in the window is taken as the "
-                        "expected background at this exposure, so it must be "
-                        "the sample's own. Converts event limits to branching "
-                        "ratios with sig_eff. Default: Run-1A, 28 days at "
-                        "3.84 kW (5.58e15 stopped muons).",
-            default=EXPOSURE, minimum=0.0,
-        ),
-        ParamSpec(
-            name="sig_eff",
-            description="Signal efficiency (0-1) for converting event limits "
-                        "to branching ratios. Not measured from the input. "
-                        "The default is the value pyCount assumes.",
-            default=SIG_EFF, minimum=0.0, maximum=1.0,
-        ),
-        ParamSpec(
-            name="cl",
-            description="Confidence level for the CLs upper limit, the "
-                        "Feldman-Cousins interval and the expected upper "
-                        "limit (fc_table_ul90_events is always 90%).",
-            default=CL, minimum=0.5, maximum=0.999,
-        ),
-        ParamSpec(
-            name="bkg_rel_uncertainty",
-            description="Relative systematic uncertainty on the background "
-                        "count, e.g. 0.2 for 20%: a Gaussian constraint on it "
-                        "in the CLs limit, and sigma_B in the discovery "
-                        "signal. 0 (default) with sig_eff_rel_uncertainty 0 "
-                        "gives the exact Poisson CLs limit; any uncertainty "
-                        "switches to the asymptotic profile likelihood, which "
-                        "at a background of a few events can come out below "
-                        "the exact limit.",
-            default=0.0, minimum=0.0, maximum=5.0,
-        ),
-        ParamSpec(
-            name="sig_eff_rel_uncertainty",
-            description="Relative systematic uncertainty on the signal "
-                        "efficiency, e.g. 0.04 for 4%: a Gaussian constraint "
-                        "on it in the CLs limit.",
-            default=0.0, minimum=0.0, maximum=1.0,
         ),
         ParamSpec(
             name="signal_window",

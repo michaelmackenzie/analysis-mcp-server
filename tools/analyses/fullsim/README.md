@@ -2,17 +2,18 @@
 
 Analyses of reconstructed EventNtuple files (`EventNtuple/ntuple`) from
 mixed MC samples with MC truth, such as the MDS ensembles. Today there is
-one, `fullsim_sensitivity`: RefAna/pyCount's cut-and-count, giving true
-signal and background in a momentum-time window and the limits on that
-background. The repo README.md, under `fullsim_sensitivity`, says how each
-step is computed and where it differs from pyCount.
+one, `fullsim_sensitivity`, the full-simulation counterpart of
+`approx_ce_sensitivity`. It reports the same thing: S/sqrt(B) in the best
+signal window, with the signal, DIO and cosmic counts in it. It selects
+tracks with RefAna/pyCount's cuts. The repo README.md, under
+`fullsim_sensitivity`, says how each step is computed and where it
+differs from pyCount.
 
 | module | what it holds |
 |---|---|
-| `sensitivity.py` | `fullsim_sensitivity` (the registered `SPEC`), its window scan and per-file reduction |
+| `sensitivity.py` | `fullsim_sensitivity` (the registered `SPEC`), its S/sqrt(B) window scan and per-file reduction |
 | `eventntuple.py` | the branch set and reader (`read_eventntuple`), surface ids and process codes, and `origin_codes`: what made each event's first track |
 | `cuts.py` | RefAna/pyCount's `Analyze.define_cuts` as track-level masks (`cut_masks`), the default set, toggling by name, and the cut flow |
-| `limits.py` | the Run-1A analysis' CLs upper limit (exact, or profile likelihood with systematics) and discovery signal; RefAna/pyCount's FC interval, expected upper limit and FC table (`FC.csv`) for comparison |
 
 ## Setup
 
@@ -49,11 +50,10 @@ result = run_analysis(
     "fullsim_sensitivity",
     output_dir="output/mds3c_set1",
     data_files=sorted(glob.glob(f"{D}/nts.*.root")),
-    parameters={"exposure": 3.4e15},   # captured muons the set is equivalent to
     timeout_s=3600,                    # ~a few seconds per 10k-event file
 )
 print(result.status, result.message)   # message: one-line summary, or the error
-result.metadata["cls_upper_events"]    # every metric is in metadata
+result.metadata["sensitivity"]         # every metric is in metadata
 ```
 
 Through the MCP server, ask the agent to call `run_analysis` with the
@@ -61,19 +61,15 @@ same arguments, or `list_analyses` to see every parameter and metric.
 
 For a quick check, pass two files: the CE split file and one ensemble
 file. With defaults that gives 162 counted events (92 CE) and the window
-[103.5, 104.5] MeV/c x [500, 1650] ns, with 49 CE and 1 cosmic in it.
+[103.5, 104.5] MeV/c x [500, 1650] ns, with 49 CE and 1 cosmic in it:
+S/sqrt(B) = 49.
 
 ### Parameters
 
 | parameter | default | what it does |
 |---|---|---|
 | `sign` | `minus` | `minus` (CE-, signal code 168) or `plus` (CE+, 176). Sets the charge cut, the window and the counting range. |
-| `exposure` | 3.398e15 | Captured muons the input is equivalent to: Run-1A's 5.58e15 stopped x the capture fraction 0.609. The background counted in the window *is* the expected background, so this must be the sample's own. It only enters the `*_br` metrics and `ses`. |
-| `sig_eff` | 0.12 | Signal efficiency for converting events to a branching ratio. Not measured from the input. |
-| `cl` | 0.9 | Confidence level of the CLs, FC and expected limits. |
-| `bkg_rel_uncertainty` | 0 | Relative background uncertainty. Nonzero switches the CLs limit to the asymptotic profile likelihood, which comes out *below* the exact one at a few events. |
-| `sig_eff_rel_uncertainty` | 0 | Relative signal-efficiency uncertainty, likewise. |
-| `signal_window` | empty | `'p_low,p_high,t_low,t_high'` (MeV/c, ns) to fix the window. Empty: for `minus`, scan for the best S/sqrt(B) over windows with both S > 0 and B > 0 (as `approx_ce_sensitivity` scores windows), else fall back to 103.9-105.1 MeV/c x 640-1650 ns; for `plus`, 90-92 MeV/c x 640-1650 ns. |
+| `signal_window` | empty | `'p_low,p_high,t_low,t_high'` (MeV/c, ns) to fix the window. Empty: for `minus`, scan for the best S/sqrt(B) over windows with both S > 0 and B > 0 (as `approx_ce_sensitivity` scores its windows), else fall back to 103.9-105.1 MeV/c x 640-1650 ns; for `plus`, 90-92 MeV/c x 640-1650 ns. |
 | `enable_cuts`, `disable_cuts` | empty | Comma-separated cut names to add to or drop from the default set, e.g. `disable_cuts="has_st,no_opa"`. An unknown name is an error that lists the known ones. |
 | `trkqual_min`, `trkpid_min` | 0.2, 0.638 | Thresholds of `good_trkqual` and `good_trkpid`. |
 
@@ -98,7 +94,7 @@ prints them next to the cut flow.
 In `output_dir`:
 
 - `fullsim_sensitivity.log`: the inputs, the cut flow, the counted events
-  by origin, the window and how it was chosen, and every limit.
+  by origin, the window and how it was chosen, and S, B by origin and S/sqrt(B) in it.
 - `cut_flow.csv`: events with a track passing each cut so far.
 - `window_events.csv`: run/subrun/event, origin, momentum and time of
   every event in the window.
@@ -106,11 +102,21 @@ In `output_dir`:
   `mom_vs_time.png`, and `window_scan.png` (S/sqrt(B) per window; blank
   where S or B is 0).
 
-The main metrics are `n_signal_window` and `n_background_window`, the
-window edges, `cls_upper_events` / `cls_upper_br` (the Run-1A limit),
-`discovery_5sigma_events` / `_br`, `ses`, and pyCount's `fc_*`,
-`expected_ul_*` and `fc_table_ul90_events`. `metadata` also has
-`cut_flow`, `counted_by_origin` and `background_window_by_origin`.
+The metrics, matching `approx_ce_sensitivity`'s where they mean the same:
+
+| metric | meaning |
+|---|---|
+| `sensitivity` | S/sqrt(B) in the window; NaN when S or B is 0 |
+| `signal_mom_low_mevc`, `signal_mom_high_mevc`, `signal_time_low_ns`, `signal_time_high_ns` | the window |
+| `window_optimized` | 1 if the scan chose the window, 0 if it was fixed or given |
+| `n_signal_window` | S: true CE in the window |
+| `n_background_window` | B: everything else in the window |
+| `dio_background`, `cosmic_background`, `other_background` | B split by origin (DIO includes IPA DIO; other is RMC, RPC, ...) |
+| `n_events`, `n_events_selected`, `n_events_counted` | events read, with a selected track, and counted |
+
+All counts are the sample's own; nothing is rescaled to an exposure.
+`metadata` also has `cut_flow`, `counted_by_origin` and
+`background_window_by_origin`.
 
 ## Using the pieces directly
 
@@ -119,7 +125,7 @@ example in a notebook:
 
 ```python
 import numpy as np
-from tools.analyses.fullsim import cuts, limits, sensitivity
+from tools.analyses.fullsim import cuts, sensitivity
 from tools.analyses.fullsim.eventntuple import ORIGIN_NAMES, read_eventntuple
 
 data = read_eventntuple(path)                 # awkward arrays per branch group
@@ -131,12 +137,9 @@ track_mask, flow = cuts.apply_cuts(masks, active, data["trk"]["trk.pdg"])
 ev = sensitivity.reduce_data(data, "minus", active, cuts.TRKQUAL_MIN,
                              cuts.TRKPID_MIN)
 best, rows = sensitivity.scan_window(ev["p"], ev["t"], ev["origin"] == 168)
-# best is None when no window has both signal and background
-
-limits.cls_upper_limit(n_obs=1, b=1.0, cl=0.9)              # 3.27 events
-limits.cls_upper_limit(1, 1.0, 0.9, b_sigma=0.2)            # 2.66, asymptotic
-limits.fc_interval(1, 1.0, 0.9)                             # (0.0, 3.357)
-limits.required_signal(5, 1.0)                              # 5 sigma: 5.0
+# best is None when no window has both signal and background, else e.g.
+# {"mom_low": 103.5, "mom_high": 104.5, "time_low": 500.0, ...,
+#  "n_signal": 49, "n_background": 1, "s_over_sqrt_b": 49.0}
 ```
 
 Read files one at a time (`sensitivity.reduce_file`) and `combine` the
@@ -156,6 +159,7 @@ branches.
 
 ## Tests
 
-`python3 tests/test_tools.py` covers the cuts, origins, reduction, window
-scan and limits on synthetic events. It also reruns pyCount's MDS3c
-comparison on two ensemble files when they are on disk.
+`python3 tests/test_tools.py` covers the cuts, origins, reduction and
+window scan on synthetic events. When the MDS3c files are on disk it also
+checks pyCount's cut flow on two ensemble files and the optimized window
+on the CE split plus one ensemble file.
