@@ -1,0 +1,12 @@
+# Run the online trigger paths over art files, with per-event timing.
+#
+# The base the trigger analyses build on: mu2e-trig-config's timing test
+# (the physics menu, with a Prefetch module so reading the data is not charged
+# to the first reconstruction module). Each run writes a small fcl that
+# includes this one and sets physics.trigger_paths and each path's prescale.
+
+#include "mu2e-trig-config/test/timingTest.fcl"
+
+# Per-event and per-module times, read back by tools/analyses/trigger.py.
+services.TimeTracker.dbOutput.filename  : "triggerTiming.db"
+services.TimeTracker.dbOutput.overwrite : true

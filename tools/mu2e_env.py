@@ -43,6 +43,9 @@ from typing import Literal
 
 MU2E_SETUP = "source /cvmfs/mu2e.opensciencegrid.org/setupmu2e-art.sh"
 
+# Where published Musings live: <root>/<Musing>/<version>.
+MUSINGS_ROOT = Path("/cvmfs/mu2e.opensciencegrid.org/Musings")
+
 # Used when nothing is configured: the work area this server grew up in.
 DEFAULT_WORK_AREA = Path("/exp/mu2e/app/users/mmackenz/mu2eopt")
 
@@ -153,6 +156,28 @@ class Mu2eEnv:
         if base is not None and (base / fcl).exists():
             return base / fcl
         return fcl
+
+    def find_code_file(self, relpath: str | Path,
+                       job_dir: Path | None = None) -> Path | None:
+        """A file in the configured code, or in a release it is backed by.
+
+        Muse resolves packages through `backing` links — a work area onto a
+        Musing, a Musing onto Offline — so a package like mu2e-trig-config
+        may sit a link or two down. Follows that chain from the work area,
+        the Musing's own directory, or an unpacked tarball. None if it is not
+        there, or the code is not on disk yet.
+        """
+        if self.kind == "musing":
+            start: Path | None = MUSINGS_ROOT / self.musing[0] / self.musing[1]
+        else:
+            start = self.base_dir(job_dir)
+        seen: set[Path] = set()
+        while start is not None and start.is_dir() and start not in seen:
+            seen.add(start)
+            if (start / relpath).is_file():
+                return start / relpath
+            start = start / "backing" if (start / "backing").exists() else None
+        return None
 
     def unpack_dir(self, job_dir: Path | None = None) -> Path:
         """Where the tarball is unpacked: the configured dir, else beside the job."""

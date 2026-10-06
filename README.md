@@ -8,10 +8,13 @@ mu2e -c <the analysis' fcl> -s <data file>     # one file
 mu2e -c <the analysis' fcl> -S <file list>     # several, one path per line
 ```
 
-or a Python computation over a ROOT file. Five analyses ship: energy
+or a Python computation over a ROOT file. Nine analyses ship: energy
 deposition (`edep`), event counts (`count`), muon stopping rate
-(`muon_stop_rate`), approximate CE sensitivity (`approx_ce_sensitivity`) and
-muon stops per material (`stop_materials`). Adding more is one small module each.
+(`muon_stop_rate`), approximate CE sensitivity (`approx_ce_sensitivity`),
+muon stops per material (`stop_materials`), and the online trigger's
+efficiency, rate and processing time (`trigger_efficiency`, `trigger_rate`,
+`trigger_timing`), and the trigger efficiency read from EventNtuples
+(`trigger_efficiency_ntuple`). Adding more is one small module each.
 
 Built to the same pattern as
 [`spectra-mcp-server`](https://github.com/HEP-KE/spectra-mcp-server), so the
@@ -52,6 +55,13 @@ tools/
     muon_stop_rate.py          stopping rate: count.py + POT scaling
     approx_ce_sensitivity.py   CE sensitivity from the EdepAna tree
     stop_materials.py          stops per material from <module>/stopmat
+    trigger.py                 the trigger job (paths + prescales) and its
+                               parsing, shared by the three below
+    trigger_efficiency.py      fraction of signal events triggered
+    trigger_rate.py            trigger rate on pileup, overall and per path
+    trigger_timing.py          trigger processing time per event on pileup
+    trigger_efficiency_ntuple.py  trigger efficiency from EventNtuple
+                               trig_<path> branches, for a track selection
     fullsim/                   full-simulation analyses of EventNtuple
       eventntuple.py           reading EventNtuple/ntuple; MC origin of a track
       cuts.py                  the CE-like track cuts (RefAna/pyCount)
@@ -97,6 +107,10 @@ workflow can chain several runs and collect `metadata` uniformly.
 | `approx_ce_sensitivity` | `nts.*.root` from `edep` | `S/sqrt(B)` for the best momentum window, with the window and its signal/DIO/cosmic counts |
 | `stop_materials` | `nts.*.root` file(s) from the stop-finding job (e.g. MuBeam) | muon stops per material, and per generated event for the `n_gen_events` you supply |
 | `fullsim_sensitivity` | reconstructed EventNtuple `nts.*.root` file(s) from a mixed MC sample, e.g. an MDS ensemble | true signal and background in a momentum-time window after the CE-like cuts, Feldman-Cousins and expected upper limits, SES |
+| `trigger_efficiency` | signal digi art file(s) | fraction of events passing any of the given trigger paths, and per path |
+| `trigger_rate` | pileup digi art file(s); default: mu2e-trig-config's CI sample | trigger rate in Hz averaged over the cycle (duty factor from `batch_mode`) and on spill, overall and per path |
+| `trigger_timing` | pileup digi art file(s); default: mu2e-trig-config's CI sample | trigger processing time per event: mean, median, tail; per path and per module |
+| `trigger_efficiency_ntuple` | EventNtuple file(s) with `trig_<path>` branches | of events with a track passing a selection, the fraction any given path accepted, and per path |
 
 `approx_ce_sensitivity` declares `produced_by = ["edep"]`, so chaining is
 discoverable: run `edep`, then pass the `nts.*.root` from its `files` to the
@@ -149,7 +163,11 @@ sensitivity is unchanged.
 
 ### Inputs
 
-Pass **exactly one** of:
+Pass **exactly one** of the following — or neither, for an analysis that
+`list_analyses` shows with `default_inputs` (`trigger_rate` and
+`trigger_timing`, which then run over the files in the configured code's
+`mu2e-trig-config/ci/data_files.txt`, found by following its `backing`
+links):
 
 - `data_file` — a single absolute art file path → `mu2e -s <file>`
 - `data_files` — a list of absolute art file paths → written one per line to
@@ -308,6 +326,117 @@ doubling it, so unlabelled empty bins are normal and are dropped. Content in
 an unlabelled bin or in the under/overflow is kept out of the total and
 reported as `unnamed_stops`, with the details per file in `per_file`
 (`unlabelled_bins`, `underflow`, `overflow`).
+
+## The trigger analyses
+
+`trigger_efficiency`, `trigger_rate` and `trigger_timing` run the online
+trigger menu's paths over art files, as one job each, built in
+`tools/analyses/trigger.py`. All three take `trigger_paths`, the paths and
+their prescales:
+
+```python
+parameters={"trigger_paths": "apr_TrkDe_80m70p:1, cpr_TrkDe_80m70p:10, calo_photon"}
+```
+
+A path without `:N` has prescale 1. The job is `fcl/trigger.fcl`, which
+builds on `mu2e-trig-config/test/timingTest.fcl` (the physics menu with a
+Prefetch module, so reading the data is not charged to the first
+reconstruction module). Each run writes `trigger_job.fcl` into `output_dir`:
+that text with `physics.trigger_paths` and each path's prescale filter set.
+FHiCL can only `#include` through `FHICL_FILE_PATH`, not an absolute path,
+so the base is copied in rather than included.
+
+- **Prescales are applied in the job**, by each path's `PrescaleEvent` filter
+  (`event % prescale == 0`), as online. The overall count therefore carries
+  the real overlap between prescaled paths, and a prescaled-away path costs
+  no time. The filter's label follows the menu generator's convention
+  (`apr_TrkDe_80m70p` → `AprTrkDe80m70pPS`); a test checks it against every
+  path in the published menu except the `tpr_`/`mpr_` ones, which are not
+  meant for the real trigger.
+- **Counts** come from art's TrigReport: events, events passing any path,
+  and each path's passes. Fractions carry the width of a uniform-prior
+  posterior as their uncertainty, so a path that never fired on a short
+  sample is not reported as exactly zero ± 0.
+- **`trigger_efficiency`** is relative to the events in the input: fold in
+  any filtering the sample already had (e.g. a "Triggerable" sample) yourself.
+- **`trigger_rate`** turns the accept fraction into Hz with the online event
+  rate: the on-spill microbunch rate (`microbunch_rate_hz`, one per 1695 ns)
+  times the spill duty factor. The duty factor follows `batch_mode` —
+  `1BB` (default) 0.322, `2BB` 0.246 — unless `duty_factor` is given. `rate_hz`
+  is averaged over the accelerator cycle, what the online system sees;
+  `onspill_rate_hz` is the rate during the spill. The event rate, duty factor
+  and microbunch rate are returned with every result.
+- **`trigger_timing`** reads the per-event times from the TimeTracker
+  database the job writes (`triggerTiming.db`, returned in `files`). An
+  event's time is the **sum of its modules' times without fetching the
+  data**: the Prefetch module (`PrefetchDAQData`) and the input source, which
+  TimeTracker times apart, are left out, as `mu2eTimingPlotsMaker` totals an
+  event. TimeTracker's own whole-event time includes the fetch, about 1 ms of
+  ~6 ms per event on the CI pileup sample, so it is reported only for
+  comparison (`metadata.fetch_time_mean_ms`, `metadata.full_event_time_mean_ms`).
+  The first `skip_events` (default 1) are left out too: the first event
+  carries the database and geometry initialization the running trigger
+  does not pay, ~1 s against a few ms per event, and would double the mean
+  of a few hundred events.
+  `metadata.modules` lists every module in the order it ran, with **N(seen)**
+  (`n_seen`, the timed events it ran on after the filters and prescale
+  upstream of it in its path, and `seen_fraction`), its time per run (mean,
+  median, rms, max) and per timed event (`ms_per_event`). The data fetch is
+  listed with `counted: false`. A module shared by several paths runs once
+  per event, charged to whichever path reached it first, so its runs can be
+  split over rows (e.g. `CaloHitMakerFast` under `calo_photon` on the events
+  that path's prescale let through, under `apr_` on the rest);
+  `n_seen_all_paths` and `ms_per_event_all_paths` add those up. `metadata.path_time_ms` is
+  what each path adds: TimeTracker charges a module shared by several paths
+  to the first that ran it. The times are wall-clock on whatever node runs
+  the job, so they compare configurations run on the same node, not
+  absolute online budgets.
+
+Per-path results are in `metadata.paths`: prescale, passes, and the
+efficiency or rate with its uncertainty. An unknown path name fails the job
+with art's `Unknown path ... has been specified in 'trigger_paths'`, carried
+in `metadata.stdout_tail`.
+
+## trigger_efficiency_ntuple
+
+The trigger efficiency without running anything: an EventNtuple records each
+path's decision per event in a `trig_<path>` branch. Of the events with at
+least one track passing `selection`, it reports the fraction any of
+`trigger_paths` accepted, and each path's own (`metadata.paths`):
+
+```python
+run_analysis(analysis="trigger_efficiency_ntuple",
+             data_file=".../nts.mu2e.CeMLeadingLogMix1BB.MDC2025au_best_v1_1-001.001430_00000000.root",
+             output_dir=".../ntuple_eff",
+             parameters={"trigger_paths": "apr_TrkDe_80m70p, cpr_TrkDe_80m70p",
+                         "selection": "status == 1 and pdg == 11 and downstream "
+                                      "and 100 < p_front < 110"})
+```
+
+`trigger_paths` are names separated by commas, with or without the `trig_`
+prefix; a name with no branch is reported along with the ones the file has.
+`selection` is a per-track cut in the `tools/selection.py` syntax over the
+variables in `TRACK_VARIABLES` (repeated in the parameter's description):
+the `trk` fields by name (`status`, `pdg`, `nactive`, `chisq`, `ndof`, ...),
+`trkqual`, `pid`, momentum, angle and time at the tracker front and middle,
+the helix fit parameters at TT_Mid (`d0`, `maxr`, `tandip`, `t0err`, ...),
+and the matched calorimeter cluster. Two details:
+
+- `*_front` quantities are at the **downstream-going** TT_Front crossing: a
+  track can cross TT_Front twice, and the first crossing is usually the
+  upstream leg. `downstream` means pz > 0 at TT_Mid.
+- The fit parameters (`trksegpars_lh`) share the segments' indexing, so
+  they are taken at the track's TT_Mid segment.
+
+The default selection is a converged (`status == 1`) downstream electron fit
+with p > 80 MeV/c at the tracker front, at least 15 active hits and
+chi^2/dof < 5. On the CeMLeadingLogMix1BB example file it selects 7178 of
+8212 events, of which 96.8% pass apr or cpr `TrkDe_80m70p`. The
+track variables were checked against a per-track loop over the raw branches
+(the same selected events, and identical TT_Mid fit parameters). Only the
+leaves the variables need are read, about 2 s per file; `data_files`
+combines several files into one result, with per-file counts in
+`metadata.per_file`.
 
 ## approx_ce_sensitivity
 
@@ -585,7 +714,7 @@ goes to `mu2e`, art resolves it on `FHICL_FILE_PATH`, `fcl_exists` comes back
 python3 tests/test_tools.py
 ```
 
-84 tests, none of which start a mu2e job. (The `ana` env has no pytest, so
+103 tests, none of which start a mu2e job. (The `ana` env has no pytest, so
 these are bare asserts.)
 
 ## Run the server
@@ -671,6 +800,35 @@ Other flags: `--output-dir` (defaults to `output/example`), `--sig-eff`
 (handed to `approx_ce_sensitivity`), `--timeout-s`. There is no default input
 file: `edep` runs over any art file with the right products, while
 `approx_ce_sensitivity` only means anything for a CE signal sample.
+
+The trigger analyses run only with `--trigger` (`--batch-mode 2BB` for the
+two-batch duty factor in the rate; the timing prints the module table). Rate and timing then run
+over the server's default pileup sample (or `--trigger-pileup-file`), and the
+efficiency over `--trigger-signal-file` when given. The default
+`--trigger-paths` are `cpr_TrkDe_80m70p` and `apr_TrkDe_80m70p`. The menu's
+TPR (`tpr_`) and MPR (`mpr_`) paths are left out of the defaults and the
+tests: they are not meant for the real trigger.
+
+```bash
+python3 examples/simple_client.py --trigger --max-events 1000 \
+    --trigger-signal-file /pnfs/.../dig.mu2e.CeEndpointOnSpill.<...>.art \
+    [--trigger-paths 'apr_TrkDe_80m70p, cpr_TrkDe_80m70p:10, calo_photon:10']
+```
+
+The trigger efficiency from EventNtuples needs no mu2e job and runs on its
+own with `--trigger-ntuple` (one file or several). It reads the decisions
+already in the ntuple's `trig_<path>` branches for `--trigger-paths`, minus
+their prescales, over events with a track passing the server's default
+selection or `--ntuple-selection`:
+
+```bash
+python3 examples/simple_client.py \
+    --trigger-ntuple /pnfs/mu2e/tape/phy-nts/nts/mu2e/CeMLeadingLogMix1BB/MDC2025au_best_v1_1-001/root/a8/50/nts.mu2e.CeMLeadingLogMix1BB.MDC2025au_best_v1_1-001.001430_00000000.root \
+    [--ntuple-selection 'status == 1 and pdg == 11 and downstream and 100 < p_front < 110']
+```
+
+On that file the defaults give 0.968: 6951 of 7178 selected events pass apr
+or cpr `TrkDe_80m70p`.
 
 ## Use it from a client
 
