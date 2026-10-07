@@ -21,7 +21,8 @@ from tools.analyses import edep as edep_mod
 from tools.analyses.edep import parse_edep_summary
 from tools.analyses.fullsim import cuts as fs_cuts
 from tools.analyses.fullsim import sensitivity as fs_sens
-from tools.analyses.fullsim.eventntuple import TRIGGERS, origin_codes
+from tools.analyses.fullsim.eventntuple import (DEFAULT_TRIGGERS, TRIGGER_PREFIX,
+                                                origin_codes)
 from tools.analyses.count import (CountsError, dataset_description,
                                   dataset_hint, parse_counts,
                                   parse_prescale_filters, saved_rates,
@@ -992,37 +993,48 @@ def _seg(sid, time=900.0, p=(0.0, 85.0, 60.0), t0err=0.5, maxr=500.0, d0=50.0,
             {"t0err": t0err, "maxr": maxr, "d0": d0, "tanDip": tandip})
 
 
-def _track(pdg=11, nactive=30, qual=0.9, pid=0.9, segs=None, sims=((168, 0, 10.0),)):
-    """A track passing every default cut unless told otherwise. `sims` are
+def _track(pdg=11, nactive=30, qual=0.9, pid=0.9, status=1, goodfit=1, segs=None,
+           sims=((168, 0, 10.0),)):
+    """A track passing every default cut unless told otherwise: segments at
+    the tracker front and middle, an ST boundary and the ST foils. `sims` are
     (startCode, gen, rho) for the track's particle, then its ancestors."""
     if segs is None:
-        segs = [_seg(0), _seg(1), _seg(104)]
+        segs = [_seg(0), _seg(1), _seg(100), _seg(104)]
     return {"pdg": pdg, "nactive": nactive, "qual": qual, "pid": pid,
-            "segs": segs,
+            "status": status, "goodfit": goodfit, "segs": segs,
             "sims": [{"startCode": code, "gen": gen,
-                      "pos": {"fCoordinates": {"fX": rho, "fY": 0.0}}}
+                      "pos": {"fCoordinates": {"fX": rho, "fY": 0.0}},
+                      "mom": {"fCoordinates": {"fX": 0.0, "fY": 84.0, "fZ": 63.0}}}
                      for code, gen, rho in sims]}
 
 
 def _eventntuple(events):
     """EventNtuple groups, as read_eventntuple returns them, from events of
-    {"tracks": [...], "crv": [(time, PEs, nHits, start, end)], "trig": 0/1}.
-    Every event carries a far-off, low-quality coincidence so the CRV arrays
-    have a type."""
+    {"tracks": [...], "crv": [(time, PEs, nHits, start, end)], "trig": 0/1,
+    "calo": [cluster energies]}. "trig" sets every default trigger path; a
+    dict {path: 0/1} sets each. "calo" defaults to one 50 MeV cluster.
+    Every event carries a far-off coincidence so the CRV arrays have a type."""
     import awkward as ak
     far = (-5000.0, 1.0, 1, -5000.0, -4990.0)
     crv = [ev.get("crv", []) + [far] for ev in events]
     tracks = [ev["tracks"] for ev in events]
     return {
         "evt": ak.Array([{"run": 1, "subrun": 0, "event": i,
-                          **{name: ev.get("trig", 1) for name in TRIGGERS}}
+                          **{TRIGGER_PREFIX + name: trig.get(name, 0)
+                             if isinstance(trig := ev.get("trig", 1), dict) else trig
+                             for name in DEFAULT_TRIGGERS}}
                          for i, ev in enumerate(events)]),
         "crv": ak.Array([{f"crvcoincs.{field}": [c[k] for c in coincs]
                           for k, field in enumerate(("time", "PEs", "nHits",
                                                      "timeStart", "timeEnd"))}
                          for coincs in crv]),
+        "calo": ak.Array([{"caloclusters.energyDep_": [float(e) for e in
+                                                       ev.get("calo", [50.0])]}
+                          for ev in events]),
         "trk": ak.Array([{"trk.pdg": [t["pdg"] for t in trks],
                           "trk.nactive": [t["nactive"] for t in trks],
+                          "trk.status": [t["status"] for t in trks],
+                          "trk.goodfit": [t["goodfit"] for t in trks],
                           "trkqual.result": [t["qual"] for t in trks],
                           "trkpid.result": [t["pid"] for t in trks]}
                          for trks in tracks]),
@@ -1033,11 +1045,9 @@ def _eventntuple(events):
     }
 
 
-def _failed_cuts(event, active=fs_cuts.DEFAULT_CUTS):
-    masks = fs_cuts.cut_masks(_eventntuple([event]), "minus")
-    active = [fs_cuts.charge_cut_name("minus") if n == "is_reco_lepton" else n
-              for n in active]
-    return sorted(name for name in active if not masks[name][0][0])
+def _failed_cuts(event, active=fs_cuts.DEFAULT_CUTS, sign="minus", track=0):
+    masks = fs_cuts.cut_masks(_eventntuple([event]), sign)
+    return sorted(name for name in active if not masks[name][0][track])
 
 
 def test_fullsim_a_ce_like_track_passes_every_default_cut():
@@ -1045,56 +1055,97 @@ def test_fullsim_a_ce_like_track_passes_every_default_cut():
 
 
 def test_fullsim_each_default_cut_rejects_what_it_should():
-    cases = {
-        "is_reco_electron": {"tracks": [_track(pdg=-11)]},
-        "has_downstream": {"tracks": [_track(segs=[_seg(0), _seg(1, p=(0, 85, -60)),
-                                                   _seg(104)])]},
-        "has_trk_front_seg": {"tracks": [_track(segs=[_seg(1), _seg(104)])]},
-        "good_trkpid": {"tracks": [_track(pid=0.5)]},
-        "good_trkqual": {"tracks": [_track(qual=0.1)]},
-        "within_t0err": {"tracks": [_track(segs=[_seg(0, t0err=1.5), _seg(1), _seg(104)])]},
-        "has_hits": {"tracks": [_track(nactive=19)]},
-        "has_st": {"tracks": [_track(segs=[_seg(0), _seg(1)])]},
-        "no_opa": {"tracks": [_track(segs=[_seg(0), _seg(1), _seg(104), _seg(95)])]},
-        "pz_over_pt": {"tracks": [_track(segs=[_seg(0, p=(0, 60, 85)), _seg(1), _seg(104)])]},
-        "good_trigger": {"tracks": [_track()], "trig": 0},
-    }
-    for cut, event in cases.items():
-        assert _failed_cuts(event) == [cut], (cut, _failed_cuts(event))
-    # the CRV cuts nest: any coincidence within 150 ns vetoes; only an in-time
-    # one also fails the time-window cut, and a bright one the quality cut
-    dim_early = {"tracks": [_track()], "crv": [(950.0, 5.0, 3, 300.0, 400.0)]}
-    assert _failed_cuts(dim_early) == ["no_crv_veto"]
-    bright = {"tracks": [_track()], "crv": [(950.0, 50.0, 20, 900.0, 1000.0)]}
-    assert _failed_cuts(bright) == ["no_crv_quality", "no_crv_timewindow", "no_crv_veto"]
-    off_time = {"tracks": [_track()], "crv": [(1200.0, 50.0, 20, 1150.0, 1250.0)]}
-    assert _failed_cuts(off_time) == []
+    front, mid, boundary, foils = _seg(0), _seg(1), _seg(100), _seg(104)
+    cases = [
+        (["is_good_track"], {"tracks": [_track(status=-1)]}),
+        (["is_good_track"], {"tracks": [_track(goodfit=0)]}),
+        # without a front segment there is no direction or tan(dip) either
+        (["has_downstream", "has_trk_front_seg", "pz_over_pt"],
+         {"tracks": [_track(segs=[mid, boundary, foils])]}),
+        (["charge_selection", "is_reco_electron_or_positron"], {"tracks": [_track(pdg=13)]}),
+        (["has_downstream"],
+         {"tracks": [_track(segs=[_seg(0, p=(0, 85, -60)), mid, boundary, foils])]}),
+        (["charge_selection"], {"tracks": [_track(pdg=-11)]}),
+        (["or_trigger"], {"tracks": [_track()], "trig": 0}),
+        (["good_trkpid"], {"tracks": [_track(pid=0.5)]}),
+        (["good_trkpid"], {"tracks": [_track()], "calo": []}),
+        (["pz_over_pt"],
+         {"tracks": [_track(segs=[_seg(0, tandip=0.9), mid, boundary, foils])]}),
+        (["st_boundary"], {"tracks": [_track(segs=[front, mid, foils])]}),
+        (["has_st"], {"tracks": [_track(segs=[front, mid, boundary])]}),
+        (["no_opa"], {"tracks": [_track(segs=[front, mid, boundary, foils, _seg(95)])]}),
+        (["good_trkqual"], {"tracks": [_track(qual=0.1)]}),
+        (["has_hits"], {"tracks": [_track(nactive=19)]}),
+        # t0err counts at the tracker middle, not the front
+        (["within_t0err"],
+         {"tracks": [_track(segs=[front, _seg(1, t0err=1.0), boundary, foils])]}),
+        ([], {"tracks": [_track(segs=[_seg(0, t0err=1.0), mid, boundary, foils])]}),
+        # the CRV veto is asymmetric: a coincidence 50 ns before the track
+        # vetoes it, one 50 ns after does not
+        (["no_crv_veto"], {"tracks": [_track()], "crv": [(850.0, 5.0, 3, 800.0, 900.0)]}),
+        ([], {"tracks": [_track()], "crv": [(950.0, 5.0, 3, 900.0, 1000.0)]}),
+    ]
+    for expected, event in cases:
+        assert _failed_cuts(event) == sorted(expected), (expected, _failed_cuts(event))
 
 
-def test_fullsim_a_segment_cut_applies_only_at_the_tracker_front():
+def test_fullsim_vetoes_pair_tracks_in_time():
+    def at(time, pz=60.0, pdg=11):
+        return _track(pdg=pdg, segs=[_seg(0, time=time, p=(0, 85, pz)), _seg(1),
+                                     _seg(100), _seg(104)])
+    # an upstream track 40-110 ns before a downstream one is its reflection
+    assert _failed_cuts({"tracks": [at(900.0), at(830.0, pz=-60)]}) == ["upstream_veto"]
+    assert _failed_cuts({"tracks": [at(900.0), at(870.0, pz=-60)]}) == []
+    # two downstream e+- within 150 ns veto each other, for sign minus only
+    pair = {"tracks": [at(900.0), at(1000.0, pdg=-11)]}
+    assert _failed_cuts(pair) == ["no_multi_trk_veto"]
+    assert _failed_cuts(pair, track=1) == ["charge_selection", "no_multi_trk_veto"]
+    assert _failed_cuts({"tracks": [at(900.0), at(1100.0)]}) == []
+    assert _failed_cuts(pair, sign="plus") == ["charge_selection"]
+
+
+def test_fullsim_trigger_passes_on_any_of_the_paths():
+    apr, cpr = DEFAULT_TRIGGERS
+    assert _failed_cuts({"tracks": [_track()], "trig": {apr: 1}}) == []
+    assert _failed_cuts({"tracks": [_track()], "trig": {cpr: 1}}) == []
+    assert _failed_cuts({"tracks": [_track()], "trig": {}}) == ["or_trigger"]
+    # only the paths asked for count
+    data = _eventntuple([{"tracks": [_track()], "trig": {apr: 1}}])
+    masks = fs_cuts.cut_masks(data, "minus", triggers=(cpr,))
+    assert not masks["or_trigger"][0][0]
+    from tools.analyses.fullsim.eventntuple import EventNtupleError, parse_trigger_paths
+    assert parse_trigger_paths(f"trig_{apr}, {cpr} {apr}") == [apr, cpr]
+    for bad in ("", " , ", "bad-name"):
+        try:
+            parse_trigger_paths(bad)
+        except EventNtupleError:
+            pass
+        else:
+            raise AssertionError(f"{bad!r} should have been refused")
+
+
+def test_fullsim_a_segment_cut_applies_only_at_its_surface():
     # a late time at the ST does not matter; at the front it does
-    st_late = {"tracks": [_track(segs=[_seg(0), _seg(1), _seg(104, time=50.0)])]}
-    front_early = {"tracks": [_track(segs=[_seg(0, time=50.0), _seg(1), _seg(104)])]}
+    st_late = {"tracks": [_track(segs=[_seg(0), _seg(1), _seg(100), _seg(104, time=50.0)])]}
+    front_early = {"tracks": [_track(segs=[_seg(0, time=50.0), _seg(1), _seg(100),
+                                           _seg(104)])]}
     active = fs_cuts.DEFAULT_CUTS + ("within_t0",)
     assert _failed_cuts(st_late, active) == []
     assert _failed_cuts(front_early, active) == ["within_t0"]
 
 
 def test_fullsim_active_cuts_toggle_by_name_and_refuse_unknown_ones():
-    active = fs_cuts.active_cuts("minus", "within_d0", "has_st, no_opa")
-    assert "within_d0" in active and "has_st" not in active and "no_opa" not in active
-    assert active[0] == "is_reco_electron"
-    assert fs_cuts.active_cuts("plus", "", "")[0] == "is_reco_positron"
-    # the cut flow follows pyCount's order whatever order they are named in
-    assert active == [n for n in fs_cuts.cut_names("minus") if n in active]
-    for enable, needle in (("not_a_cut", "Known:"),
-                           ("is_reco_positron", "with sign='minus' it is is_reco_electron")):
-        try:
-            fs_cuts.active_cuts("minus", enable, "")
-        except fs_cuts.CutError as exc:
-            assert needle in str(exc), exc
-        else:
-            raise AssertionError(f"{enable} was accepted")
+    active = fs_cuts.active_cuts("within_t0", "has_st, no_opa")
+    assert "within_t0" in active and "has_st" not in active and "no_opa" not in active
+    assert "in_mom_range" not in active and active[0] == "has_a_track"
+    # the cut flow follows pyfitter's order whatever order they are named in
+    assert active == [n for n in fs_cuts.CUT_DESCRIPTIONS if n in active]
+    try:
+        fs_cuts.active_cuts("not_a_cut", "")
+    except fs_cuts.CutError as exc:
+        assert "Known:" in str(exc), exc
+    else:
+        raise AssertionError("not_a_cut was accepted")
 
 
 def test_fullsim_origin_is_the_first_classified_particle_in_the_chain():
@@ -1115,45 +1166,114 @@ def test_fullsim_origin_is_the_first_classified_particle_in_the_chain():
 def test_fullsim_reduce_counts_the_first_selected_track_of_each_event():
     data = _eventntuple([
         {"tracks": [_track()]},
-        # the first track fails, so the second (a DIO) represents the event
-        {"tracks": [_track(qual=0.0), _track(segs=[_seg(0, p=(0, 80, 60)), _seg(1),
-                                                    _seg(104)], sims=[(166, 0, 20.0)])]},
+        # the first track fails, so the second (a DIO, 200 ns later so the
+        # multi-track veto leaves it) represents the event
+        {"tracks": [_track(qual=0.0),
+                    _track(segs=[_seg(0, time=1100.0, p=(0, 80, 60)), _seg(1), _seg(100),
+                                 _seg(104)], sims=[(166, 0, 20.0)])]},
         {"tracks": [_track(nactive=5)]},                            # cut away
         # selected, but with two front segments, so not counted (a reflected
         # track would be, but pz_over_pt removes those)
-        {"tracks": [_track(segs=[_seg(0), _seg(0, time=950.0), _seg(1), _seg(104)])]},
+        {"tracks": [_track(segs=[_seg(0), _seg(0, time=950.0), _seg(1), _seg(100),
+                                 _seg(104)])]},
+        # likewise when the second front segment's time is NaN: it still counts
+        {"tracks": [_track(segs=[_seg(0), _seg(0, time=np.nan), _seg(1), _seg(100),
+                                 _seg(104)])]},
     ])
-    active = fs_cuts.active_cuts("minus", "", "")
-    reduced = fs_sens.reduce_data(data, "minus", active, 0.2, 0.638)
-    assert reduced["n_events"] == 4 and reduced["n_selected"] == 3
-    assert reduced["flow"][-1] == 3 and len(reduced["flow"]) == len(active)
+    data["n_processed"] = 7          # the job processed more than it kept
+    active = fs_cuts.active_cuts("", "")
+    reduced = fs_sens.reduce_data(data, active, fs_cuts.TRKQUAL_MIN, fs_cuts.TRKPID_MIN)
+    assert reduced["n_events"] == 5 and reduced["n_selected"] == 4
+    assert reduced["n_processed"] == 7
+    assert reduced["flow"][-1] == 4 and len(reduced["flow"]) == len(active)
     assert reduced["origin"].tolist() == [168, 166]
     assert np.allclose(reduced["p"], [np.hypot(85, 60), 100.0])
+    assert np.allclose(reduced["p_true"], [105.0, 105.0])
     assert reduced["event"].tolist() == [0, 1]
-    assert reduced["all_p"].size == 4      # every front segment of every track
 
 
-def test_fullsim_window_scan_scores_windows_as_approx_ce_sensitivity_does():
-    """Only windows with S > 0 and B > 0 count, and a tie keeps the first
-    scanned, as in approx_ce_sensitivity.scan_signal_box."""
-    p = np.array([104.0, 104.1, 104.15, 103.25, 104.95])
-    t = np.array([900.0, 900.0, 900.0, 900.0, 600.0])
-    is_signal = np.array([True, True, True, False, False])
-    best, rows = fs_sens.scan_window(p, t, is_signal)
-    # S = 3, B = 1 at [103.2, 104.2] and again at [104.0, 105.0]: first wins.
-    # The windows holding all three and no background score nothing.
-    assert (best["n_signal"], best["n_background"]) == (3, 1)
-    assert (best["mom_low"], best["mom_high"], best["time_low"]) == (103.2, 104.2, 500.0)
-    assert best["s_over_sqrt_b"] == 3.0
-    assert len(rows) == 26 * 21
-    assert all(np.isnan(r["s_over_sqrt_b"]) for r in rows
-               if r["n_signal"] == 0 or r["n_background"] == 0)
-    assert any(r["n_signal"] == 3 and r["n_background"] == 0 for r in rows)
-    # nothing to optimize on: no window has both, so there is no best
-    best, _ = fs_sens.scan_window(p, t, np.zeros(5, dtype=bool))
-    assert best is None
-    best, _ = fs_sens.scan_window(p[:3], t[:3], is_signal[:3])
-    assert best is None
+def test_fullsim_rates_follow_production_normalization():
+    """Signal = NPOT x stops/POT x captures/stop x R_mue x efficiency; the DIO
+    is the theory spectrum for NPOT x stops/POT x DIO/stop, folded with the
+    measured response, which carries the same efficiency; cosmics are flat
+    per MeV/c over the on-spill time."""
+    from tools.analyses.fullsim import normalization as norm
+    from tools.analyses import approx_ce_sensitivity as fast
+    if not fast.DIO_TABLE.exists():
+        print("     (skipped: DIO table not on disk)")
+        return
+    rng = np.random.default_rng(1)
+    p_true = np.full(400, 104.97)
+    p_reco = p_true - rng.exponential(0.3, p_true.size) + rng.normal(0, 0.15, p_true.size)
+    spectra = fs_sens.build_spectra(p_reco, p_true, n_generated=1000,
+                                    upstream_eff=0.5, npot=1e18,
+                                    mean_pot_per_event=1.6e7,
+                                    cosmic_rate_per_s_per_mev=1e-5,
+                                    stopped_muons_per_pot=1e-3, rmue=1e-13)
+    eff = 400 / 1000 * 0.5
+    stops = 1e18 * 1e-3
+    assert np.isclose(spectra["efficiency"], eff)
+    assert np.isclose(spectra["stopped_muons"], stops)
+    assert np.isclose(spectra["signal"].values.sum(), stops * 0.609 * 1e-13 * eff)
+    assert np.isclose(spectra["response"].values.sum() * spectra["response"].width, eff)
+    # the response only moves DIO a little, so the folded total is the
+    # theory total times the efficiency
+    dio_total = norm.DIO_PER_STOPPED_MUON * stops * eff
+    assert np.isclose(spectra["dio"].values.sum(), dio_total, rtol=1e-3)
+    width = spectra["signal"].width
+    onspill = 1e18 / 1.6e7 * fast.ONSPILL_SECONDS_PER_EVENT
+    assert np.allclose(spectra["cosmic"].values, 1e-5 * onspill * width)
+    # the scan is approx_ce_sensitivity's, and finds the peak
+    best, _ = fast.scan_signal_box(spectra["signal"], spectra["dio"], spectra["cosmic"])
+    assert 103.5 < best["low_mev"] < best["high_mev"] < 105.5
+
+
+# SimEfficiencies2 for Sim_best v1_1, run 1430, as dbTool prints it.
+SIM_EFFICIENCIES_TABLE = """\
+MuBeamCat,213816,100000000,0.00213816
+EleBeamCat,5532579,100000000,0.05532579
+MuminusStopsCat,1435092,4000000000,0.000358773
+MuplusStopsCat,7578,4000000000,0.0000018945
+IPAStopsCat,22519,3584800000,0.00000628180093729078
+PiTotalLifeimeWeight_filter,0,0,38536.77997060446
+"""
+
+
+def test_fullsim_stopped_muons_per_pot_follow_the_sim_chain():
+    from tools.analyses.fullsim import normalization as norm
+    table = norm.parse_sim_efficiencies(SIM_EFFICIENCIES_TABLE)
+    # Production's normalizations.py: MuBeamCat x MuminusStopsCat x 1000
+    assert np.isclose(norm.stopped_muons_per_pot(table),
+                      0.00213816 * 0.000358773 * 1000)
+    assert np.isclose(norm.STOPPED_MUONS_PER_POT, norm.stopped_muons_per_pot(table))
+    assert np.isclose(norm.CAPTURES_PER_STOPPED_MUON + norm.DIO_PER_STOPPED_MUON, 1.0)
+    del table["MuminusStopsCat"]
+    try:
+        norm.stopped_muons_per_pot(table)
+    except norm.NormalizationError as exc:
+        assert "MuminusStopsCat" in str(exc) and "dbTool" in str(exc), exc
+    else:
+        raise AssertionError("a table without MuminusStopsCat was accepted")
+
+
+def test_fullsim_generated_events_come_from_the_nearest_ancestor_with_gencount():
+    from tools.analyses.fullsim import provenance
+    nts = "nts.mu2e.CeMLeadingLogMix1BB.MDC2025au_best_v1_1-001.001430_00000000.root"
+    mcs = "mcs.mu2e.CeMLeadingLogMix1BB.MDC2025au_best_v1_1.001430_00000000.art"
+    catalog = {nts: {"parents": [{"file_name": mcs}]},
+               mcs: {"dh.gencount": 20000, "event_count": 8212,
+                     "parents": [{"file_name": "dig.x"}]}}
+    assert provenance.generated_events(nts, fetch=catalog.__getitem__) == 20000
+    # no ancestor with a count, or no SAM: an error that says which file
+    orphan = {nts: {"parents": []}}
+    for fetch, needle in ((orphan.__getitem__, "no dh.gencount"),
+                          ({}.__getitem__, "cannot read the SAM metadata")):
+        try:
+            provenance.generated_events(nts, fetch=fetch)
+        except provenance.ProvenanceError as exc:
+            assert needle in str(exc) and nts in str(exc), exc
+        else:
+            raise AssertionError(f"{needle}: no error")
 
 
 def test_fullsim_run_reports_a_file_that_is_not_an_eventntuple(tmp_dir):
@@ -1162,56 +1282,57 @@ def test_fullsim_run_reports_a_file_that_is_not_an_eventntuple(tmp_dir):
     result = run_analysis(analysis="fullsim_sensitivity", data_file=str(path),
                           output_dir=tmp_dir)
     assert result.status == "error" and "EventNtuple/ntuple" in result.message
-    bad = run_analysis(analysis="fullsim_sensitivity", data_file=str(path),
-                       output_dir=tmp_dir, parameters={"sign": "neutral"})
-    assert bad.status == "error" and "'minus'" in bad.message
     window = run_analysis(analysis="fullsim_sensitivity", data_file=str(path),
-                          output_dir=tmp_dir,
-                          parameters={"signal_window": "105,104,600,1650"})
-    assert window.status == "error"
+                          output_dir=tmp_dir, parameters={"time_window": "1650,640"})
+    assert window.status == "error" and "time_window" in window.message
 
 
-# Two files of the MDS3c ensemble (Run-1 mix, R_mue = 1e-13), on which
-# pyCount's process.py gave the numbers below; skipped where not on disk.
-MDS3C_FILES = [Path("/exp/mu2e/data/users/mu2epro/ensembles/MDS3/MDS3c/"
-                    f"merged_files_1/nts.mu2e.ensembleMDS3cMix1BB.MDC2025-001.001430_0000000{i}.root")
-               for i in (1, 3)]
-MDS3C_CE_FILE = MDS3C_FILES[0].parent / "nts.mu2e.CeMLeadingLogMix1BBSplit.best_v1_3.1.root"
+# A CeMLeadingLogMix1BB EventNtuple file: CE- mixed with pileup; skipped
+# where not on disk.
+CE_MIX_FILE = Path("/pnfs/mu2e/tape/phy-nts/nts/mu2e/CeMLeadingLogMix1BB/"
+                   "MDC2025au_best_v1_1-001/root/a8/50/nts.mu2e.CeMLeadingLogMix1BB."
+                   "MDC2025au_best_v1_1-001.001430_00000000.root")
 
 
-def test_fullsim_reproduces_pycount_on_mds3c(tmp_dir):
-    if not all(path.exists() for path in MDS3C_FILES):
-        print("     (skipped: MDS3c ensemble files not on disk)")
+def test_fullsim_measures_the_efficiency_on_ce_mix(tmp_dir):
+    if not CE_MIX_FILE.exists():
+        print("     (skipped: CE mix file not on disk)")
         return
-    # pyCount's scan finds no CE in these and keeps its first window
-    result = run_analysis(analysis="fullsim_sensitivity",
-                          data_files=[str(p) for p in MDS3C_FILES], output_dir=tmp_dir,
-                          parameters={"signal_window": "103,104,500,1650"})
+    # the file's parent mcs file has dh.gencount 20000 in SAM; passed here so
+    # the test needs no network
+    generated = {"n_generated": 20000}
+    result = run_analysis(analysis="fullsim_sensitivity", data_file=str(CE_MIX_FILE),
+                          output_dir=tmp_dir, parameters=generated)
     assert result.status == "success", result.message
     md = result.metadata
-    assert list(md["cut_flow"].values()) == [19433, 13375, 9127, 9065, 3850, 3103,
-                                             3098, 3030, 821, 794, 764, 761, 761,
-                                             712, 480]
-    assert md["n_events_counted"] == 141
-    assert (md["n_signal_window"], md["n_background_window"]) == (0, 1)
-    assert md["background_window_by_origin"] == {"cosmic": 1}
-    assert md["n_reco_segments_window"] == 1
-    # S = 0, so S/sqrt(B) is undefined, as approx_ce_sensitivity has it
-    assert np.isnan(md["sensitivity"])
-    assert (md["dio_background"], md["cosmic_background"], md["other_background"]) == (0, 1, 0)
-    if not MDS3C_CE_FILE.exists():
-        return
-    # With the CE split the scan optimizes: only windows with B > 0 count
-    optimized = run_analysis(analysis="fullsim_sensitivity",
-                             data_files=[str(MDS3C_CE_FILE), str(MDS3C_FILES[0])],
-                             output_dir=tmp_dir)
-    md = optimized.metadata
-    assert optimized.status == "success" and md["window_optimized"] == 1.0
-    assert md["n_events_counted"] == 162
-    assert (md["signal_mom_low_mevc"], md["signal_mom_high_mevc"],
-            md["signal_time_low_ns"]) == (103.5, 104.5, 500.0)
-    assert (md["n_signal_window"], md["n_background_window"]) == (49, 1)
-    assert md["sensitivity"] == 49.0 and md["cosmic_background"] == 1
+    assert md["n_events_processed"] == 8212 and md["n_events_generated"] == 20000
+    assert np.isclose(md["acceptance"], 8212 / 20000)
+    assert (md["n_events_selected"], md["n_events_counted"]) == (4181, 3010)
+    # the efficiency counts against what was generated, so it carries the
+    # digitization filter's acceptance
+    assert np.isclose(md["signal_efficiency"], 3010 / 20000)
+    assert np.isclose(md["signal_rate"], 4.686, rtol=1e-3)
+    # the cut flow is pyfitter's for cut-set 80_1d on this file
+    assert list(md["cut_flow"].values())[-1] == 4181
+    assert md["cut_flow"]["no_multi_trk_veto"] == 6909 and md["cut_flow"]["pz_over_pt"] == 4550
+    assert np.allclose((md["signal_mom_low_mevc"], md["signal_mom_high_mevc"]), (103.5, 104.7))
+    # 1e18 POT x 7.67e-4 stopped mu-/POT x 0.609 captures x R_mue 1e-13
+    assert np.isclose(md["n_conversions"], 46.717, rtol=1e-4)
+    assert md["total_background"] == md["dio_background"] + md["cosmic_background"]
+    # a pileup DIO track that passes the cuts is not signal
+    assert md["selected_by_origin"] == {"DIO": 1, "CE-": 4180}
+    # upstream_eff scales the signal and the DIO alike, not the cosmics
+    half = run_analysis(analysis="fullsim_sensitivity", data_file=str(CE_MIX_FILE),
+                        output_dir=tmp_dir, parameters={**generated, "upstream_eff": 0.5})
+    hm = half.metadata
+    assert np.isclose(hm["signal_efficiency"], 0.5 * 3010 / 20000)
+    assert hm["cosmic_rate_per_s_per_mev"] == md["cosmic_rate_per_s_per_mev"]
+    bad = run_analysis(analysis="fullsim_sensitivity", data_file=str(CE_MIX_FILE),
+                       output_dir=tmp_dir, parameters={**generated, "trigger_paths": "apr_Nope"})
+    assert bad.status == "error" and "trig_apr_Nope" in bad.message
+    few = run_analysis(analysis="fullsim_sensitivity", data_file=str(CE_MIX_FILE),
+                       output_dir=tmp_dir, parameters={"n_generated": 100})
+    assert few.status == "error" and "n_generated 100" in few.message
 
 
 # --- the registry (loops over every analysis) --------------------------------
