@@ -14,7 +14,7 @@ computed.
 |---|---|
 | `sensitivity.py` | `fullsim_sensitivity` (the registered `SPEC`): per-file reduction, the signal/DIO/cosmic spectra (`build_spectra`) |
 | `eventntuple.py` | the branch set and reader (`read_eventntuple`), trigger paths, surface ids and process codes, and `origin_codes`: what made each event's first track |
-| `normalization.py` | stopped mu- per POT from a SimEfficiencies2 table (`stopped_muons_per_pot`) and the captures/DIO per stopped mu-, as Production's `normalizations.py` |
+| `normalization.py` | stopped mu- per POT from the stop chain's stage efficiencies, computed from their SAM datasets as `CreateSimEfficiency.sh` does (`sim_efficiencies`, `stopped_muons_per_pot`), and the captures/DIO per stopped mu-, as Production's `normalizations.py` |
 | `provenance.py` | events generated to make a file: `dh.gencount` of its nearest SAM ancestor that has one (`generated_events`) |
 | `cuts.py` | pyfitter's `Analyze.define_cuts` with cut-set `80_1d`'s thresholds, as track-level masks (`cut_masks`), the default set, toggling by name, and the cut flow |
 
@@ -71,7 +71,8 @@ alone: 20000 events were generated and 8212 reached the ntuple (acceptance
 | parameter | default | what it does |
 |---|---|---|
 | `npot`, `mean_pot_per_event`, `cosmic_rate_per_s_per_mev` | as `approx_ce_sensitivity` | NPOT, and the cosmic rate over the on-spill time they imply. |
-| `stopped_muons_per_pot` | 7.67e-4 | Stopped mu- per POT: MuBeamCat x MuminusStopsCat x 1000 from the campaign's SimEfficiencies2 table (default: Sim_best v1_1, run 1430). Signal and DIO scale with NPOT times this. |
+| `stopped_muons_per_pot` | 0 (compute from SAM) | Stopped mu- per POT: MuBeamCat x MuminusStopsCat efficiency x 1000. Signal and DIO scale with NPOT times this. 0 computes it in SAM from the chain `stop_datasets` gives; a number (7.67e-4 for the MDC2025 chain) skips SAM. |
+| `stop_datasets` | `auto` | The stop chain. `auto` traces it from the inputs' SAM ancestry: the MuminusStopsCat dataset the CE were generated from, then the MuBeamCat dataset that came from (for the MDC2025au_best_v1_1 CE mix, `sim.mu2e.MuBeamCat.MDC2025ab.art, sim.mu2e.MuminusStopsCat.MDC2025ac.art`). Or name the datasets, one per stage, for inputs whose ancestry is not in SAM. Each stage's efficiency is events in the dataset over events generated (`event_count` / `dh.gencount`, summed over its files), as `mu2eGenFilterEff` computes it, so no conditions-database table is needed. |
 | `rmue` | 1e-13 | R_mue, relative to capture: the expected CE count is NPOT x `stopped_muons_per_pot` x 0.609 x `rmue`. |
 | `n_generated` | 0 (look up in SAM) | Events generated to make the inputs: the efficiency's denominator. |
 | `upstream_eff` | 1 | An extra efficiency factor for a loss `dh.gencount` does not count. Scales the signal and the DIO. |
@@ -126,17 +127,41 @@ In `output_dir`:
 
 ### Stopped muons per POT for another campaign
 
-```bash
-muse setup SimJob MDC2025ay        # any environment with dbTool
-dbTool print-run --purpose Sim_best --version v1_1 --run 1430 \
-    --table SimEfficiencies2 --content > simeff.txt
+Nothing to set: with `stop_datasets` at `auto`, the chain is traced from
+the input files' SAM parents. The CE mix file's ancestry is
+
 ```
+nts.CeMLeadingLogMix1BB -> mcs -> dig -> dts.CeMLeadingLog.MDC2025ap
+  -> sim.MuminusStopsCat.MDC2025ac -> sim.TargetStopsCat -> sim.TargetStops
+  -> sim.MuBeamCat.MDC2025ab
+```
+
+and each generation follows one file per parent dataset, so it takes a few
+SAM lookups however many parents a concatenated file has. Files of one
+input dataset are traced once. Inputs that trace to different chains, or a
+generation with two MuminusStopsCat datasets, are an error. For inputs
+whose ancestry is not in SAM (e.g. a renamed local file), name the chain:
+`"sim.mu2e.MuBeamCat.<config>.art, sim.mu2e.MuminusStopsCat.<config>.art"`.
+
+The efficiencies are computed from SAM as Production's
+`Scripts/CreateSimEfficiency.sh` computes them with `mu2eGenFilterEff`,
+before anything is loaded into the SimEfficiencies2 table, so a chain that
+was never put in the database works. The log and `metadata.sim_efficiencies`
+give each stage's dataset, file count, passed and generated events.
+
+The same from Python:
 
 ```python
 from tools.analyses.fullsim import normalization
-table = normalization.parse_sim_efficiencies(open("simeff.txt").read())
-normalization.stopped_muons_per_pot(table)   # pass as stopped_muons_per_pot
+chain = normalization.stop_chain_of_inputs([nts_file_name])  # SAM file names
+stages = normalization.sim_efficiencies(chain)
+normalization.stopped_muons_per_pot(stages)   # 7.67e-4
 ```
+
+A table that is in the database (`dbTool print-run --purpose Sim_best
+--version v1_1 --run 1430 --table SimEfficiencies2 --content`) or a
+`mu2eGenFilterEff` output file can still be read with
+`normalization.parse_sim_efficiencies` and passed to `stopped_muons_per_pot`.
 
 ## Using the pieces directly
 

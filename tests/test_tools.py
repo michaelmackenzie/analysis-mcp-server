@@ -1251,9 +1251,160 @@ def test_fullsim_stopped_muons_per_pot_follow_the_sim_chain():
     try:
         norm.stopped_muons_per_pot(table)
     except norm.NormalizationError as exc:
-        assert "MuminusStopsCat" in str(exc) and "dbTool" in str(exc), exc
+        assert "MuminusStopsCat" in str(exc), exc
     else:
         raise AssertionError("a table without MuminusStopsCat was accepted")
+
+
+# The MDC2025 stop chain's files as SAM has them (2026-10-07): MuBeamCat's
+# four, one with event_count left out as SAM does for a zero, and
+# MuminusStopsCat's one.
+MUBEAM_FILES = [("sim.mu2e.MuBeamCat.MDC2025ab.001430_00020851.art", 25000000, 53513),
+                ("sim.mu2e.MuBeamCat.MDC2025ab.001430_00032620.art", 25000000, 53834),
+                ("sim.mu2e.MuBeamCat.MDC2025ab.001430_00020001.art", 25000000, 53262),
+                ("sim.mu2e.MuBeamCat.MDC2025ab.001430_00020000.art", 25000000, 53207)]
+MUSTOPS_FILES = [("sim.mu2e.MuminusStopsCat.MDC2025ac.001430_00000000.art",
+                  4000000000, 1435092)]
+
+
+def _fake_sam(datasets):
+    """list_files and fetch over {dataset: [(file, gencount, event_count)]};
+    an event_count of None is left out of the metadata."""
+    records = {}
+    for files in datasets.values():
+        for name, gencount, count in files:
+            records[name] = {"file_name": name, "dh.gencount": gencount}
+            if count is not None:
+                records[name]["event_count"] = count
+    return ((lambda ds: [f[0] for f in datasets.get(ds, [])]),
+            (lambda names: [records[n] for n in names]))
+
+
+def test_fullsim_stage_efficiencies_come_from_the_datasets_without_the_db():
+    """As CreateSimEfficiency.sh (mu2eGenFilterEff): events in the dataset
+    over events generated, summed over its files, so the MDC2025 chain gives
+    the SimEfficiencies2 rows without reading them."""
+    from tools.analyses.fullsim import normalization as norm
+    beam, stops = norm.STOP_CHAIN_DATASETS
+    list_files, fetch = _fake_sam({beam: MUBEAM_FILES, stops: MUSTOPS_FILES})
+    stages = norm.sim_efficiencies(norm.STOP_CHAIN_DATASETS, list_files, fetch)
+    assert stages == norm.STOP_CHAIN_MDC2025
+    table = norm.parse_sim_efficiencies(SIM_EFFICIENCIES_TABLE)
+    for stage in norm.STOP_CHAIN:
+        assert np.isclose(stages[stage].efficiency, table[stage]), stage
+    assert np.isclose(norm.stopped_muons_per_pot(stages), norm.STOPPED_MUONS_PER_POT)
+    # a missing event_count is zero events, not an error
+    zero = [MUBEAM_FILES[0][:2] + (None,)] + MUBEAM_FILES[1:]
+    list_files, fetch = _fake_sam({beam: zero})
+    assert norm.dataset_efficiency(beam, list_files, fetch).passed == 213816 - 53513
+
+
+def test_fullsim_stage_efficiency_errors_say_what_is_wrong():
+    from tools.analyses.fullsim import normalization as norm
+    beam, stops = norm.STOP_CHAIN_DATASETS
+    no_gencount = [(MUBEAM_FILES[0][0], 0, 5)]
+    def unreachable(_):
+        raise OSError("network down")
+    cases = [
+        (["MuBeamCat"], _fake_sam({}), "not a dataset name"),
+        (["sim.mu2e.MuBeamCat.MDC2025ab.art with availability x"], _fake_sam({}),
+         "not a dataset name"),
+        ([beam], _fake_sam({}), "no files"),
+        ([beam], _fake_sam({beam: no_gencount}), "no dh.gencount"),
+        ([beam], (unreachable, None), "network down"),
+        ([beam, "sim.mu2e.MuBeamCat.MDC2026a.art"], _fake_sam({beam: MUBEAM_FILES}),
+         "two datasets"),
+    ]
+    for datasets, (list_files, fetch), needle in cases:
+        try:
+            norm.sim_efficiencies(datasets, list_files, fetch)
+        except norm.NormalizationError as exc:
+            assert needle in str(exc), (needle, str(exc))
+        else:
+            raise AssertionError(f"{needle}: no error")
+    # one stage only cannot give stops per POT
+    stages = norm.sim_efficiencies([beam], *_fake_sam({beam: MUBEAM_FILES}))
+    try:
+        norm.stopped_muons_per_pot(stages)
+    except norm.NormalizationError as exc:
+        assert "MuminusStopsCat" in str(exc), exc
+    else:
+        raise AssertionError("a chain without MuminusStopsCat was accepted")
+
+
+def _ce_ancestry(config="MDC2025", stops="MDC2025ac", beam="MDC2025ab", seq="001430_00000000"):
+    """A SAM catalog shaped like the CE mix file's real ancestry: nts -> mcs
+    -> dig (many dts parents) -> dts -> MuminusStopsCat -> TargetStopsCat ->
+    TargetStops -> MuBeamCat. Returns (nts file name, catalog)."""
+    nts = f"nts.mu2e.CeMLeadingLogMix1BB.{config}au_best_v1_1-001.{seq}.root"
+    mcs = f"mcs.mu2e.CeMLeadingLogMix1BB.{config}au_best_v1_1.{seq}.art"
+    dig = f"dig.mu2e.CeMLeadingLogMix1BB.{config}au_best_v1_3.{seq}.art"
+    dts = [f"dts.mu2e.CeMLeadingLog.{config}ap.001430_{i:08d}.art" for i in range(3)]
+    mustops = f"sim.mu2e.MuminusStopsCat.{stops}.001430_00000000.art"
+    tscat = f"sim.mu2e.TargetStopsCat.{stops}.001430_00000000.art"
+    ts = [f"sim.mu2e.TargetStops.{stops}.001430_{i:08d}.art" for i in range(3)]
+    mubeam = f"sim.mu2e.MuBeamCat.{beam}.001430_00020001.art"
+    beam_parents = [f"sim.mu2e.Beam.{beam}.001430_{i:08d}.art" for i in range(3)]
+    def parents(*names):
+        return {"parents": [{"file_name": n} for n in names]}
+    catalog = {nts: parents(mcs), mcs: parents(dig), dig: parents(*dts),
+               **{d: parents(mustops) for d in dts},
+               mustops: parents(tscat), tscat: parents(*ts),
+               **{t: parents(mubeam) for t in ts},
+               mubeam: parents(*beam_parents)}
+    return nts, catalog
+
+
+def test_fullsim_stop_chain_is_traced_from_the_inputs_ancestry():
+    from tools.analyses.fullsim import normalization as norm
+    nts, catalog = _ce_ancestry()
+    fetched = []
+    def fetch(name):
+        fetched.append(name)
+        return catalog[name]
+    # the CE mix's chain is the one CreateSimEfficiency.sh names for MDC2025
+    assert norm.stop_chain_of(nts, fetch) == norm.STOP_CHAIN_DATASETS
+    # one file per parent dataset is followed, not every parent
+    assert len(fetched) == 7, fetched
+    # files of one dataset are traced once
+    other = nts.replace("00000000.root", "00000001.root")
+    catalog[other] = catalog[nts]
+    fetched.clear()
+    assert norm.stop_chain_of_inputs([nts, other], fetch) == norm.STOP_CHAIN_DATASETS
+    assert len(fetched) == 7, fetched
+    # a later iteration is traced to its own chain
+    nts26, catalog26 = _ce_ancestry("MDC2026", "MDC2026c", "MDC2026b")
+    assert norm.stop_chain_of(nts26, catalog26.__getitem__) == (
+        "sim.mu2e.MuBeamCat.MDC2026b.art", "sim.mu2e.MuminusStopsCat.MDC2026c.art")
+
+
+def test_fullsim_stop_chain_tracing_errors_say_what_is_wrong():
+    from tools.analyses.fullsim import normalization as norm
+    nts, catalog = _ce_ancestry()
+    nts26, catalog26 = _ce_ancestry("MDC2026", "MDC2026c", "MDC2026b")
+    both = {**catalog, **catalog26}
+    # a dts parent from a second stops dataset makes the stops ambiguous
+    ambiguous = dict(catalog)
+    dts0 = catalog[catalog[catalog[nts]["parents"][0]["file_name"]]["parents"][0]["file_name"]]
+    first_dts = dts0["parents"][0]["file_name"]
+    ambiguous[first_dts] = {"parents": [
+        {"file_name": "sim.mu2e.MuminusStopsCat.MDC2025ac.001430_00000000.art"},
+        {"file_name": "sim.mu2e.MuminusStopsCat.MDC2025zz.001430_00000000.art"}]}
+    orphan = {nts: {"parents": []}}
+    cases = [
+        ([nts, nts26], both.__getitem__, "different stop chains"),
+        ([nts], ambiguous.__getitem__, "more than one MuminusStopsCat"),
+        ([nts], orphan.__getitem__, "no MuminusStopsCat dataset"),
+        ([nts], {}.__getitem__, "cannot read the SAM metadata"),
+        (["my_ce_ntuple.root"], catalog.__getitem__, "not a SAM file name"),
+    ]
+    for names, fetch, needle in cases:
+        try:
+            norm.stop_chain_of_inputs(names, fetch)
+        except norm.NormalizationError as exc:
+            assert needle in str(exc), (needle, str(exc))
+        else:
+            raise AssertionError(f"{needle}: no error")
 
 
 def test_fullsim_generated_events_come_from_the_nearest_ancestor_with_gencount():
@@ -1298,9 +1449,12 @@ def test_fullsim_measures_the_efficiency_on_ce_mix(tmp_dir):
     if not CE_MIX_FILE.exists():
         print("     (skipped: CE mix file not on disk)")
         return
-    # the file's parent mcs file has dh.gencount 20000 in SAM; passed here so
-    # the test needs no network
-    generated = {"n_generated": 20000}
+    # the file's parent mcs file has dh.gencount 20000 in SAM, and the stop
+    # chain gives STOPPED_MUONS_PER_POT; both passed here so the test needs
+    # no network
+    from tools.analyses.fullsim import normalization as norm
+    generated = {"n_generated": 20000,
+                 "stopped_muons_per_pot": norm.STOPPED_MUONS_PER_POT}
     result = run_analysis(analysis="fullsim_sensitivity", data_file=str(CE_MIX_FILE),
                           output_dir=tmp_dir, parameters=generated)
     assert result.status == "success", result.message
@@ -1331,7 +1485,7 @@ def test_fullsim_measures_the_efficiency_on_ce_mix(tmp_dir):
                        output_dir=tmp_dir, parameters={**generated, "trigger_paths": "apr_Nope"})
     assert bad.status == "error" and "trig_apr_Nope" in bad.message
     few = run_analysis(analysis="fullsim_sensitivity", data_file=str(CE_MIX_FILE),
-                       output_dir=tmp_dir, parameters={"n_generated": 100})
+                       output_dir=tmp_dir, parameters={**generated, "n_generated": 100})
     assert few.status == "error" and "n_generated 100" in few.message
 
 

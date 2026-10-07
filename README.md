@@ -514,9 +514,16 @@ mixed with pileup: CeMLeadingLogMix1BB EventNtuple files, e.g.
    momentum, binned as `approx_ce_sensitivity`'s signal (0.2 MeV/c), is
    scaled as Production's `normalizations.py` has it: NPOT x
    `stopped_muons_per_pot` x 0.609 captures per stopped mu- x `rmue`
-   (default 1e-13) x efficiency. `stopped_muons_per_pot` defaults to
-   7.67e-4, MuBeamCat x MuminusStopsCat x 1000 from the Sim_best v1_1
-   (run 1430) SimEfficiencies2 table (`fullsim/normalization.py`). The
+   (default 1e-13) x efficiency. `stopped_muons_per_pot` is
+   MuBeamCat x MuminusStopsCat efficiency x 1000, computed by default from
+   the stop chain's SAM datasets (7.67e-4 for the MDC2025 chain) as
+   Production's `CreateSimEfficiency.sh` does with
+   `mu2eGenFilterEff`: events in each dataset over events generated
+   (`fullsim/normalization.py`). The chain is traced from the input files'
+   SAM ancestry (`stop_datasets` `auto`): the MuminusStopsCat dataset the
+   CE were generated from and the MuBeamCat dataset behind it. No SimEfficiencies2 table is needed, so a
+   new iteration of the simulation works before it is in the database;
+   pass a number to skip SAM. The
    efficiency is measured: CE counted over the events generated to make the
    input files, so it includes the digitization filter's acceptance. The
    generated count is each file's `dh.gencount` in SAM, from its nearest
@@ -677,7 +684,7 @@ goes to `mu2e`, art resolves it on `FHICL_FILE_PATH`, `fcl_exists` comes back
 python3 tests/test_tools.py
 ```
 
-104 tests, none of which start a mu2e job. (The `ana` env has no pytest, so
+108 tests, none of which start a mu2e job. (The `ana` env has no pytest, so
 these are bare asserts.)
 
 ## Run the server

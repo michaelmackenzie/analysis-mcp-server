@@ -15,7 +15,10 @@ files) instead of from EdepAna's truth-level tree:
 2. Signal: the reconstructed momentum of the CE events inside the time
    window, binned as approx_ce_sensitivity's signal, and scaled as
    Production's normalizations.py has it (normalization.py): NPOT x stopped
-   mu- per POT x captures per stopped mu- x R_mue x efficiency. The
+   mu- per POT x captures per stopped mu- x R_mue x efficiency. Stopped mu-
+   per POT is computed from the stop chain's datasets in SAM, as
+   CreateSimEfficiency.sh computes the stage efficiencies, the chain being
+   the one the input files descend from. The
    efficiency is measured: CE counted over the events generated to make the
    input files (their SAM dh.gencount, provenance.py), so it includes the
    acceptance of the digitization filter. No smearing is added, since
@@ -51,10 +54,15 @@ from .eventntuple import (DEFAULT_TRIGGERS, ORIGIN_NAMES, SID_TT_FRONT,
                           TREE_PATH, EventNtupleError, origin_codes,
                           parse_trigger_paths, read_eventntuple)
 from .normalization import (CAPTURES_PER_STOPPED_MUON, DIO_PER_STOPPED_MUON,
-                            STOPPED_MUONS_PER_POT)
+                            STOP_CHAIN, STOP_CHAIN_DATASETS,
+                            STOPPED_MUONS_PER_POT, NormalizationError,
+                            sim_efficiencies, stop_chain_of_inputs,
+                            stopped_muons_per_pot)
 from .provenance import ProvenanceError, generated_events
 
 SIGN = "minus"
+# stop_datasets' value for tracing the stop chain from the inputs.
+STOP_DATASETS_AUTO = "auto"
 # The origin label of a true CE- (eventntuple.ORIGIN_NAMES).
 CE_ORIGIN = 168
 
@@ -284,7 +292,7 @@ def run(context: RunContext) -> RunOutcome:
     npot = params["npot"]
     upstream_eff = params["upstream_eff"]
     cosmic_rate_per_s_per_mev = params["cosmic_rate_per_s_per_mev"]
-    stopped_muons_per_pot = params["stopped_muons_per_pot"]
+    stops_per_pot = params["stopped_muons_per_pot"]
     n_generated = int(params["n_generated"])
     rmue = params["rmue"]
     extra: dict = {}
@@ -305,6 +313,25 @@ def run(context: RunContext) -> RunOutcome:
                               for path in context.input_paths)
         extra["n_generated_from"] = ("parameter" if params["n_generated"] > 0
                                      else "SAM dh.gencount")
+        if stops_per_pot <= 0:
+            if params["stop_datasets"].strip().lower() == STOP_DATASETS_AUTO:
+                datasets = stop_chain_of_inputs(
+                    [path.name for path in context.input_paths])
+                extra["stop_chain_from"] = "SAM ancestry of the inputs"
+            else:
+                datasets = [d.strip() for d in params["stop_datasets"].split(",")
+                            if d.strip()]
+                extra["stop_chain_from"] = "stop_datasets"
+            stages = sim_efficiencies(datasets)
+            stops_per_pot = stopped_muons_per_pot(stages)
+            extra["sim_efficiencies"] = {
+                stage: {"dataset": e.dataset, "n_files": e.n_files,
+                        "passed": e.passed, "generated": e.generated,
+                        "efficiency": e.efficiency}
+                for stage, e in stages.items()}
+        extra["stopped_muons_per_pot_from"] = (
+            "parameter" if params["stopped_muons_per_pot"] > 0
+            else f"SAM, chain from {extra['stop_chain_from']}")
         if n_generated < ev["n_processed"]:
             raise FullsimError(
                 f"n_generated {n_generated} is fewer than the {ev['n_processed']} "
@@ -326,16 +353,25 @@ def run(context: RunContext) -> RunOutcome:
                                 n_generated, upstream_eff, npot,
                                 params["mean_pot_per_event"],
                                 cosmic_rate_per_s_per_mev,
-                                stopped_muons_per_pot, rmue)
+                                stops_per_pot, rmue)
         best, top = scan_signal_box(spectra["signal"], spectra["dio"],
                                     spectra["cosmic"])
     except (FullsimError, EventNtupleError, CutError, SensitivityError) as exc:
         return RunOutcome(error=str(exc), extra=extra)
+    except NormalizationError as exc:
+        return RunOutcome(error=(
+            f"{exc}. Stopped mu- per POT is computed from the stop chain's "
+            f"SAM datasets ({', '.join(STOP_CHAIN)}), traced from the inputs' "
+            "ancestry unless stop_datasets names them (e.g. "
+            f"'{', '.join(STOP_CHAIN_DATASETS)}'); without SAM, "
+            "pass stopped_muons_per_pot instead (MuBeamCat x MuminusStopsCat "
+            f"efficiency x 1000; {STOPPED_MUONS_PER_POT:.4g} for the MDC2025 chain)"
+        ), extra=extra)
     except ProvenanceError as exc:
         return RunOutcome(error=(
             f"{exc}. The efficiency counts against the events generated, which "
             "come from SAM; without SAM, pass n_generated: the sum of dh.gencount "
-            "over the input files' parent mcs files (samweb get-metadata)."
+            "over the input files' parent mcs files (samweb get-metadata)"
         ), extra=extra)
 
     in_window = counted & (ev["p"] >= best["low_mev"]) & (ev["p"] <= best["high_mev"])
@@ -366,7 +402,7 @@ def run(context: RunContext) -> RunOutcome:
         "npot": float(npot),
         "upstream_eff": float(upstream_eff),
         "cosmic_rate_per_s_per_mev": float(cosmic_rate_per_s_per_mev),
-        "stopped_muons_per_pot": float(stopped_muons_per_pot),
+        "stopped_muons_per_pot": float(stops_per_pot),
         "n_stopped_muons": float(spectra["stopped_muons"]),
         "rmue": float(rmue),
         "n_conversions": float(spectra["conversions"]),
@@ -394,8 +430,12 @@ def run(context: RunContext) -> RunOutcome:
         f"  trigger paths    any of {', '.join(triggers)}",
         f"  time window      {t_lo:g}-{t_hi:g} ns at the tracker front",
         f"  NPOT             {npot:g}",
-        f"  stopped mu-/POT  {stopped_muons_per_pot:.4g} -> "
-        f"{spectra['stopped_muons']:.4g} stopped mu-",
+        f"  stopped mu-/POT  {stops_per_pot:.4g} -> "
+        f"{spectra['stopped_muons']:.4g} stopped mu- "
+        f"({extra['stopped_muons_per_pot_from']})",
+        *(f"    {stage:<14s} {e['passed']} / {e['generated']} = "
+          f"{e['efficiency']:.6g} ({e['dataset']}, {e['n_files']} files)"
+          for stage, e in extra.get("sim_efficiencies", {}).items()),
         f"  R_mue            {rmue:.4g} -> {spectra['conversions']:.4g} CE "
         f"({CAPTURES_PER_STOPPED_MUON:g} captures, {DIO_PER_STOPPED_MUON:g} "
         "DIO per stopped mu-)",
@@ -501,15 +541,31 @@ SPEC = AnalysisSpec(
         ParamSpec(
             name="stopped_muons_per_pot",
             description="mu- stopped in the target per proton on target. "
-                        "Signal and DIO scale with npot times this. The "
-                        "default is from the Sim_best v1_1 (run 1430) "
-                        "SimEfficiencies2 table, the campaign of the "
-                        "MDC2025au_best_v1_1 CE mix: MuBeamCat x "
-                        "MuminusStopsCat x 1000, as Production's "
-                        "normalizations.py. For another campaign, print its "
-                        "table with dbTool and use "
-                        "fullsim.normalization.stopped_muons_per_pot.",
-            default=STOPPED_MUONS_PER_POT, minimum=0.0,
+                        "Signal and DIO scale with npot times this. 0 (the "
+                        "default) computes it in SAM, from the stop chain "
+                        "stop_datasets gives: "
+                        "MuBeamCat x MuminusStopsCat efficiency x 1000, as "
+                        "Production's normalizations.py, each efficiency "
+                        "being events in the dataset over events generated, "
+                        "as CreateSimEfficiency.sh (mu2eGenFilterEff) has "
+                        "it. Set a number to skip SAM: "
+                        f"{STOPPED_MUONS_PER_POT:.4g} for the MDC2025 chain.",
+            default=0.0, minimum=0.0,
+        ),
+        ParamSpec(
+            name="stop_datasets",
+            description="The stop chain stopped_muons_per_pot is computed "
+                        "from when it is 0. 'auto' (the default) traces it "
+                        "from the input files' SAM ancestry: the "
+                        "MuminusStopsCat dataset the CE were generated from, "
+                        "and the MuBeamCat dataset that came from, so a new "
+                        "iteration of the simulation needs no database "
+                        "table and no setting here. Or comma-separated SAM "
+                        f"datasets, one per stage ({', '.join(STOP_CHAIN)}), "
+                        f"e.g. '{', '.join(STOP_CHAIN_DATASETS)}' (the chain "
+                        "of the MDC2025au_best_v1_1 CE mix), for inputs "
+                        "whose ancestry is not in SAM.",
+            default=STOP_DATASETS_AUTO, kind="text",
         ),
         ParamSpec(
             name="rmue",
