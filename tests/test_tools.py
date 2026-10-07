@@ -20,7 +20,6 @@ from tools.analyses import approx_ce_sensitivity as sens
 from tools.analyses import edep as edep_mod
 from tools.analyses.edep import parse_edep_summary
 from tools.analyses.fullsim import cuts as fs_cuts
-from tools.analyses.fullsim import limits as fs_limits
 from tools.analyses.fullsim import sensitivity as fs_sens
 from tools.analyses.fullsim.eventntuple import TRIGGERS, origin_codes
 from tools.analyses.count import (CountsError, dataset_description,
@@ -1157,56 +1156,6 @@ def test_fullsim_window_scan_scores_windows_as_approx_ce_sensitivity_does():
     assert best is None
 
 
-def test_fullsim_exposure_uses_approx_ce_sensitivitys_capture_fraction():
-    assert fs_sens.EXPOSURE == fs_sens.STOPPED_MUONS * sens.MUON_CAPTURE_RATE
-    assert abs(fs_sens.EXPOSURE - 3.4e15) / 3.4e15 < 1e-3
-
-
-def test_fullsim_limits_match_pycount_sensitivity_analyzer():
-    """Reference values from RefAna/pyCount SensitivityAnalyzer (its FC is a
-    200,000-point grid from 0 to 20, so agreement is to its 1e-4 spacing)."""
-    for n, b, upper, expected in ((0, 0.0, 2.435912, 2.302582),
-                                  (1, 1.0, 3.357317, 2.823961),
-                                  (5, 4.6, 5.387027, 4.157231)):
-        low, high = fs_limits.fc_interval(n, b, 0.9)
-        assert low == 0.0 and abs(high - upper) < 2e-4, (b, high)
-        assert abs(fs_limits.expected_upper_limit(b, 0.9) - expected) < 1e-5
-    # n well above b excludes zero signal
-    low, high = fs_limits.fc_interval(10, 2.0, 0.9)
-    assert 3.0 < low < 8.0 < high
-    assert abs(fs_limits.fc_table_upper_limit(1.0) - 3.274) < 1e-9
-
-
-def test_fullsim_cls_limits_match_the_run1a_analysis():
-    """Reference values from Run-1A-Analysis/stats/profile2d.py
-    calculate_advanced_2d_cls_limit(b, b_sigma, s_sigma, n_obs), 90% CL."""
-    for b, b_sigma, eff_sigma, expected in (
-            (0, 0.0, 0.0, 2.302585092994076),    # exact Poisson CLs
-            (1, 0.0, 0.0, 3.271812060356269),
-            (16, 0.0, 0.0, 7.984760910395279),
-            (16, 5.2, 0.0, 11.171903500382857),  # profile likelihood, b only
-            (16, 5.2, 0.04, 11.195264672399928),  # b and efficiency
-            (1, 0.2, 0.0, 2.661058909292188),
-            (3, 0.6, 0.05, 3.9245812538954667)):
-        limit = fs_limits.cls_upper_limit(b, float(b), 0.9, b_sigma, eff_sigma)
-        assert abs(limit - expected) < 1e-6, (b, b_sigma, eff_sigma, limit)
-    # With b_sigma = 0 the background stays fixed. profile2d.py lets it float
-    # instead and gets 24.4 here.
-    fixed_b = fs_limits.cls_upper_limit(16, 16.0, 0.9, 0.0, 0.1)
-    assert 7.0 < fixed_b < 8.5, fixed_b
-    # No background, only an efficiency uncertainty. The asymptotic formula
-    # gives q = 2s at n = 0, so the limit is 1.645^2 / 2 = 1.35 (plus a little
-    # for the uncertainty), below the exact 2.30. That is the method, not a bug.
-    no_bkg = fs_limits.cls_upper_limit(0, 0.0, 0.9, 0.0, 0.04)
-    assert 1.3528 < no_bkg < 1.40, no_bkg
-    # an excess pushes the limit up
-    assert fs_limits.cls_upper_limit(10, 2.0, 0.9) > fs_limits.cls_upper_limit(2, 2.0, 0.9)
-    # discovery: Z sqrt(b + sigma_b^2), as stats/profile.py has it
-    assert fs_limits.required_signal(5, 16.0) == 20.0
-    assert abs(fs_limits.required_signal(5, 16.0, 3.0) - 25.0) < 1e-12
-    assert np.isnan(fs_limits.required_signal(5, 0.0))
-
-
 def test_fullsim_run_reports_a_file_that_is_not_an_eventntuple(tmp_dir):
     path = Path(tmp_dir) / "nts.owner.edep.test.root"
     _write_edep_tree(path, n=10)
@@ -1227,6 +1176,7 @@ def test_fullsim_run_reports_a_file_that_is_not_an_eventntuple(tmp_dir):
 MDS3C_FILES = [Path("/exp/mu2e/data/users/mu2epro/ensembles/MDS3/MDS3c/"
                     f"merged_files_1/nts.mu2e.ensembleMDS3cMix1BB.MDC2025-001.001430_0000000{i}.root")
                for i in (1, 3)]
+MDS3C_CE_FILE = MDS3C_FILES[0].parent / "nts.mu2e.CeMLeadingLogMix1BBSplit.best_v1_3.1.root"
 
 
 def test_fullsim_reproduces_pycount_on_mds3c(tmp_dir):
@@ -1246,16 +1196,22 @@ def test_fullsim_reproduces_pycount_on_mds3c(tmp_dir):
     assert (md["n_signal_window"], md["n_background_window"]) == (0, 1)
     assert md["background_window_by_origin"] == {"cosmic": 1}
     assert md["n_reco_segments_window"] == 1
-    assert abs(md["fc_upper_events"] - 3.357317) < 2e-4
-    # and the Run-1A limit on that background, exact and with systematics
-    assert abs(md["cls_upper_events"] - 3.271812060356269) < 1e-6
-    assert md["discovery_5sigma_events"] == 5.0
-    with_sys = run_analysis(analysis="fullsim_sensitivity",
-                            data_files=[str(p) for p in MDS3C_FILES],
-                            output_dir=tmp_dir,
-                            parameters={"signal_window": "103,104,500,1650",
-                                        "bkg_rel_uncertainty": 0.2})
-    assert abs(with_sys.metadata["cls_upper_events"] - 2.661058909292188) < 1e-6
+    # S = 0, so S/sqrt(B) is undefined, as approx_ce_sensitivity has it
+    assert np.isnan(md["sensitivity"])
+    assert (md["dio_background"], md["cosmic_background"], md["other_background"]) == (0, 1, 0)
+    if not MDS3C_CE_FILE.exists():
+        return
+    # With the CE split the scan optimizes: only windows with B > 0 count
+    optimized = run_analysis(analysis="fullsim_sensitivity",
+                             data_files=[str(MDS3C_CE_FILE), str(MDS3C_FILES[0])],
+                             output_dir=tmp_dir)
+    md = optimized.metadata
+    assert optimized.status == "success" and md["window_optimized"] == 1.0
+    assert md["n_events_counted"] == 162
+    assert (md["signal_mom_low_mevc"], md["signal_mom_high_mevc"],
+            md["signal_time_low_ns"]) == (103.5, 104.5, 500.0)
+    assert (md["n_signal_window"], md["n_background_window"]) == (49, 1)
+    assert md["sensitivity"] == 49.0 and md["cosmic_background"] == 1
 
 
 # --- the registry (loops over every analysis) --------------------------------

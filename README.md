@@ -65,8 +65,7 @@ tools/
     fullsim/                   full-simulation analyses of EventNtuple
       eventntuple.py           reading EventNtuple/ntuple; MC origin of a track
       cuts.py                  the CE-like track cuts (RefAna/pyCount)
-      limits.py                CLs (Run-1A) and FC (pyCount) limits, discovery
-      sensitivity.py           fullsim_sensitivity: the cut-and-count
+      sensitivity.py           fullsim_sensitivity: S/sqrt(B) in the best window
   analysis_tools.py   the MCP tools: list_analyses, run_analysis
   __init__.py         __all__ — ONLY these names become tools
 analysis_mcp_server/  generic drop-in wrapper (FastMCP): server.py, cli.py
@@ -106,7 +105,7 @@ workflow can chain several runs and collect `metadata` uniformly.
 | `muon_stop_rate` | `sim.*.TargetStops.*.art` | stopped muons per generated event and per POT, from the file's event count, generated-event count and output prescale |
 | `approx_ce_sensitivity` | `nts.*.root` from `edep` | `S/sqrt(B)` for the best momentum window, with the window and its signal/DIO/cosmic counts |
 | `stop_materials` | `nts.*.root` file(s) from the stop-finding job (e.g. MuBeam) | muon stops per material, and per generated event for the `n_gen_events` you supply |
-| `fullsim_sensitivity` | reconstructed EventNtuple `nts.*.root` file(s) from a mixed MC sample, e.g. an MDS ensemble | true signal and background in a momentum-time window after the CE-like cuts, Feldman-Cousins and expected upper limits, SES |
+| `fullsim_sensitivity` | reconstructed EventNtuple `nts.*.root` file(s) from a mixed MC sample, e.g. an MDS ensemble | `S/sqrt(B)` for the best momentum-time window after the CE-like cuts, with the window and its signal/DIO/cosmic/other counts |
 | `trigger_efficiency` | signal digi art file(s) | fraction of events passing any of the given trigger paths, and per path |
 | `trigger_rate` | pileup digi art file(s); default: mu2e-trig-config's CI sample | trigger rate in Hz averaged over the cycle (duty factor from `batch_mode`) and on spill, overall and per path |
 | `trigger_timing` | pileup digi art file(s); default: mu2e-trig-config's CI sample | trigger processing time per event: mean, median, tail; per path and per module |
@@ -486,12 +485,14 @@ Three deviations from the macro, all deliberate:
 
 ## fullsim_sensitivity
 
-A port of RefAna/pyCount's `process.py --sign minus` counting path
-(`run_count`), for reconstructed EventNtuple files (`EventNtuple/ntuple`)
-from a mixed MC sample with MC truth, such as the MDS ensembles in
-`/exp/mu2e/data/users/mu2epro/ensembles/`. Where `approx_ce_sensitivity`
-folds theory spectra with a parametrized detector, this counts fully
-simulated, reconstructed tracks:
+The full-simulation counterpart of `approx_ce_sensitivity`. It computes the
+same thing, `sensitivity` = S/sqrt(B) in the best signal window, with the
+window and the signal, DIO and cosmic counts in it. Where
+`approx_ce_sensitivity` folds theory spectra with a parametrized detector,
+this counts reconstructed tracks in a mixed MC sample with MC truth, such
+as the MDS ensembles in `/exp/mu2e/data/users/mu2epro/ensembles/`. The
+selection and window follow RefAna/pyCount's `process.py` counting path
+(`run_count`). `fullsim/README.md` says how to run it on MDS3.
 
 1. **Cuts**: pyCount's `Analyze.define_cuts`, track by track, in its order
    (`fullsim/cuts.py`). The default set is its current switch set. Add or
@@ -504,51 +505,19 @@ simulated, reconstructed tracks:
    process (CE, DIO, IPA DIO, RMC, RPC, cosmic, ...), so a conversion
    electron from an RMC photon counts as RMC. An event whose first track has
    more than one front segment is not counted, as in pyCount.
-3. **Signal window**: for `sign='minus'` it is optimized by default with
-   pyCount's scan. That is a 1 MeV/c momentum window starting at
-   103.0-105.5 MeV/c, with the time window starting at 500-700 ns and ending
-   at 1650 ns, keeping the best S/sqrt(B). Windows are scored as
-   `approx_ce_sensitivity` scores its windows: only a window with both
-   S > 0 and B > 0 counts, and a tie keeps the first scanned. For `plus` it
-   is fixed. Pass
+3. **Signal window**: for `sign='minus'` it is optimized by default over
+   pyCount's windows: a 1 MeV/c momentum window starting at 103.0-105.5
+   MeV/c, with the time window starting at 500-700 ns and ending at
+   1650 ns. Windows are scored as `approx_ce_sensitivity` scores its
+   windows: S/sqrt(B), only where S > 0 and B > 0, and a tie keeps the
+   first scanned. With no such window it falls back to 103.9-105.1 MeV/c x
+   640-1650 ns. For `plus` the window is 90-92 MeV/c x 640-1650 ns. Pass
    `signal_window='p_low,p_high,t_low,t_high'` to fix it yourself.
 4. **Count**: the true signal and the background (everything else) in the
-   window. The background count *is* the expected background, so `exposure`
-   must be the stopped muons the input sample is equivalent to.
-5. **Limits** (`fullsim/limits.py`), for n_obs = B. These are the Run-1A
-   analysis' methods (`Run-1A-Analysis/stats/profile2d.py`, `profile.py`),
-   which results are quoted with:
-   - `cls_upper_events`: the CLs upper limit. With `bkg_rel_uncertainty` and
-     `sig_eff_rel_uncertainty` both 0 (default) it is exact Poisson CLs.
-     Otherwise it is asymptotic profile-likelihood CLs, with Gaussian
-     constraints on the background and on the signal efficiency.
-   - `discovery_5sigma_events`: 5 sqrt(B + sigma_B^2). NaN when B = 0,
-     where the formula's 0 means nothing.
-
-   Kept from pyCount's `SensitivityAnalyzer` for comparison, with no
-   systematics:
-   - `fc_*`: the Feldman-Cousins interval.
-   - `expected_ul_*`: the expected classical upper limit.
-   - `fc_table_ul90_events`: the 90% CL value from `FC.csv`.
-
-   Each is also converted to a branching ratio over `exposure x sig_eff`,
-   where `exposure` is **captured** muons: 3.398e15 for Run-1A, the
-   5.58e15 stopped (`Run-1A-Analysis/Normalization.md`) times
-   `approx_ce_sensitivity`'s capture fraction, 0.609.
-
-   The CLs limit agrees with `profile2d.py` to 1e-6 or better on its test
-   cases, with one deliberate difference. When `sig_eff_rel_uncertainty`
-   is set but the background uncertainty is 0, the background stays fixed.
-   `profile2d.py` drops its constraint and lets it float, which gives 24.4
-   events instead of 7.6 for B = 16 and a 10% efficiency uncertainty.
-
-   Know this before quoting a limit with systematics. Any nonzero
-   uncertainty switches from the exact to the asymptotic calculation, and
-   at Mu2e's backgrounds of a few events the asymptotic one comes out
-   *lower*. For B = 0 the exact limit is 2.30 events, but with any
-   uncertainty it is about 1.35 (1.645^2 / 2). For B = 1 it is 3.27 exact
-   and 2.66 with 20% on the background. The asymptotic formulae do not
-   hold at these counts.
+   window, the background split into `dio_background` (DIO and IPA DIO),
+   `cosmic_background` and `other_background` (RMC, RPC, ...). The counts
+   are the sample's own; nothing is rescaled. `sensitivity` is NaN for a
+   given or fixed window without both signal and background.
 
 Outputs: `fullsim_sensitivity.log` and `cut_flow.csv`, and
 `window_events.csv` (run/subrun/event and origin of every event in the
@@ -561,28 +530,21 @@ one at a time, so a long `data_files` list is fine for memory. Raise
 
 Run with defaults on two MDS3c files (the CE split plus one ensemble file),
 it reproduces pyCount's cut flow at every step and the 162 counted events
-(92 CE). The optimized window differs, because pyCount takes a window with
-no background as the best: it picks [103.6, 104.6] MeV/c x [500, 1650] ns
-with 52 CE and 0 background, where this picks [103.5, 104.5] MeV/c x
-[500, 1650] ns with 49 CE and 1 cosmic. With a fixed `signal_window` the
-counts and the FC limit match pyCount's (pyCount does not compute the CLs
-one).
-`tests/test_tools.py` locks in the same comparison on two ensemble files.
+(92 CE). It picks [103.5, 104.5] MeV/c x [500, 1650] ns, with 49 CE and
+1 cosmic: S/sqrt(B) = 49. With a fixed `signal_window` the counts match
+pyCount's. `tests/test_tools.py` locks in both.
 
 Deviations from pyCount, all deliberate:
 
 - **Window figure of merit**: a window with no background does not count,
   as in `approx_ce_sensitivity`, where pyCount scores it as infinite and
   prefers it. So the optimized window always holds at least one background
-  event.
+  event: pyCount picks [103.6, 104.6] MeV/c with 52 CE and 0 background on
+  the two files above.
 - **Window fallback**: when no window in the scan holds both signal and
   background (an ensemble file with no CE in it), it falls back to the
-  fixed window 103.9-105.1 MeV/c x 640-1650 ns. pyCount keeps the first
-  window scanned, which is arbitrary. `window_optimized` says which
-  happened.
-- **FC computation**: the FC interval edges are found by bisection, not read
-  off a 200,000-point grid. The result is the same to the grid's 1e-4
-  spacing, in 0.05 s instead of ~80 s.
+  fixed window. pyCount keeps the first window scanned, which is
+  arbitrary. `window_optimized` says which happened.
 - **Origin labels**:
   - DIO from the leading-log generator (process code 170) counts as DIO.
   - An event whose sim chain has no known process is labelled "other".
@@ -714,7 +676,7 @@ goes to `mu2e`, art resolves it on `FHICL_FILE_PATH`, `fcl_exists` comes back
 python3 tests/test_tools.py
 ```
 
-103 tests, none of which start a mu2e job. (The `ana` env has no pytest, so
+100 tests, none of which start a mu2e job. (The `ana` env has no pytest, so
 these are bare asserts.)
 
 ## Run the server
