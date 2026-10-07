@@ -36,14 +36,15 @@ import numpy as np
 from ..selection import SelectionError
 from ..spectrum import Kernel, Spectrum
 from ..spec import AnalysisSpec, ParamSpec, RunContext, RunOutcome
-from .edep import (TREE_PATH, EdepTreeError, read_edep_tree, select_events,
-                   selection_help)
+from .edep import (TREE_PATH, EdepTreeError, generated_events, read_edep_tree,
+                   read_run_record, select_events, selection_help)
 
 # --- assumptions carried over from the macro ---------------------------------
 
 MUON_CAPTURE_RATE = 0.609         # N(muon captures) / N(muon stops) on aluminum
 NPOT = 1.0e18                     # protons on target assumed
-SIGNAL_BR = 1.0e-13 / MUON_CAPTURE_RATE # CE branching ratio for R_mue = 1e-13
+R_MUE = 1.0e-13                   # conversions per muon capture (the signal assumed)
+SIGNAL_BR = R_MUE * MUON_CAPTURE_RATE  # CEs per stopped muon: R_mue per capture x captures per stop
 MEAN_POT_PER_EVENT = 1.6e7        # 1BB
 ONSPILL_SECONDS_PER_EVENT = 1.695e-6
 COSMIC_RATE_PER_SECOND_PER_MEV = 10. / 7.8e5  # rough, per second per MeV/c, taken from Run 1A mu- --> e- analysis
@@ -276,9 +277,60 @@ def selected_hist(variables: dict[str, np.ndarray], mask: np.ndarray,
                                 weights=variables["weight"][keep], name=name)
 
 
+def signal_efficiency(variables: dict[str, np.ndarray], mask: np.ndarray,
+                      n_gen_events: float,
+                      stops_per_pot: float) -> tuple[float, float]:
+    """(sig_eff, CE acceptance) for a stopping rate: the acceptance is the
+    file's events passing the selection (`mask`, weighted) per generated CE
+    event, so the selection sets the signal's size as well as its shape."""
+    if variables["weight"].size == 0:
+        raise SensitivityError(
+            "the file holds no events, so there is no CE acceptance to work "
+            "out; run this on a CE (signal) sample"
+        )
+    if not n_gen_events > 0.0:
+        raise SensitivityError(
+            "the file records no generated events (ngen is 0), so the CE "
+            "acceptance behind stops_per_pot cannot be worked out; pass "
+            "sig_eff instead, or rerun 'edep' on files whose SubRuns carry a "
+            "GenEventCount"
+        )
+    selected = float(variables["weight"][mask].sum())
+    if not selected > 0.0:
+        raise SensitivityError(
+            "no event in the file passes the selection, so the CE acceptance "
+            "is 0; loosen the selection"
+        )
+    acceptance = selected / n_gen_events
+    if acceptance > 1.0:
+        raise SensitivityError(
+            f"the CE acceptance comes out at {acceptance:g} (events per "
+            "generated event) — above 1, so the file's generated-event count "
+            "(ngen) does not cover its events"
+        )
+    sig_eff = stops_per_pot * acceptance
+    if not 0.0 < sig_eff <= 1.0:
+        raise SensitivityError(
+            f"stops_per_pot {stops_per_pot:g} times the CE acceptance "
+            f"{acceptance:g} gives sig_eff {sig_eff:g}, outside (0, 1]"
+        )
+    return sig_eff, acceptance
+
+
 def run(context: RunContext) -> RunOutcome:
     """Compute the approximate CE sensitivity for one EdepAna ROOT file."""
     sig_eff = context.params["sig_eff"]
+    stops_per_pot = context.params["stops_per_pot"]
+    if np.isnan(sig_eff) or np.isnan(stops_per_pot):
+        return RunOutcome(error=(
+            f"sig_eff ({sig_eff:g}) and stops_per_pot ({stops_per_pot:g}) "
+            "must be numbers, not NaN"))
+    if (sig_eff > 0.0) == (stops_per_pot > 0.0):
+        return RunOutcome(error=(
+            "pass exactly one of sig_eff or stops_per_pot (> 0): sig_eff is "
+            "the signal efficiency itself, stops_per_pot works it out with "
+            "the file's own CE acceptance"))
+    ce_acceptance = n_gen_events = run_record = None
     npot = context.params["npot"]
     cosmic_rate_per_s_per_mev = context.params["cosmic_rate_per_s_per_mev"]
     mean_pot_per_event = context.params["mean_pot_per_event"]
@@ -289,6 +341,19 @@ def run(context: RunContext) -> RunOutcome:
     try:
         variables = read_edep_tree(context.input_path)
         mask = select_events(variables, selection)
+        if stops_per_pot > 0.0:
+            run_record = read_run_record(context.input_path)
+            if run_record is not None and run_record["max_events"] is not None:
+                raise SensitivityError(
+                    f"this file comes from an 'edep' run with max_events="
+                    f"{run_record['max_events']}, which cuts a subrun short "
+                    "while ngen keeps its whole generated-event count, so the "
+                    "CE acceptance behind stops_per_pot would come out low; "
+                    "rerun 'edep' without max_events, or pass sig_eff"
+                )
+            n_gen_events = generated_events(context.input_path)
+            sig_eff, ce_acceptance = signal_efficiency(variables, mask,
+                                                       n_gen_events, stops_per_pot)
         n_selected = int(mask.sum())
         signal = selected_hist(variables, mask, SIGNAL_VAR)
         response = selected_hist(variables, mask, RESPONSE_VAR)
@@ -362,9 +427,21 @@ def run(context: RunContext) -> RunOutcome:
         "approx_ce_sensitivity",
         f"  input            {context.input_path}",
         f"  selection        {selection or '(none)'}: {n_selected} of {mask.size} events",
-        f"  sig_eff          {sig_eff:g}",
+        f"  sig_eff          {sig_eff:g}" + (
+            "" if ce_acceptance is None else
+            f"  (stops/POT {stops_per_pot:g} x CE acceptance {ce_acceptance:g}"
+            f" = {variables['weight'][mask].sum():g} selected / "
+            f"{n_gen_events:g} generated)"),
+    ]
+    if ce_acceptance is not None and run_record is None:
+        lines.append(
+            "  WARNING          no edep run record next to the file, so this "
+            "cannot confirm it comes from one full 'edep' run (without "
+            "max_events, not merged); the CE acceptance is only as good as that")
+    lines += [
         f"  NPOT             {npot:g}",
-        f"  signal BR        {SIGNAL_BR:.4g}  (R_mue = 1e-9)",
+        f"  signal BR        {SIGNAL_BR:.4g} per stop  (R_mue = {R_MUE:g} per capture "
+        f"x {MUON_CAPTURE_RATE:g} captures per stop)",
         f"  cosmic rate      {cosmic_rate_per_s_per_mev:.4g} per s per MeV/c "
         f"-> {cosmic_rate:.4g} per MeV/c ({onspill_seconds:.4g} s on-spill)",
         f"  signal entries   {signal.entries:g}",
@@ -395,6 +472,11 @@ def run(context: RunContext) -> RunOutcome:
         log_path=log_path,
         extra={
             "sig_eff": sig_eff,
+            **({} if ce_acceptance is None else {
+                "stops_per_pot": stops_per_pot,
+                "ce_acceptance": ce_acceptance,
+                "n_gen_events": n_gen_events,
+                "edep_run_recorded": run_record is not None}),
             "selection": selection,
             "n_events_selected": n_selected,
             "signal_br": SIGNAL_BR,
@@ -444,8 +526,23 @@ SPEC = AnalysisSpec(
         ParamSpec(
             name="sig_eff",
             description="Signal (CE) reconstruction+selection efficiency, 0-1. "
-                        "Scales signal and both backgrounds.",
-            minimum=0.0, maximum=1.0,
+                        "Scales signal and both backgrounds. Pass this or "
+                        "stops_per_pot, not both; 0 means not given.",
+            default=0.0, minimum=0.0, maximum=1.0,
+        ),
+        ParamSpec(
+            name="stops_per_pot",
+            description="Stopped muons per POT, e.g. muon_stop_rate's "
+                        "stops_per_pot for the same configuration. Instead of "
+                        "sig_eff: sig_eff becomes stops_per_pot times the CE "
+                        "acceptance, the file's events passing `selection` "
+                        "per generated event (EdepAna's ngen), so the "
+                        "selection sets the signal's size too. The file must "
+                        "come from one full 'edep' run: one 'edep' recorded "
+                        "as run with max_events is refused, and a merged one "
+                        "is refused when ngen shows it (not every merge "
+                        "does). 0 means not given.",
+            default=0.0, minimum=0.0, maximum=1.0,
         ),
         ParamSpec(
             name="npot",
