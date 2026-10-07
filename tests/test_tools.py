@@ -468,8 +468,12 @@ def test_edep_selection_counts_weighted_events_per_gen_event():
     assert edep_mod.selected_metrics(v, "", 10.0)["n_events_selected"] == 3.0
 
 
-def _write_edep_tree(path: Path, n: int = 4000) -> None:
-    """A CE-like EdepAna tree: ~105 MeV electrons losing a little on the way."""
+def _write_edep_tree(path: Path, n: int = 4000, ngen_total: int | None = None) -> None:
+    """A CE-like EdepAna tree: ~105 MeV electrons losing a little on the way.
+
+    `ngen` is EdepAna's running generated-event count, raised at each subrun;
+    with `ngen_total` it climbs to that over the file, else it is n throughout.
+    """
     import awkward as ak
     import uproot
     rng = np.random.default_rng(1)
@@ -484,7 +488,9 @@ def _write_edep_tree(path: Path, n: int = 4000) -> None:
         "event_trk_edep": np.zeros(n, dtype=np.float32),
         "weight": np.ones(n, dtype=np.float32),
         "run": np.ones(n, dtype=np.int32), "subrun": np.ones(n, dtype=np.int32),
-        "event": np.arange(n, dtype=np.int32), "ngen": np.full(n, n, dtype=np.int64),
+        "event": np.arange(n, dtype=np.int32),
+        "ngen": (np.full(n, n, dtype=np.int64) if ngen_total is None else
+                 np.ceil(np.arange(1, n + 1) * ngen_total / n).astype(np.int64)),
         "primary_trk_front_p": one(front), "primary_trk_front_energy": one(front),
         "primary_start_e": one(e0), "primary_start_pdg": one(np.full(n, 11, np.int32)),
     }
@@ -525,6 +531,222 @@ def test_sensitivity_runs_on_the_tree_with_the_selection_it_is_given(tmp_dir):
                         output_dir=tmp_dir,
                         parameters={"sig_eff": 0.5, "selection": "calo > 10"})
     assert typo.status == "error" and "unknown variable" in typo.message
+
+
+# --- approx_ce_sensitivity: the efficiency from the stopping rate --------------
+
+def test_generated_events_is_each_files_last_running_count(tmp_dir):
+    a, b = Path(tmp_dir) / "a.root", Path(tmp_dir) / "b.root"
+    _write_edep_tree(a, n=400, ngen_total=1000)
+    _write_edep_tree(b, n=300, ngen_total=900)
+    assert edep_mod.generated_events(a) == 1000
+    assert edep_mod.generated_events([a, b]) == 1900
+
+
+def test_sensitivity_takes_exactly_one_of_sig_eff_and_stops_per_pot(tmp_dir):
+    path = Path(tmp_dir) / "nts.owner.edep.test.root"
+    _write_edep_tree(path)
+    for params in ({}, {"sig_eff": 0.1, "stops_per_pot": 1e-3}):
+        result = run_analysis(analysis="approx_ce_sensitivity",
+                              data_file=str(path), output_dir=tmp_dir,
+                              parameters=params)
+        assert result.status == "error", params
+        assert "one of sig_eff or stops_per_pot" in result.message, result.message
+    declared = list_analyses().metadata["analyses"]["approx_ce_sensitivity"]["parameters"]
+    assert not declared["sig_eff"]["required"]
+    assert not declared["stops_per_pot"]["required"]
+
+
+def test_stops_per_pot_is_sig_eff_times_the_files_ce_acceptance(tmp_dir):
+    path = Path(tmp_dir) / "nts.owner.edep.test.root"
+    _write_edep_tree(path, n=4000, ngen_total=8000)     # acceptance 0.5
+    by_stops = run_analysis(analysis="approx_ce_sensitivity", data_file=str(path),
+                            output_dir=str(Path(tmp_dir) / "stops"),
+                            parameters={"stops_per_pot": 2e-3, "selection": ""})
+    by_eff = run_analysis(analysis="approx_ce_sensitivity", data_file=str(path),
+                          output_dir=str(Path(tmp_dir) / "eff"),
+                          parameters={"sig_eff": 1e-3, "selection": ""})
+    assert by_stops.status == "success", by_stops.message
+    assert by_eff.status == "success", by_eff.message
+    meta = by_stops.metadata
+    assert meta["sensitivity"] == by_eff.metadata["sensitivity"]
+    assert (meta["sig_eff"], meta["ce_acceptance"], meta["n_gen_events"],
+            meta["stops_per_pot"]) == (1e-3, 0.5, 8000.0, 2e-3), meta
+
+
+def test_signal_efficiency_is_stops_per_pot_times_selected_per_generated():
+    variables = {"weight": np.ones(400)}
+    mask = np.arange(400) < 300
+    assert sens.signal_efficiency(variables, mask, 1000.0, 2e-3) == (2e-3 * 0.3, 0.3)
+
+
+def test_signal_efficiency_refuses_a_selection_no_event_passes():
+    try:
+        sens.signal_efficiency({"weight": np.ones(10)}, np.zeros(10, bool),
+                               100.0, 2e-3)
+    except sens.SensitivityError as exc:
+        assert "no event" in str(exc) and "selection" in str(exc), exc
+    else:
+        raise AssertionError("an acceptance of 0 was accepted")
+
+
+def test_signal_efficiency_refuses_an_acceptance_above_one():
+    try:
+        sens.signal_efficiency({"weight": np.ones(400)}, np.ones(400, bool),
+                               100.0, 2e-3)
+    except sens.SensitivityError as exc:
+        assert "acceptance" in str(exc) and "4" in str(exc), exc
+    else:
+        raise AssertionError("an acceptance of 4 was accepted")
+
+
+def test_signal_efficiency_refuses_an_empty_file_for_what_it_is():
+    try:
+        sens.signal_efficiency({"weight": np.ones(0)}, np.ones(0, bool),
+                               0.0, 2e-3)
+    except sens.SensitivityError as exc:
+        assert "no events" in str(exc), exc
+    else:
+        raise AssertionError("an empty file was accepted")
+
+
+def test_generated_events_refuses_a_merged_file(tmp_dir):
+    """ngen restarts with each job, so a falling count means several edep
+    outputs were merged into one file: their totals cannot be told apart."""
+    import uproot
+    path = Path(tmp_dir) / "merged.root"
+    with uproot.recreate(path) as f:
+        f.mktree("EDepAna/tree", {"ngen": np.int64}).extend(
+            {"ngen": np.array([1000, 2000, 2000, 500, 1500], dtype=np.int64)})
+    try:
+        edep_mod.generated_events(path)
+    except edep_mod.EdepTreeError as exc:
+        assert "merged" in str(exc), exc
+    else:
+        raise AssertionError("a merged file was accepted")
+
+
+def test_sensitivity_refuses_a_nan_efficiency_input(tmp_dir):
+    path = Path(tmp_dir) / "nts.owner.edep.test.root"
+    _write_edep_tree(path, n=100, ngen_total=200)
+    for params in ({"sig_eff": 0.1, "stops_per_pot": "nan"},
+                   {"sig_eff": "nan", "stops_per_pot": 2e-3}):
+        result = run_analysis(analysis="approx_ce_sensitivity", data_file=str(path),
+                              output_dir=tmp_dir, parameters=params)
+        assert result.status == "error", params
+        assert "nan" in result.message.lower(), result.message
+
+
+def test_stops_per_pot_needs_a_generated_count(tmp_dir):
+    path = Path(tmp_dir) / "nts.owner.edep.test.root"
+    _write_edep_tree(path, n=100, ngen_total=0)
+    result = run_analysis(analysis="approx_ce_sensitivity", data_file=str(path),
+                          output_dir=tmp_dir, parameters={"stops_per_pot": 2e-3})
+    assert result.status == "error"
+    assert "generated" in result.message, result.message
+
+
+def test_ce_acceptance_counts_only_events_passing_the_selection(tmp_dir):
+    """The selection sets the signal's size, not only its shape: a tighter
+    cut must lower the efficiency stops_per_pot works out."""
+    path = Path(tmp_dir) / "nts.owner.edep.test.root"
+    _write_edep_tree(path, n=4000, ngen_total=8000)
+    cut = "event_calo_edep_vis > 50"
+    passing = float((edep_mod.read_edep_tree(path)["event_calo_edep_vis"] > 50).sum())
+    acceptance = passing / 8000.0
+    assert 0.0 < acceptance < 0.45, acceptance       # the cut removes events
+    by_stops = run_analysis(analysis="approx_ce_sensitivity", data_file=str(path),
+                            output_dir=str(Path(tmp_dir) / "stops"),
+                            parameters={"stops_per_pot": 2e-3, "selection": cut})
+    by_eff = run_analysis(analysis="approx_ce_sensitivity", data_file=str(path),
+                          output_dir=str(Path(tmp_dir) / "eff"),
+                          parameters={"sig_eff": 2e-3 * acceptance, "selection": cut})
+    assert by_stops.status == "success", by_stops.message
+    assert by_eff.status == "success", by_eff.message
+    meta = by_stops.metadata
+    assert (meta["ce_acceptance"], meta["sig_eff"]) == (acceptance, 2e-3 * acceptance), meta
+    assert meta["sensitivity"] == by_eff.metadata["sensitivity"]
+
+
+def _fake_edep_job(tmp_dir):
+    """A stand-in for run_mu2e_job: writes an EdepAna tree where the job
+    would and reports the summary block, recording the max_events it got."""
+    from tools.mu2e_job import JobOutcome
+    calls = []
+
+    def fake(*, fcl, input_paths, outdir, single, timeout_s, max_events=None, **_):
+        calls.append(max_events)
+        outdir.mkdir(parents=True, exist_ok=True)
+        root = outdir / "nts.owner.edep.test.root"
+        _write_edep_tree(root, n=100)
+        return JobOutcome(command="mu2e", returncode=0, timed_out=False,
+                          stdout=SAMPLE_EDEP_STDOUT, stderr="",
+                          log_path=outdir / "mu2e.log", input_paths=input_paths,
+                          input_flag="-s", environment="test", file_list_path=None,
+                          written_root_files=[str(root)])
+    return fake, calls
+
+
+def test_edep_records_max_events_next_to_its_file(tmp_dir):
+    from tools.spec import RunContext
+    fake, calls = _fake_edep_job(tmp_dir)
+    real = edep_mod.run_mu2e_job
+    edep_mod.run_mu2e_job = fake
+    try:
+        for max_events in (100, None):
+            outdir = Path(tmp_dir) / f"run{max_events}"
+            outcome = edep_mod.run(RunContext(
+                input_paths=[Path(tmp_dir) / "in.art"], outdir=outdir,
+                params={"selection": ""}, timeout_s=60, max_events=max_events))
+            assert outcome.error is None, outcome.error
+            root = Path(outcome.files[0])
+            assert edep_mod.read_run_record(root) == {"max_events": max_events}
+            # the record rides next to the file; it is not an output to chain
+            assert outcome.files == [str(root)], outcome.files
+    finally:
+        edep_mod.run_mu2e_job = real
+    assert calls == [100, None], calls
+
+
+def test_stops_per_pot_refuses_a_file_from_a_max_events_run(tmp_dir):
+    path = Path(tmp_dir) / "nts.owner.edep.test.root"
+    _write_edep_tree(path, n=4000, ngen_total=8000)
+    edep_mod.write_run_record(path, max_events=100)
+    result = run_analysis(analysis="approx_ce_sensitivity", data_file=str(path),
+                          output_dir=tmp_dir, parameters={"stops_per_pot": 2e-3})
+    assert result.status == "error"
+    assert "max_events" in result.message, result.message
+
+
+def test_stops_per_pot_says_when_it_cannot_confirm_a_full_run(tmp_dir):
+    path = Path(tmp_dir) / "nts.owner.edep.test.root"
+    _write_edep_tree(path, n=4000, ngen_total=8000)
+    unrecorded = run_analysis(analysis="approx_ce_sensitivity", data_file=str(path),
+                              output_dir=str(Path(tmp_dir) / "a"),
+                              parameters={"stops_per_pot": 2e-3})
+    assert unrecorded.status == "success", unrecorded.message
+    assert unrecorded.metadata["edep_run_recorded"] is False
+    log = (Path(tmp_dir) / "a" / "approx_ce_sensitivity.log").read_text()
+    assert "cannot confirm" in log, log
+    edep_mod.write_run_record(path, max_events=None)
+    recorded = run_analysis(analysis="approx_ce_sensitivity", data_file=str(path),
+                            output_dir=str(Path(tmp_dir) / "b"),
+                            parameters={"stops_per_pot": 2e-3})
+    assert recorded.status == "success", recorded.message
+    assert recorded.metadata["edep_run_recorded"] is True
+    log = (Path(tmp_dir) / "b" / "approx_ce_sensitivity.log").read_text()
+    assert "cannot confirm" not in log, log
+
+
+def test_stops_per_pot_is_at_most_one(tmp_dir):
+    declared = list_analyses().metadata["analyses"]["approx_ce_sensitivity"]["parameters"]
+    assert declared["stops_per_pot"]["maximum"] == 1.0
+    path = Path(tmp_dir) / "nts.owner.edep.test.root"
+    _write_edep_tree(path, n=100, ngen_total=200)
+    result = run_analysis(analysis="approx_ce_sensitivity", data_file=str(path),
+                          output_dir=tmp_dir, parameters={"stops_per_pot": 1.5})
+    assert result.status == "error"
+    assert "above the maximum" in result.message, result.message
 
 
 # --- the trigger ---------------------------------------------------------------
@@ -1077,7 +1299,9 @@ def test_list_analyses_reports_every_registered_analysis():
     ce = catalogue["approx_ce_sensitivity"]
     assert ce["input_kind"] == "root_file"
     assert ce["produced_by"] == ["edep"]          # chaining is discoverable
-    assert ce["parameters"]["sig_eff"]["required"] is True
+    # one of the two, checked when it runs: 0 means not given
+    assert ce["parameters"]["sig_eff"]["required"] is False
+    assert ce["parameters"]["stops_per_pot"]["required"] is False
     assert ce["parameters"]["npot"]["required"] is False
     cosmic = ce["parameters"]["cosmic_rate_per_s_per_mev"]
     assert cosmic["required"] is False
@@ -1107,10 +1331,10 @@ def test_params_resolve_defaults_and_validate():
 
 
 def test_missing_required_parameter_is_reported(tmp_dir):
-    result = run_analysis(analysis="approx_ce_sensitivity",
+    result = run_analysis(analysis="trigger_efficiency_ntuple",
                           data_file="/nonexistent/x.root", output_dir=tmp_dir)
     assert result.status == "error"
-    assert "sig_eff" in result.message and "missing" in result.message
+    assert "trigger_paths" in result.message and "missing" in result.message
 
 
 def test_out_of_range_parameter_is_reported(tmp_dir):
