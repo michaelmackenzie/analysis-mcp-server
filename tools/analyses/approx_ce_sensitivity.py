@@ -43,7 +43,8 @@ from .edep import (TREE_PATH, EdepTreeError, read_edep_tree, select_events,
 
 MUON_CAPTURE_RATE = 0.609         # N(muon captures) / N(muon stops) on aluminum
 NPOT = 1.0e18                     # protons on target assumed
-SIGNAL_BR = 1.0e-13 / MUON_CAPTURE_RATE # CE branching ratio for R_mue = 1e-13
+R_MUE = 1.0e-13                   # conversions per muon capture (the signal assumed)
+SIGNAL_BR = R_MUE * MUON_CAPTURE_RATE  # CEs per stopped muon: R_mue per capture x captures per stop
 MEAN_POT_PER_EVENT = 1.6e7        # 1BB
 ONSPILL_SECONDS_PER_EVENT = 1.695e-6
 COSMIC_RATE_PER_SECOND_PER_MEV = 10. / 7.8e5  # rough, per second per MeV/c, taken from Run 1A mu- --> e- analysis
@@ -364,7 +365,8 @@ def run(context: RunContext) -> RunOutcome:
         f"  selection        {selection or '(none)'}: {n_selected} of {mask.size} events",
         f"  sig_eff          {sig_eff:g}",
         f"  NPOT             {npot:g}",
-        f"  signal BR        {SIGNAL_BR:.4g}  (R_mue = 1e-9)",
+        f"  signal BR        {SIGNAL_BR:.4g} per stop  (R_mue = {R_MUE:g} per capture "
+        f"x {MUON_CAPTURE_RATE:g} captures per stop)",
         f"  cosmic rate      {cosmic_rate_per_s_per_mev:.4g} per s per MeV/c "
         f"-> {cosmic_rate:.4g} per MeV/c ({onspill_seconds:.4g} s on-spill)",
         f"  signal entries   {signal.entries:g}",

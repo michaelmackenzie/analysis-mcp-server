@@ -501,6 +501,19 @@ def _write_edep_tree(path: Path, n: int = 4000) -> None:
         f.mktree("EDepAna/tree", types).extend(tree)
 
 
+def test_signal_is_r_mue_times_the_captures_per_stop(tmp_dir):
+    """R_mue is per muon capture, so the CEs per stopped muon are R_mue times
+    the fraction of stops that capture, not R_mue divided by it."""
+    path = Path(tmp_dir) / "nts.owner.edep.test.root"
+    _write_edep_tree(path)
+    result = run_analysis(analysis="approx_ce_sensitivity", data_file=str(path),
+                          output_dir=tmp_dir, parameters={"sig_eff": 1e-3})
+    assert result.status == "success", result.message
+    assert result.metadata["signal_br"] == 1.0e-13 * 0.609, result.metadata["signal_br"]
+    log = (Path(tmp_dir) / "approx_ce_sensitivity.log").read_text()
+    assert "R_mue = 1e-13" in log and "1e-9" not in log, log
+
+
 def test_sensitivity_runs_on_the_tree_with_the_selection_it_is_given(tmp_dir):
     path = Path(tmp_dir) / "nts.owner.edep.test.root"
     _write_edep_tree(path)
