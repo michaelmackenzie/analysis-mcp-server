@@ -145,6 +145,41 @@ def read_edep_tree(paths: list[Path] | Path) -> dict[str, np.ndarray]:
             for name in parts[0]}
 
 
+def generated_events(paths: list[Path] | Path) -> float:
+    """The generated events behind the EdepAna file(s).
+
+    `ngen` is EdepAna's running count, raised by each subrun's GenEventCount
+    as the job reaches it, so a file's total is its largest value; files from
+    separate jobs add up. A subrun after a file's last event is not in it, nor
+    is the rest of a subrun cut off by max_events: read it from a full run.
+    The count restarts with each job, so a file in which it falls holds
+    several jobs' output merged, and is refused.
+    """
+    import uproot
+
+    paths = [paths] if isinstance(paths, Path) else list(paths)
+    total = 0.0
+    for path in paths:
+        try:
+            with uproot.open(path) as rootfile:
+                ngen = rootfile[TREE_PATH]["ngen"].array(library="np")
+        except KeyError as exc:
+            raise EdepTreeError(
+                f"{path}: no {TREE_PATH} with an ngen branch ({exc}) — is "
+                "this an nts.*.root from EdepAna in Offline v13_39_00 or later? "
+                "Rerun the 'edep' analysis to make one."
+            ) from None
+        if ngen.size > 1 and (np.diff(ngen) < 0).any():
+            raise EdepTreeError(
+                f"{path}: EdepAna's running generated-event count (ngen) "
+                "falls, so this file holds several edep outputs merged (e.g. "
+                "by hadd) and their generated events cannot be added up; run "
+                "'edep' once over all the art files instead"
+            )
+        total += float(ngen.max()) if ngen.size else 0.0
+    return total
+
+
 def select_events(variables: dict[str, np.ndarray], selection: str) -> np.ndarray:
     """The mask of events passing `selection`, a cut over EDEP_VARIABLES."""
     nevents = variables["event_calo_edep_vis"].size

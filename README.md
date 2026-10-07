@@ -278,7 +278,8 @@ built on — `npot` and `cosmic_rate_per_s_per_mev` — so a number never travel
 without its normalization. The summary line carries them too. Its `metadata`
 also records the rest of the assumptions (`sig_eff`, `signal_br`, the
 `cosmic_rate_per_mev` the cosmic rate works out to over the live time, and
-`onspill_seconds`), and it writes the macro's figures — `sig_vs_bkg.png`,
+`onspill_seconds`; with `stops_per_pot`, also `stops_per_pot`,
+`ce_acceptance` and `n_gen_events`), and it writes the macro's figures — `sig_vs_bkg.png`,
 `dio.png`, `response.png`, `res.png`, `ce_z.png`, `ce_r.png` — into
 `<output_dir>/figures`.
 
@@ -444,6 +445,12 @@ momentum window:
    the binning of EdepAna's `trk_front_energy` histogram, rebinned x2 and
    scaled to a rate for `npot` protons at `SIGNAL_BR` (R_mue = 1e-9) and
    `sig_eff`, then smeared by a Gaussian tracker resolution (sigma = 0.2 MeV).
+   Pass `stops_per_pot` instead of `sig_eff` to have it worked out:
+   `sig_eff = stops_per_pot * acceptance`, the acceptance being the file's
+   own events (weighted) per generated CE event, from EdepAna's running
+   `ngen`. Pass exactly one of the two. The file must come from one full
+   `edep` run: one cut short by `max_events` undercounts the acceptance, and
+   a merged (hadd'ed) one is refused.
 2. **DIO** — the Heeck/Szafron theoretical spectrum, scaled to a rate, then
    smeared by the *measured* energy-loss response
    of the same events (`primary_trk_front_energy_diff`) and the same
@@ -597,7 +604,7 @@ goes to `mu2e`, art resolves it on `FHICL_FILE_PATH`, `fcl_exists` comes back
 python3 tests/test_tools.py
 ```
 
-91 tests, none of which start a mu2e job. (The `ana` env has no pytest, so
+100 tests, none of which start a mu2e job. (The `ana` env has no pytest, so
 these are bare asserts.)
 
 ## Run the server
