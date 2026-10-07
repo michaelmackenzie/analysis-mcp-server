@@ -12,6 +12,7 @@ This module also owns the reading of that tree — `read_edep_tree` and
 same way, with the same variable names.
 """
 
+import json
 import re
 from pathlib import Path
 
@@ -151,9 +152,12 @@ def generated_events(paths: list[Path] | Path) -> float:
     `ngen` is EdepAna's running count, raised by each subrun's GenEventCount
     as the job reaches it, so a file's total is its largest value; files from
     separate jobs add up. A subrun after a file's last event is not in it, nor
-    is the rest of a subrun cut off by max_events: read it from a full run.
+    is the rest of a subrun cut off by max_events: read it from a full run
+    (read_run_record says whether 'edep' made the file with max_events).
     The count restarts with each job, so a file in which it falls holds
-    several jobs' output merged, and is refused.
+    several jobs' output merged, and is refused. Not every merge shows this
+    way: one whose later part starts at or above the earlier part's total
+    keeps the count rising and is not caught, so do not merge edep outputs.
     """
     import uproot
 
@@ -174,10 +178,47 @@ def generated_events(paths: list[Path] | Path) -> float:
                 f"{path}: EdepAna's running generated-event count (ngen) "
                 "falls, so this file holds several edep outputs merged (e.g. "
                 "by hadd) and their generated events cannot be added up; run "
-                "'edep' once over all the art files instead"
+                "'edep' once over all the art files instead (and do not merge "
+                "its outputs: not every merge can be caught this way)"
             )
         total += float(ngen.max()) if ngen.size else 0.0
     return total
+
+
+RUN_RECORD_SUFFIX = ".edep.json"
+
+
+def run_record_path(path: Path) -> Path:
+    """Where the 'edep' analysis records how it made the EdepAna file `path`."""
+    path = Path(path)
+    return path.with_name(path.name + RUN_RECORD_SUFFIX)
+
+
+def write_run_record(path: Path, max_events: int | None) -> Path:
+    """Record, next to an EdepAna file 'edep' wrote, the max_events its job
+    ran with (None for a full run). ngen keeps a cut-short subrun's whole
+    GenEventCount, so a file from a max_events run undercounts its events
+    per generated event, and that cannot be seen from the file itself."""
+    record = run_record_path(path)
+    record.write_text(json.dumps({"max_events": max_events}) + "\n",
+                      encoding="utf-8")
+    return record
+
+
+def read_run_record(path: Path) -> dict | None:
+    """The record 'edep' wrote next to `path`, or None for a file it did not
+    make (e.g. one from a production job)."""
+    record = run_record_path(path)
+    if not record.exists():
+        return None
+    try:
+        data = json.loads(record.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise EdepTreeError(f"{record}: unreadable edep run record ({exc})") from None
+    if not isinstance(data, dict) or "max_events" not in data:
+        raise EdepTreeError(f"{record}: an edep run record holds max_events, "
+                            f"got {data!r}")
+    return data
 
 
 def select_events(variables: dict[str, np.ndarray], selection: str) -> np.ndarray:
@@ -315,6 +356,10 @@ def run(context: RunContext) -> RunOutcome:
         return RunOutcome(log_path=outcome.log_path, extra=extra,
                           error="mu2e wrote no ROOT file, so there is no "
                                 f"{TREE_PATH} to apply the selection to")
+    # Beside each file, not in `files`: a chained analysis takes the ROOT
+    # file alone, and finds the record next to it.
+    for ntuple in ntuples:
+        write_run_record(ntuple, context.max_events)
     try:
         metrics.update(selected_metrics(read_edep_tree(ntuples), selection,
                                         metrics["n_gen_events"]))

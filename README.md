@@ -179,7 +179,9 @@ the others take a single `data_file`.
 Beware: generated-event counts come from the input's subrun bookkeeping and
 cover the whole file regardless, so **any "per gen event" metric is
 meaningless when `max_events` is set** — use it to confirm a job runs, not for
-physics numbers.
+physics numbers. `edep` records the `max_events` it ran with next to each file
+it writes (`<file>.edep.json`, not listed in `files`), and
+`approx_ce_sensitivity` refuses such a file when given `stops_per_pot`.
 
 ### Results
 
@@ -279,7 +281,7 @@ without its normalization. The summary line carries them too. Its `metadata`
 also records the rest of the assumptions (`sig_eff`, `signal_br`, the
 `cosmic_rate_per_mev` the cosmic rate works out to over the live time, and
 `onspill_seconds`; with `stops_per_pot`, also `stops_per_pot`,
-`ce_acceptance` and `n_gen_events`), and it writes the macro's figures — `sig_vs_bkg.png`,
+`ce_acceptance`, `n_gen_events` and `edep_run_recorded`), and it writes the macro's figures — `sig_vs_bkg.png`,
 `dio.png`, `response.png`, `res.png`, `ce_z.png`, `ce_r.png` — into
 `<output_dir>/figures`.
 
@@ -447,10 +449,14 @@ momentum window:
    `sig_eff`, then smeared by a Gaussian tracker resolution (sigma = 0.2 MeV).
    Pass `stops_per_pot` instead of `sig_eff` to have it worked out:
    `sig_eff = stops_per_pot * acceptance`, the acceptance being the file's
-   own events (weighted) per generated CE event, from EdepAna's running
-   `ngen`. Pass exactly one of the two. The file must come from one full
-   `edep` run: one cut short by `max_events` undercounts the acceptance, and
-   a merged (hadd'ed) one is refused.
+   events passing `selection` (weighted) per generated CE event, from
+   EdepAna's running `ngen` — so the selection sets the signal's size as well
+   as its shape. Pass exactly one of the two. The file must come from one
+   full `edep` run: one cut short by `max_events` undercounts the acceptance
+   and is refused when `edep`'s record says so (a file without the record,
+   e.g. from a production job, runs with a warning in the log), and a merged
+   (hadd'ed) one is refused when `ngen` falls — not every merge shows that
+   way, so do not merge `edep` outputs.
 2. **DIO** — the Heeck/Szafron theoretical spectrum, scaled to a rate, then
    smeared by the *measured* energy-loss response
    of the same events (`primary_trk_front_energy_diff`) and the same
@@ -604,7 +610,7 @@ goes to `mu2e`, art resolves it on `FHICL_FILE_PATH`, `fcl_exists` comes back
 python3 tests/test_tools.py
 ```
 
-100 tests, none of which start a mu2e job. (The `ana` env has no pytest, so
+106 tests, none of which start a mu2e job. (The `ana` env has no pytest, so
 these are bare asserts.)
 
 ## Run the server
