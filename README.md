@@ -445,7 +445,8 @@ momentum window:
    tracker) for the events passing `selection` (default: >10 MeV visible in
    the calorimeter, the macro's `hist_2` cut), filled from `EDepAna/tree` with
    the binning of EdepAna's `trk_front_energy` histogram, rebinned x2 and
-   scaled to a rate for `npot` protons at `SIGNAL_BR` (R_mue = 1e-9) and
+   scaled to a rate for `npot` protons at `SIGNAL_BR` (R_mue = 1e-13 per
+   capture times 0.609 captures per stop on aluminum) and
    `sig_eff`, then smeared by a Gaussian tracker resolution (sigma = 0.2 MeV).
    Pass `stops_per_pot` instead of `sig_eff` to have it worked out:
    `sig_eff = stops_per_pot * acceptance`, the acceptance being the file's
@@ -610,7 +611,7 @@ goes to `mu2e`, art resolves it on `FHICL_FILE_PATH`, `fcl_exists` comes back
 python3 tests/test_tools.py
 ```
 
-106 tests, none of which start a mu2e job. (The `ana` env has no pytest, so
+107 tests, none of which start a mu2e job. (The `ana` env has no pytest, so
 these are bare asserts.)
 
 ## Run the server
