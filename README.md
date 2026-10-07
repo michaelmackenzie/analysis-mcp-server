@@ -62,6 +62,10 @@ tools/
     trigger_timing.py          trigger processing time per event on pileup
     trigger_efficiency_ntuple.py  trigger efficiency from EventNtuple
                                trig_<path> branches, for a track selection
+    fullsim/                   full-simulation analyses of EventNtuple
+      eventntuple.py           reading EventNtuple/ntuple; MC origin of a track
+      cuts.py                  the CE-like track cuts (pyfitter cut-set 80)
+      sensitivity.py           fullsim_sensitivity: S/sqrt(B) in the best window
   analysis_tools.py   the MCP tools: list_analyses, run_analysis
   __init__.py         __all__ — ONLY these names become tools
 analysis_mcp_server/  generic drop-in wrapper (FastMCP): server.py, cli.py
@@ -101,6 +105,7 @@ workflow can chain several runs and collect `metadata` uniformly.
 | `muon_stop_rate` | `sim.*.TargetStops.*.art` | stopped muons per generated event and per POT, from the file's event count, generated-event count and output prescale |
 | `approx_ce_sensitivity` | `nts.*.root` from `edep` | `S/sqrt(B)` for the best momentum window, with the window and its signal/DIO/cosmic counts |
 | `stop_materials` | `nts.*.root` file(s) from the stop-finding job (e.g. MuBeam) | muon stops per material, and per generated event for the `n_gen_events` you supply |
+| `fullsim_sensitivity` | reconstructed CE-mixed-with-pileup EventNtuple `nts.*.root` file(s), e.g. CeMLeadingLogMix1BB | `S/sqrt(B)` for the best momentum window, as `approx_ce_sensitivity`, with the signal efficiency and detector response measured after the CE-like cuts |
 | `trigger_efficiency` | signal digi art file(s) | fraction of events passing any of the given trigger paths, and per path |
 | `trigger_rate` | pileup digi art file(s); default: mu2e-trig-config's CI sample | trigger rate in Hz averaged over the cycle (duty factor from `batch_mode`) and on spill, overall and per path |
 | `trigger_timing` | pileup digi art file(s); default: mu2e-trig-config's CI sample | trigger processing time per event: mean, median, tail; per path and per module |
@@ -492,6 +497,88 @@ Three deviations from the macro, all deliberate:
   Run-1B CE sample that moves `dio_background` by ~2% and `sensitivity` by
   0.01%.
 
+## fullsim_sensitivity
+
+The full-simulation counterpart of `approx_ce_sensitivity`, built the same
+way: `sensitivity` = S/sqrt(B) in the best momentum window, with a DIO and
+a cosmic background. Where `approx_ce_sensitivity` takes the signal shape
+and energy loss from EdepAna's truth-level tree and assumes an efficiency
+and a Gaussian resolution, this measures all of them from reconstructed CE
+mixed with pileup: CeMLeadingLogMix1BB EventNtuple files, e.g.
+`/pnfs/mu2e/tape/phy-nts/nts/mu2e/CeMLeadingLogMix1BB/MDC2025au_best_v1_1-001/`.
+`fullsim/README.md` says how to run it.
+
+1. **Cuts**: pyfitter's cut-set 80 (`80_1d`), track by track, as its
+   `Analyze.define_cuts` applies them and in its order (`fullsim/cuts.py`).
+   On by default: every cut pyfitter switches on except its fit ranges
+   (`in_mom_range`, `within_t0`), which the momentum scan and `time_window`
+   stand in for. Add or drop cuts by name with `enable_cuts` /
+   `disable_cuts`, and move the `trkqual_min` / `trkpid_min` thresholds
+   (default 0.155 and 0.54). `or_trigger` passes an event that any of
+   `trigger_paths` accepted, by default the production tracker paths
+   `apr_TrkDe_80m70p` or `cpr_TrkDe_80m70p`, as in pyfitter. With every cut
+   on, the cut flow on a CE mix file matches pyfitter's cut for cut. The cut
+   flow goes to `cut_flow.csv` and to `metadata.cut_flow`.
+2. **Signal**: each event with a selected track is represented by its
+   first selected track: momentum and time at the tracker front, MC origin,
+   and true momentum at birth. An event whose first track has more than one
+   front segment is not counted, as in pyCount. The signal is the true CE
+   among these with a time inside `time_window` (default 640-1650 ns, open),
+   so a pileup track passing the cuts is not signal. Their reconstructed
+   momentum, binned as `approx_ce_sensitivity`'s signal (0.2 MeV/c), is
+   scaled as Production's `normalizations.py` has it: NPOT x
+   `stopped_muons_per_pot` x 0.609 captures per stopped mu- x `rmue`
+   (default 1e-13) x efficiency. `stopped_muons_per_pot` is
+   MuBeamCat x MuminusStopsCat efficiency x 1000, computed by default from
+   the stop chain's SAM datasets (7.67e-4 for the MDC2025 chain) as
+   Production's `CreateSimEfficiency.sh` does with
+   `mu2eGenFilterEff`: events in each dataset over events generated
+   (`fullsim/normalization.py`). The chain is traced from the input files'
+   SAM ancestry (`stop_datasets` `auto`): the MuminusStopsCat dataset the
+   CE were generated from and the MuBeamCat dataset behind it. No SimEfficiencies2 table is needed, so a
+   new iteration of the simulation works before it is in the database;
+   pass a number to skip SAM. The
+   efficiency is measured: CE counted over the events generated to make the
+   input files, so it includes the digitization filter's acceptance. The
+   generated count is each file's `dh.gencount` in SAM, from its nearest
+   ancestor that has one (the parent mcs file; `fullsim/provenance.py`),
+   or the `n_generated` parameter where SAM cannot be reached.
+   `upstream_eff` (default 1) multiplies in any further loss.
+   No resolution is added; the reconstruction already has it.
+3. **DIO**: `approx_ce_sensitivity`'s Heeck/Szafron spectrum, as a count per
+   0.01 MeV bin for NPOT x `stopped_muons_per_pot` x 0.391 DIO per stopped
+   mu-, folded with the measured response of the signal
+   events (reconstructed momentum at the tracker front minus true momentum
+   at birth: energy loss and resolution together). The response integrates
+   to the measured efficiency, so DIO electrons pass the selection as CE do.
+4. **Cosmics**: flat in momentum at `cosmic_rate_per_s_per_mev` over the
+   on-spill time NPOT implies, exactly as in `approx_ce_sensitivity`, whose
+   defaults (`npot`, `mean_pot_per_event`, the rate) it shares.
+5. **Window**: `approx_ce_sensitivity`'s `scan_signal_box` over momentum. The
+   time window is fixed.
+
+The metrics carry `approx_ce_sensitivity`'s meanings: `signal_rate`,
+`dio_background`, `cosmic_background`, `total_background` in the window,
+and `npot`, `stopped_muons_per_pot`, `n_stopped_muons`, `rmue`,
+`n_conversions` and `cosmic_rate_per_s_per_mev` behind them. Also
+`signal_efficiency` (overall) and `signal_efficiency_window`,
+`n_signal_window` (reconstructed CE in the window), and the event counts.
+Outputs: `fullsim_sensitivity.log` (with the top windows scanned),
+`cut_flow.csv`, and `figures/`: signal vs background, the measured
+response, and momentum vs time.
+
+On `nts.mu2e.CeMLeadingLogMix1BB.MDC2025au_best_v1_1-001.001430_00000000.root`
+(20000 generated, 8212 reaching the ntuple: acceptance 0.41; about 6 s),
+3010 CE pass the cuts and the time window: efficiency 0.15. For 1e18 POT
+(7.67e14 stopped mu-, 46.7 conversions at R_mue = 1e-13) the best window is
+[103.5, 104.7] MeV/c with S = 4.69, cosmics 1.90 and DIO 0.0009: with
+stopped muons per POT in, the DIO is negligible and the cosmics set the
+window. `tests/test_tools.py` locks this in.
+
+Unlike `approx_ce_sensitivity`, whose normalization is its macro's (signal
+NPOT x BR and DIO NPOT x (1 - capture fraction), with no stopped muons per
+POT), the signal and DIO here are counts for the stopped muons NPOT gives.
+
 ## Adding an analysis
 
 1. Write `tools/analyses/<name>.py` with a `run(context) -> RunOutcome` and a
@@ -611,7 +698,7 @@ goes to `mu2e`, art resolves it on `FHICL_FILE_PATH`, `fcl_exists` comes back
 python3 tests/test_tools.py
 ```
 
-107 tests, none of which start a mu2e job. (The `ana` env has no pytest, so
+124 tests, none of which start a mu2e job. (The `ana` env has no pytest, so
 these are bare asserts.)
 
 ## Run the server

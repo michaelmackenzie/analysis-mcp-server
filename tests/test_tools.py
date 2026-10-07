@@ -19,6 +19,10 @@ from tools import ANALYSES, list_analyses, run_analysis
 from tools.analyses import approx_ce_sensitivity as sens
 from tools.analyses import edep as edep_mod
 from tools.analyses.edep import parse_edep_summary
+from tools.analyses.fullsim import cuts as fs_cuts
+from tools.analyses.fullsim import sensitivity as fs_sens
+from tools.analyses.fullsim.eventntuple import (DEFAULT_TRIGGERS, TRIGGER_PREFIX,
+                                                origin_codes)
 from tools.analyses.count import (CountsError, dataset_description,
                                   dataset_hint, parse_counts,
                                   parse_prescale_filters, saved_rates,
@@ -1213,11 +1217,518 @@ def test_stop_materials_names_the_file_in_a_list_that_lacks_the_histogram(tmp_di
     assert str(bad) in result.message and str(STOPMAT_FILE) not in result.message
 
 
+# --- fullsim_sensitivity -----------------------------------------------------
+
+def _seg(sid, time=900.0, p=(0.0, 85.0, 60.0), t0err=0.5, maxr=500.0, d0=50.0,
+         tandip=0.7):
+    """One track segment and its loop-helix parameters. The default momentum
+    is CE-like: |p| = 104 MeV/c, p_z/p_T = 0.71."""
+    return ({"sid": sid, "time": time,
+             "mom": {"fCoordinates": {"fX": p[0], "fY": p[1], "fZ": p[2]}}},
+            {"t0err": t0err, "maxr": maxr, "d0": d0, "tanDip": tandip})
+
+
+def _track(pdg=11, nactive=30, qual=0.9, pid=0.9, status=1, goodfit=1, segs=None,
+           sims=((168, 0, 10.0),)):
+    """A track passing every default cut unless told otherwise: segments at
+    the tracker front and middle, an ST boundary and the ST foils. `sims` are
+    (startCode, gen, rho) for the track's particle, then its ancestors."""
+    if segs is None:
+        segs = [_seg(0), _seg(1), _seg(100), _seg(104)]
+    return {"pdg": pdg, "nactive": nactive, "qual": qual, "pid": pid,
+            "status": status, "goodfit": goodfit, "segs": segs,
+            "sims": [{"startCode": code, "gen": gen,
+                      "pos": {"fCoordinates": {"fX": rho, "fY": 0.0}},
+                      "mom": {"fCoordinates": {"fX": 0.0, "fY": 84.0, "fZ": 63.0}}}
+                     for code, gen, rho in sims]}
+
+
+def _eventntuple(events):
+    """EventNtuple groups, as read_eventntuple returns them, from events of
+    {"tracks": [...], "crv": [(time, PEs, nHits, start, end)], "trig": 0/1,
+    "calo": [cluster energies]}. "trig" sets every default trigger path; a
+    dict {path: 0/1} sets each. "calo" defaults to one 50 MeV cluster.
+    Every event carries a far-off coincidence so the CRV arrays have a type."""
+    import awkward as ak
+    far = (-5000.0, 1.0, 1, -5000.0, -4990.0)
+    crv = [ev.get("crv", []) + [far] for ev in events]
+    tracks = [ev["tracks"] for ev in events]
+    return {
+        "evt": ak.Array([{"run": 1, "subrun": 0, "event": i,
+                          **{TRIGGER_PREFIX + name: trig.get(name, 0)
+                             if isinstance(trig := ev.get("trig", 1), dict) else trig
+                             for name in DEFAULT_TRIGGERS}}
+                         for i, ev in enumerate(events)]),
+        "crv": ak.Array([{f"crvcoincs.{field}": [c[k] for c in coincs]
+                          for k, field in enumerate(("time", "PEs", "nHits",
+                                                     "timeStart", "timeEnd"))}
+                         for coincs in crv]),
+        "calo": ak.Array([{"caloclusters.energyDep_": [float(e) for e in
+                                                       ev.get("calo", [50.0])]}
+                          for ev in events]),
+        "trk": ak.Array([{"trk.pdg": [t["pdg"] for t in trks],
+                          "trk.nactive": [t["nactive"] for t in trks],
+                          "trk.status": [t["status"] for t in trks],
+                          "trk.goodfit": [t["goodfit"] for t in trks],
+                          "trkqual.result": [t["qual"] for t in trks],
+                          "trkpid.result": [t["pid"] for t in trks]}
+                         for trks in tracks]),
+        "trkfit": ak.Array([{"trksegs": [[s for s, _ in t["segs"]] for t in trks],
+                             "trksegpars_lh": [[lh for _, lh in t["segs"]] for t in trks]}
+                            for trks in tracks]),
+        "trkmc": ak.Array([{"trkmcsim": [t["sims"] for t in trks]} for trks in tracks]),
+    }
+
+
+def _failed_cuts(event, active=fs_cuts.DEFAULT_CUTS, sign="minus", track=0):
+    masks = fs_cuts.cut_masks(_eventntuple([event]), sign)
+    return sorted(name for name in active if not masks[name][0][track])
+
+
+def test_fullsim_a_ce_like_track_passes_every_default_cut():
+    assert _failed_cuts({"tracks": [_track()]}) == []
+
+
+def test_fullsim_each_default_cut_rejects_what_it_should():
+    front, mid, boundary, foils = _seg(0), _seg(1), _seg(100), _seg(104)
+    cases = [
+        (["is_good_track"], {"tracks": [_track(status=-1)]}),
+        (["is_good_track"], {"tracks": [_track(goodfit=0)]}),
+        # without a front segment there is no direction or tan(dip) either
+        (["has_downstream", "has_trk_front_seg", "pz_over_pt"],
+         {"tracks": [_track(segs=[mid, boundary, foils])]}),
+        (["charge_selection", "is_reco_electron_or_positron"], {"tracks": [_track(pdg=13)]}),
+        (["has_downstream"],
+         {"tracks": [_track(segs=[_seg(0, p=(0, 85, -60)), mid, boundary, foils])]}),
+        (["charge_selection"], {"tracks": [_track(pdg=-11)]}),
+        (["or_trigger"], {"tracks": [_track()], "trig": 0}),
+        (["good_trkpid"], {"tracks": [_track(pid=0.5)]}),
+        (["good_trkpid"], {"tracks": [_track()], "calo": []}),
+        (["pz_over_pt"],
+         {"tracks": [_track(segs=[_seg(0, tandip=0.9), mid, boundary, foils])]}),
+        (["st_boundary"], {"tracks": [_track(segs=[front, mid, foils])]}),
+        (["has_st"], {"tracks": [_track(segs=[front, mid, boundary])]}),
+        (["no_opa"], {"tracks": [_track(segs=[front, mid, boundary, foils, _seg(95)])]}),
+        (["good_trkqual"], {"tracks": [_track(qual=0.1)]}),
+        (["has_hits"], {"tracks": [_track(nactive=19)]}),
+        # t0err counts at the tracker middle, not the front
+        (["within_t0err"],
+         {"tracks": [_track(segs=[front, _seg(1, t0err=1.0), boundary, foils])]}),
+        ([], {"tracks": [_track(segs=[_seg(0, t0err=1.0), mid, boundary, foils])]}),
+        # the CRV veto is asymmetric: a coincidence 50 ns before the track
+        # vetoes it, one 50 ns after does not
+        (["no_crv_veto"], {"tracks": [_track()], "crv": [(850.0, 5.0, 3, 800.0, 900.0)]}),
+        ([], {"tracks": [_track()], "crv": [(950.0, 5.0, 3, 900.0, 1000.0)]}),
+    ]
+    for expected, event in cases:
+        assert _failed_cuts(event) == sorted(expected), (expected, _failed_cuts(event))
+
+
+def test_fullsim_vetoes_pair_tracks_in_time():
+    def at(time, pz=60.0, pdg=11):
+        return _track(pdg=pdg, segs=[_seg(0, time=time, p=(0, 85, pz)), _seg(1),
+                                     _seg(100), _seg(104)])
+    # an upstream track 40-110 ns before a downstream one is its reflection
+    assert _failed_cuts({"tracks": [at(900.0), at(830.0, pz=-60)]}) == ["upstream_veto"]
+    assert _failed_cuts({"tracks": [at(900.0), at(870.0, pz=-60)]}) == []
+    # two downstream e+- within 150 ns veto each other, for sign minus only
+    pair = {"tracks": [at(900.0), at(1000.0, pdg=-11)]}
+    assert _failed_cuts(pair) == ["no_multi_trk_veto"]
+    assert _failed_cuts(pair, track=1) == ["charge_selection", "no_multi_trk_veto"]
+    assert _failed_cuts({"tracks": [at(900.0), at(1100.0)]}) == []
+    assert _failed_cuts(pair, sign="plus") == ["charge_selection"]
+
+
+def test_fullsim_trigger_passes_on_any_of_the_paths():
+    apr, cpr = DEFAULT_TRIGGERS
+    assert _failed_cuts({"tracks": [_track()], "trig": {apr: 1}}) == []
+    assert _failed_cuts({"tracks": [_track()], "trig": {cpr: 1}}) == []
+    assert _failed_cuts({"tracks": [_track()], "trig": {}}) == ["or_trigger"]
+    # only the paths asked for count
+    data = _eventntuple([{"tracks": [_track()], "trig": {apr: 1}}])
+    masks = fs_cuts.cut_masks(data, "minus", triggers=(cpr,))
+    assert not masks["or_trigger"][0][0]
+    from tools.analyses.fullsim.eventntuple import EventNtupleError, parse_trigger_paths
+    assert parse_trigger_paths(f"trig_{apr}, {cpr} {apr}") == [apr, cpr]
+    for bad in ("", " , ", "bad-name"):
+        try:
+            parse_trigger_paths(bad)
+        except EventNtupleError:
+            pass
+        else:
+            raise AssertionError(f"{bad!r} should have been refused")
+
+
+def test_fullsim_a_segment_cut_applies_only_at_its_surface():
+    # a late time at the ST does not matter; at the front it does
+    st_late = {"tracks": [_track(segs=[_seg(0), _seg(1), _seg(100), _seg(104, time=50.0)])]}
+    front_early = {"tracks": [_track(segs=[_seg(0, time=50.0), _seg(1), _seg(100),
+                                           _seg(104)])]}
+    active = fs_cuts.DEFAULT_CUTS + ("within_t0",)
+    assert _failed_cuts(st_late, active) == []
+    assert _failed_cuts(front_early, active) == ["within_t0"]
+
+
+def test_fullsim_active_cuts_toggle_by_name_and_refuse_unknown_ones():
+    active = fs_cuts.active_cuts("within_t0", "has_st, no_opa")
+    assert "within_t0" in active and "has_st" not in active and "no_opa" not in active
+    assert "in_mom_range" not in active and active[0] == "has_a_track"
+    # the cut flow follows pyfitter's order whatever order they are named in
+    assert active == [n for n in fs_cuts.CUT_DESCRIPTIONS if n in active]
+    try:
+        fs_cuts.active_cuts("not_a_cut", "")
+    except fs_cuts.CutError as exc:
+        assert "Known:" in str(exc), exc
+    else:
+        raise AssertionError("not_a_cut was accepted")
+
+
+def test_fullsim_origin_is_the_first_classified_particle_in_the_chain():
+    events = [
+        {"tracks": [_track(sims=[(168, 0, 10.0)])]},              # CE
+        {"tracks": [_track(sims=[(167, 0, 10.0)])]},              # CE endpoint
+        {"tracks": [_track(sims=[(166, 0, 30.0)])]},              # DIO on the ST
+        {"tracks": [_track(sims=[(166, 0, 200.0)])]},             # DIO on the IPA
+        {"tracks": [_track(sims=[(170, 0, 30.0)])]},              # leading-log DIO
+        {"tracks": [_track(sims=[(12, 0, 0.0), (171, 0, 0.0)])]},  # conversion of an iRMC photon
+        {"tracks": [_track(sims=[(12, 44, 0.0)])]},                # cosmic
+        {"tracks": [_track(sims=[(12, 0, 0.0), (13, 0, 0.0)])]},   # nothing known
+    ]
+    origin = origin_codes(_eventntuple(events)["trkmc"]["trkmcsim"])
+    assert origin.tolist() == [168, 168, 166, 0, 166, 171, -1, -2]
+
+
+def test_fullsim_reduce_counts_the_first_selected_track_of_each_event():
+    data = _eventntuple([
+        {"tracks": [_track()]},
+        # the first track fails, so the second (a DIO, 200 ns later so the
+        # multi-track veto leaves it) represents the event
+        {"tracks": [_track(qual=0.0),
+                    _track(segs=[_seg(0, time=1100.0, p=(0, 80, 60)), _seg(1), _seg(100),
+                                 _seg(104)], sims=[(166, 0, 20.0)])]},
+        {"tracks": [_track(nactive=5)]},                            # cut away
+        # selected, but with two front segments, so not counted (a reflected
+        # track would be, but pz_over_pt removes those)
+        {"tracks": [_track(segs=[_seg(0), _seg(0, time=950.0), _seg(1), _seg(100),
+                                 _seg(104)])]},
+        # likewise when the second front segment's time is NaN: it still counts
+        {"tracks": [_track(segs=[_seg(0), _seg(0, time=np.nan), _seg(1), _seg(100),
+                                 _seg(104)])]},
+    ])
+    data["n_processed"] = 7          # the job processed more than it kept
+    active = fs_cuts.active_cuts("", "")
+    reduced = fs_sens.reduce_data(data, active, fs_cuts.TRKQUAL_MIN, fs_cuts.TRKPID_MIN)
+    assert reduced["n_events"] == 5 and reduced["n_selected"] == 4
+    assert reduced["n_processed"] == 7
+    assert reduced["flow"][-1] == 4 and len(reduced["flow"]) == len(active)
+    assert reduced["origin"].tolist() == [168, 166]
+    assert np.allclose(reduced["p"], [np.hypot(85, 60), 100.0])
+    assert np.allclose(reduced["p_true"], [105.0, 105.0])
+    assert reduced["event"].tolist() == [0, 1]
+
+
+def test_fullsim_rates_follow_production_normalization():
+    """Signal = NPOT x stops/POT x captures/stop x R_mue x efficiency; the DIO
+    is the theory spectrum for NPOT x stops/POT x DIO/stop, folded with the
+    measured response, which carries the same efficiency; cosmics are flat
+    per MeV/c over the on-spill time."""
+    from tools.analyses.fullsim import normalization as norm
+    from tools.analyses import approx_ce_sensitivity as fast
+    if not fast.DIO_TABLE.exists():
+        print("     (skipped: DIO table not on disk)")
+        return
+    rng = np.random.default_rng(1)
+    p_true = np.full(400, 104.97)
+    p_reco = p_true - rng.exponential(0.3, p_true.size) + rng.normal(0, 0.15, p_true.size)
+    spectra = fs_sens.build_spectra(p_reco, p_true, n_generated=1000,
+                                    upstream_eff=0.5, npot=1e18,
+                                    mean_pot_per_event=1.6e7,
+                                    cosmic_rate_per_s_per_mev=1e-5,
+                                    stopped_muons_per_pot=1e-3, rmue=1e-13)
+    eff = 400 / 1000 * 0.5
+    stops = 1e18 * 1e-3
+    assert np.isclose(spectra["efficiency"], eff)
+    assert np.isclose(spectra["stopped_muons"], stops)
+    assert np.isclose(spectra["signal"].values.sum(), stops * 0.609 * 1e-13 * eff)
+    assert np.isclose(spectra["response"].values.sum() * spectra["response"].width, eff)
+    # the response only moves DIO a little, so the folded total is the
+    # theory total times the efficiency
+    dio_total = norm.DIO_PER_STOPPED_MUON * stops * eff
+    assert np.isclose(spectra["dio"].values.sum(), dio_total, rtol=1e-3)
+    width = spectra["signal"].width
+    onspill = 1e18 / 1.6e7 * fast.ONSPILL_SECONDS_PER_EVENT
+    assert np.allclose(spectra["cosmic"].values, 1e-5 * onspill * width)
+    # the scan is approx_ce_sensitivity's, and finds the peak
+    best, _ = fast.scan_signal_box(spectra["signal"], spectra["dio"], spectra["cosmic"])
+    assert 103.5 < best["low_mev"] < best["high_mev"] < 105.5
+
+
+# SimEfficiencies2 for Sim_best v1_1, run 1430, as dbTool prints it.
+SIM_EFFICIENCIES_TABLE = """\
+MuBeamCat,213816,100000000,0.00213816
+EleBeamCat,5532579,100000000,0.05532579
+MuminusStopsCat,1435092,4000000000,0.000358773
+MuplusStopsCat,7578,4000000000,0.0000018945
+IPAStopsCat,22519,3584800000,0.00000628180093729078
+PiTotalLifeimeWeight_filter,0,0,38536.77997060446
+"""
+
+
+def test_fullsim_stopped_muons_per_pot_follow_the_sim_chain():
+    from tools.analyses.fullsim import normalization as norm
+    table = norm.parse_sim_efficiencies(SIM_EFFICIENCIES_TABLE)
+    # Production's normalizations.py: MuBeamCat x MuminusStopsCat x 1000
+    assert np.isclose(norm.stopped_muons_per_pot(table),
+                      0.00213816 * 0.000358773 * 1000)
+    assert np.isclose(norm.STOPPED_MUONS_PER_POT, norm.stopped_muons_per_pot(table))
+    assert np.isclose(norm.CAPTURES_PER_STOPPED_MUON + norm.DIO_PER_STOPPED_MUON, 1.0)
+    del table["MuminusStopsCat"]
+    try:
+        norm.stopped_muons_per_pot(table)
+    except norm.NormalizationError as exc:
+        assert "MuminusStopsCat" in str(exc), exc
+    else:
+        raise AssertionError("a table without MuminusStopsCat was accepted")
+
+
+# The MDC2025 stop chain's files as SAM has them (2026-10-07): MuBeamCat's
+# four, one with event_count left out as SAM does for a zero, and
+# MuminusStopsCat's one.
+MUBEAM_FILES = [("sim.mu2e.MuBeamCat.MDC2025ab.001430_00020851.art", 25000000, 53513),
+                ("sim.mu2e.MuBeamCat.MDC2025ab.001430_00032620.art", 25000000, 53834),
+                ("sim.mu2e.MuBeamCat.MDC2025ab.001430_00020001.art", 25000000, 53262),
+                ("sim.mu2e.MuBeamCat.MDC2025ab.001430_00020000.art", 25000000, 53207)]
+MUSTOPS_FILES = [("sim.mu2e.MuminusStopsCat.MDC2025ac.001430_00000000.art",
+                  4000000000, 1435092)]
+
+
+def _fake_sam(datasets):
+    """list_files and fetch over {dataset: [(file, gencount, event_count)]};
+    an event_count of None is left out of the metadata."""
+    records = {}
+    for files in datasets.values():
+        for name, gencount, count in files:
+            records[name] = {"file_name": name, "dh.gencount": gencount}
+            if count is not None:
+                records[name]["event_count"] = count
+    return ((lambda ds: [f[0] for f in datasets.get(ds, [])]),
+            (lambda names: [records[n] for n in names]))
+
+
+def test_fullsim_stage_efficiencies_come_from_the_datasets_without_the_db():
+    """As CreateSimEfficiency.sh (mu2eGenFilterEff): events in the dataset
+    over events generated, summed over its files, so the MDC2025 chain gives
+    the SimEfficiencies2 rows without reading them."""
+    from tools.analyses.fullsim import normalization as norm
+    beam, stops = norm.STOP_CHAIN_DATASETS
+    list_files, fetch = _fake_sam({beam: MUBEAM_FILES, stops: MUSTOPS_FILES})
+    stages = norm.sim_efficiencies(norm.STOP_CHAIN_DATASETS, list_files, fetch)
+    assert stages == norm.STOP_CHAIN_MDC2025
+    table = norm.parse_sim_efficiencies(SIM_EFFICIENCIES_TABLE)
+    for stage in norm.STOP_CHAIN:
+        assert np.isclose(stages[stage].efficiency, table[stage]), stage
+    assert np.isclose(norm.stopped_muons_per_pot(stages), norm.STOPPED_MUONS_PER_POT)
+    # a missing event_count is zero events, not an error
+    zero = [MUBEAM_FILES[0][:2] + (None,)] + MUBEAM_FILES[1:]
+    list_files, fetch = _fake_sam({beam: zero})
+    assert norm.dataset_efficiency(beam, list_files, fetch).passed == 213816 - 53513
+
+
+def test_fullsim_stage_efficiency_errors_say_what_is_wrong():
+    from tools.analyses.fullsim import normalization as norm
+    beam, stops = norm.STOP_CHAIN_DATASETS
+    no_gencount = [(MUBEAM_FILES[0][0], 0, 5)]
+    def unreachable(_):
+        raise OSError("network down")
+    cases = [
+        (["MuBeamCat"], _fake_sam({}), "not a dataset name"),
+        (["sim.mu2e.MuBeamCat.MDC2025ab.art with availability x"], _fake_sam({}),
+         "not a dataset name"),
+        ([beam], _fake_sam({}), "no files"),
+        ([beam], _fake_sam({beam: no_gencount}), "no dh.gencount"),
+        ([beam], (unreachable, None), "network down"),
+        ([beam, "sim.mu2e.MuBeamCat.MDC2026a.art"], _fake_sam({beam: MUBEAM_FILES}),
+         "two datasets"),
+    ]
+    for datasets, (list_files, fetch), needle in cases:
+        try:
+            norm.sim_efficiencies(datasets, list_files, fetch)
+        except norm.NormalizationError as exc:
+            assert needle in str(exc), (needle, str(exc))
+        else:
+            raise AssertionError(f"{needle}: no error")
+    # one stage only cannot give stops per POT
+    stages = norm.sim_efficiencies([beam], *_fake_sam({beam: MUBEAM_FILES}))
+    try:
+        norm.stopped_muons_per_pot(stages)
+    except norm.NormalizationError as exc:
+        assert "MuminusStopsCat" in str(exc), exc
+    else:
+        raise AssertionError("a chain without MuminusStopsCat was accepted")
+
+
+def _ce_ancestry(config="MDC2025", stops="MDC2025ac", beam="MDC2025ab", seq="001430_00000000"):
+    """A SAM catalog shaped like the CE mix file's real ancestry: nts -> mcs
+    -> dig (many dts parents) -> dts -> MuminusStopsCat -> TargetStopsCat ->
+    TargetStops -> MuBeamCat. Returns (nts file name, catalog)."""
+    nts = f"nts.mu2e.CeMLeadingLogMix1BB.{config}au_best_v1_1-001.{seq}.root"
+    mcs = f"mcs.mu2e.CeMLeadingLogMix1BB.{config}au_best_v1_1.{seq}.art"
+    dig = f"dig.mu2e.CeMLeadingLogMix1BB.{config}au_best_v1_3.{seq}.art"
+    dts = [f"dts.mu2e.CeMLeadingLog.{config}ap.001430_{i:08d}.art" for i in range(3)]
+    mustops = f"sim.mu2e.MuminusStopsCat.{stops}.001430_00000000.art"
+    tscat = f"sim.mu2e.TargetStopsCat.{stops}.001430_00000000.art"
+    ts = [f"sim.mu2e.TargetStops.{stops}.001430_{i:08d}.art" for i in range(3)]
+    mubeam = f"sim.mu2e.MuBeamCat.{beam}.001430_00020001.art"
+    beam_parents = [f"sim.mu2e.Beam.{beam}.001430_{i:08d}.art" for i in range(3)]
+    def parents(*names):
+        return {"parents": [{"file_name": n} for n in names]}
+    catalog = {nts: parents(mcs), mcs: parents(dig), dig: parents(*dts),
+               **{d: parents(mustops) for d in dts},
+               mustops: parents(tscat), tscat: parents(*ts),
+               **{t: parents(mubeam) for t in ts},
+               mubeam: parents(*beam_parents)}
+    return nts, catalog
+
+
+def test_fullsim_stop_chain_is_traced_from_the_inputs_ancestry():
+    from tools.analyses.fullsim import normalization as norm
+    nts, catalog = _ce_ancestry()
+    fetched = []
+    def fetch(name):
+        fetched.append(name)
+        return catalog[name]
+    # the CE mix's chain is the one CreateSimEfficiency.sh names for MDC2025
+    assert norm.stop_chain_of(nts, fetch) == norm.STOP_CHAIN_DATASETS
+    # one file per parent dataset is followed, not every parent
+    assert len(fetched) == 7, fetched
+    # files of one dataset are traced once
+    other = nts.replace("00000000.root", "00000001.root")
+    catalog[other] = catalog[nts]
+    fetched.clear()
+    assert norm.stop_chain_of_inputs([nts, other], fetch) == norm.STOP_CHAIN_DATASETS
+    assert len(fetched) == 7, fetched
+    # a later iteration is traced to its own chain
+    nts26, catalog26 = _ce_ancestry("MDC2026", "MDC2026c", "MDC2026b")
+    assert norm.stop_chain_of(nts26, catalog26.__getitem__) == (
+        "sim.mu2e.MuBeamCat.MDC2026b.art", "sim.mu2e.MuminusStopsCat.MDC2026c.art")
+
+
+def test_fullsim_stop_chain_tracing_errors_say_what_is_wrong():
+    from tools.analyses.fullsim import normalization as norm
+    nts, catalog = _ce_ancestry()
+    nts26, catalog26 = _ce_ancestry("MDC2026", "MDC2026c", "MDC2026b")
+    both = {**catalog, **catalog26}
+    # a dts parent from a second stops dataset makes the stops ambiguous
+    ambiguous = dict(catalog)
+    dts0 = catalog[catalog[catalog[nts]["parents"][0]["file_name"]]["parents"][0]["file_name"]]
+    first_dts = dts0["parents"][0]["file_name"]
+    ambiguous[first_dts] = {"parents": [
+        {"file_name": "sim.mu2e.MuminusStopsCat.MDC2025ac.001430_00000000.art"},
+        {"file_name": "sim.mu2e.MuminusStopsCat.MDC2025zz.001430_00000000.art"}]}
+    orphan = {nts: {"parents": []}}
+    cases = [
+        ([nts, nts26], both.__getitem__, "different stop chains"),
+        ([nts], ambiguous.__getitem__, "more than one MuminusStopsCat"),
+        ([nts], orphan.__getitem__, "no MuminusStopsCat dataset"),
+        ([nts], {}.__getitem__, "cannot read the SAM metadata"),
+        (["my_ce_ntuple.root"], catalog.__getitem__, "not a SAM file name"),
+    ]
+    for names, fetch, needle in cases:
+        try:
+            norm.stop_chain_of_inputs(names, fetch)
+        except norm.NormalizationError as exc:
+            assert needle in str(exc), (needle, str(exc))
+        else:
+            raise AssertionError(f"{needle}: no error")
+
+
+def test_fullsim_generated_events_come_from_the_nearest_ancestor_with_gencount():
+    from tools.analyses.fullsim import provenance
+    nts = "nts.mu2e.CeMLeadingLogMix1BB.MDC2025au_best_v1_1-001.001430_00000000.root"
+    mcs = "mcs.mu2e.CeMLeadingLogMix1BB.MDC2025au_best_v1_1.001430_00000000.art"
+    catalog = {nts: {"parents": [{"file_name": mcs}]},
+               mcs: {"dh.gencount": 20000, "event_count": 8212,
+                     "parents": [{"file_name": "dig.x"}]}}
+    assert provenance.generated_events(nts, fetch=catalog.__getitem__) == 20000
+    # no ancestor with a count, or no SAM: an error that says which file
+    orphan = {nts: {"parents": []}}
+    for fetch, needle in ((orphan.__getitem__, "no dh.gencount"),
+                          ({}.__getitem__, "cannot read the SAM metadata")):
+        try:
+            provenance.generated_events(nts, fetch=fetch)
+        except provenance.ProvenanceError as exc:
+            assert needle in str(exc) and nts in str(exc), exc
+        else:
+            raise AssertionError(f"{needle}: no error")
+
+
+def test_fullsim_run_reports_a_file_that_is_not_an_eventntuple(tmp_dir):
+    path = Path(tmp_dir) / "nts.owner.edep.test.root"
+    _write_edep_tree(path, n=10)
+    result = run_analysis(analysis="fullsim_sensitivity", data_file=str(path),
+                          output_dir=tmp_dir)
+    assert result.status == "error" and "EventNtuple/ntuple" in result.message
+    window = run_analysis(analysis="fullsim_sensitivity", data_file=str(path),
+                          output_dir=tmp_dir, parameters={"time_window": "1650,640"})
+    assert window.status == "error" and "time_window" in window.message
+
+
+# A CeMLeadingLogMix1BB EventNtuple file: CE- mixed with pileup; skipped
+# where not on disk.
+CE_MIX_FILE = Path("/pnfs/mu2e/tape/phy-nts/nts/mu2e/CeMLeadingLogMix1BB/"
+                   "MDC2025au_best_v1_1-001/root/a8/50/nts.mu2e.CeMLeadingLogMix1BB."
+                   "MDC2025au_best_v1_1-001.001430_00000000.root")
+
+
+def test_fullsim_measures_the_efficiency_on_ce_mix(tmp_dir):
+    if not CE_MIX_FILE.exists():
+        print("     (skipped: CE mix file not on disk)")
+        return
+    # the file's parent mcs file has dh.gencount 20000 in SAM, and the stop
+    # chain gives STOPPED_MUONS_PER_POT; both passed here so the test needs
+    # no network
+    from tools.analyses.fullsim import normalization as norm
+    generated = {"n_generated": 20000,
+                 "stopped_muons_per_pot": norm.STOPPED_MUONS_PER_POT}
+    result = run_analysis(analysis="fullsim_sensitivity", data_file=str(CE_MIX_FILE),
+                          output_dir=tmp_dir, parameters=generated)
+    assert result.status == "success", result.message
+    md = result.metadata
+    assert md["n_events_processed"] == 8212 and md["n_events_generated"] == 20000
+    assert np.isclose(md["acceptance"], 8212 / 20000)
+    assert (md["n_events_selected"], md["n_events_counted"]) == (4181, 3010)
+    # the efficiency counts against what was generated, so it carries the
+    # digitization filter's acceptance
+    assert np.isclose(md["signal_efficiency"], 3010 / 20000)
+    assert np.isclose(md["signal_rate"], 4.686, rtol=1e-3)
+    # the cut flow is pyfitter's for cut-set 80_1d on this file
+    assert list(md["cut_flow"].values())[-1] == 4181
+    assert md["cut_flow"]["no_multi_trk_veto"] == 6909 and md["cut_flow"]["pz_over_pt"] == 4550
+    assert np.allclose((md["signal_mom_low_mevc"], md["signal_mom_high_mevc"]), (103.5, 104.7))
+    # 1e18 POT x 7.67e-4 stopped mu-/POT x 0.609 captures x R_mue 1e-13
+    assert np.isclose(md["n_conversions"], 46.717, rtol=1e-4)
+    assert md["total_background"] == md["dio_background"] + md["cosmic_background"]
+    # a pileup DIO track that passes the cuts is not signal
+    assert md["selected_by_origin"] == {"DIO": 1, "CE-": 4180}
+    # upstream_eff scales the signal and the DIO alike, not the cosmics
+    half = run_analysis(analysis="fullsim_sensitivity", data_file=str(CE_MIX_FILE),
+                        output_dir=tmp_dir, parameters={**generated, "upstream_eff": 0.5})
+    hm = half.metadata
+    assert np.isclose(hm["signal_efficiency"], 0.5 * 3010 / 20000)
+    assert hm["cosmic_rate_per_s_per_mev"] == md["cosmic_rate_per_s_per_mev"]
+    bad = run_analysis(analysis="fullsim_sensitivity", data_file=str(CE_MIX_FILE),
+                       output_dir=tmp_dir, parameters={**generated, "trigger_paths": "apr_Nope"})
+    assert bad.status == "error" and "trig_apr_Nope" in bad.message
+    few = run_analysis(analysis="fullsim_sensitivity", data_file=str(CE_MIX_FILE),
+                       output_dir=tmp_dir, parameters={**generated, "n_generated": 100})
+    assert few.status == "error" and "n_generated 100" in few.message
+
+
 # --- the registry (loops over every analysis) --------------------------------
 
 def test_registry_includes_every_analysis():
-    assert {"edep", "count", "muon_stop_rate",
-            "approx_ce_sensitivity", "stop_materials"} <= set(ANALYSES)
+    assert {"edep", "count", "muon_stop_rate", "approx_ce_sensitivity",
+            "stop_materials", "fullsim_sensitivity"} <= set(ANALYSES)
 
 
 def test_every_spec_is_self_consistent():

@@ -3,7 +3,14 @@ from pathlib import Path
 import tomllib
 from typing import Literal
 
-from mcp.server.fastmcp import FastMCP
+# mcp 2.0 (ana 2.8.0 and later) renamed FastMCP to MCPServer and moved
+# host/port from the constructor to run(); ana 2.7.0 and earlier have mcp 1.x.
+try:
+    from mcp.server.mcpserver import MCPServer as FastMCP
+    _HOST_PORT_IN_RUN = True
+except ImportError:
+    from mcp.server.fastmcp import FastMCP
+    _HOST_PORT_IN_RUN = False
 
 Transport = Literal["stdio", "streamable-http"]
 
@@ -50,12 +57,15 @@ def create_server(
         "quick check before a full run."
     )
 
-    mcp = FastMCP(
-        "Mu2e Analysis MCP Server",
-        instructions=instructions,
-        host=host,
-        port=port,
-    )
+    if _HOST_PORT_IN_RUN:
+        mcp = FastMCP("Mu2e Analysis MCP Server", instructions=instructions)
+    else:
+        mcp = FastMCP(
+            "Mu2e Analysis MCP Server",
+            instructions=instructions,
+            host=host,
+            port=port,
+        )
 
     for tool_module in load_tool_modules():
         if not hasattr(tool_module, "__all__"):
@@ -75,4 +85,7 @@ def run_server(
     port: int = 8000,
 ) -> None:
     mcp = create_server(host=host, port=port)
-    mcp.run(transport=transport)
+    if _HOST_PORT_IN_RUN and transport != "stdio":
+        mcp.run(transport=transport, host=host, port=port)
+    else:
+        mcp.run(transport=transport)
