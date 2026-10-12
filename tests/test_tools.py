@@ -2104,6 +2104,254 @@ def test_validate_input_paths_flags_only_bad_ones(tmp_dir):
     assert any("does not exist" in p and "x.art" in p for p in problems)
 
 
+# --- catalogued inputs: SAM definitions, metacat datasets, file names ------
+
+# Two files and the directories SAM records for them (2026-10-12): a
+# production nts file on tape, and a user dts file on scratch.
+SAM_TAPE_FILE = ("nts.mu2e.CeMLeadingLogMix1BB.MDC2025au_best_v1_1-001."
+                 "001430_00000000.root",
+                 "/pnfs/mu2e/tape/phy-nts/nts/mu2e/CeMLeadingLogMix1BB/"
+                 "MDC2025au_best_v1_1-001/root/a8/50")
+SAM_SCRATCH_FILE = ("dts.mmackenz.CeEndpoint.MDC2025ax.001430_00000000.art",
+                    "/pnfs/mu2e/scratch/datasets/usr-sim/dts/mmackenz/"
+                    "CeEndpoint/MDC2025ax/art/a4/0e")
+
+
+class FakeCatalogs:
+    """SAM, metacat and dCache from dictionaries; records what was asked."""
+
+    def __init__(self, sam_defs=None, metacat=None, locations=None,
+                 on_disk=(), locality=None, down=False):
+        self.sam_defs, self.metacat = sam_defs or {}, metacat or {}
+        self.locations = locations or {}
+        self.on_disk = {Path(p) for p in on_disk}
+        self.localities = locality or {}
+        self.down, self.asked = down, []
+
+    def _ask(self, what):
+        self.asked.append(what)
+        if self.down:
+            import urllib.error
+            raise urllib.error.URLError("connection refused")
+
+    def sam_definition_files(self, defname):
+        self._ask(("sam", defname))
+        return self.sam_defs.get(defname)
+
+    def metacat_dataset_files(self, did):
+        self._ask(("metacat", did))
+        return self.metacat.get(did)
+
+    def sam_locations(self, names):
+        self._ask(("locations", tuple(names)))
+        return {n: [Path(p) for p in self.locations[n]]
+                for n in names if n in self.locations}
+
+    def exists(self, path):
+        return Path(path) in self.on_disk or Path(path).exists()
+
+    def locality(self, path):
+        return self.localities.get(Path(path))
+
+
+def _expect_catalog_error(needles, **kwargs):
+    from tools.catalog import CatalogError, resolve_inputs
+    try:
+        resolve_inputs(**kwargs)
+    except CatalogError as exc:
+        for needle in needles:
+            assert needle in str(exc), (needle, str(exc))
+        return str(exc)
+    raise AssertionError(f"{needles}: no error")
+
+
+def test_standard_paths_follow_the_layout_sam_records():
+    from tools.catalog import standard_paths
+    for name, directory in (SAM_TAPE_FILE, SAM_SCRATCH_FILE):
+        assert Path(directory) / name in standard_paths(name), name
+    # disk first, tape last: the order copies are preferred in
+    paths = standard_paths(SAM_SCRATCH_FILE[0])
+    assert [str(p).split("/")[3] for p in paths] == ["persistent", "scratch", "tape"]
+    for name in ("my_ntuple.root", "xyz.mu2e.a.b.0.art", "ext.mu2e.a.b.0.art"):
+        assert standard_paths(name) == [], name
+
+
+def test_metacat_query_output_is_read_as_a_json_text_sequence():
+    from tools.catalog import _json_records
+    text = '\x1e{"name": "a"}\n\x1e{"name": "b"}\n'
+    assert [r["name"] for r in _json_records(text)] == ["a", "b"]
+    assert _json_records('[{"name": "c"}]') == [{"name": "c"}]
+
+
+def test_a_sam_definition_resolves_to_its_files_first_by_name():
+    from tools.catalog import resolve_inputs, standard_paths
+    names = [f"dig.mu2e.X.v1.001430_0000000{i}.art" for i in (2, 0, 1)]
+    disk = {n: standard_paths(n)[0] for n in names}
+    fake = FakeCatalogs(sam_defs={"dig.mu2e.X.v1.art": names},
+                        on_disk=disk.values())
+    resolved = resolve_inputs(dataset="dig.mu2e.X.v1.art", max_files=2,
+                              client=fake)
+    assert resolved.paths == [disk[n] for n in sorted(names)[:2]], resolved.paths
+    assert resolved.source == {"dataset": "dig.mu2e.X.v1.art", "catalog": "sam",
+                               "n_files_in_dataset": 3, "locations": {"disk": 2},
+                               "n_catalogued_files": 2}, resolved.source
+    # found as a SAM definition, so metacat is never asked
+    assert not any(kind == "metacat" for kind, _ in fake.asked), fake.asked
+
+
+def test_a_dataset_not_in_sam_is_looked_up_in_metacat():
+    from tools.catalog import resolve_inputs, standard_paths
+    name = SAM_SCRATCH_FILE[0]
+    scratch = standard_paths(name)[1]
+    # a bare name goes to its owner's namespace; SAM has no record of the
+    # file, so the standard layout finds it
+    fake = FakeCatalogs(metacat={"mmackenz:dts.mmackenz.CeEndpoint.MDC2025ax.art": [name]},
+                        on_disk=[scratch])
+    for dataset in ("dts.mmackenz.CeEndpoint.MDC2025ax.art",
+                    "mmackenz:dts.mmackenz.CeEndpoint.MDC2025ax.art"):
+        fake.asked.clear()
+        resolved = resolve_inputs(dataset=dataset, client=fake)
+        assert resolved.paths == [scratch], resolved.paths
+        assert resolved.source["catalog"] == "metacat"
+        assert resolved.source["locations"] == {"scratch": 1}
+        # a DID is a metacat name: SAM's definitions are not asked
+        asked_sam = ("sam", dataset) in fake.asked
+        assert asked_sam == (":" not in dataset), fake.asked
+
+
+def test_a_registered_file_name_is_located_and_a_disk_copy_wins():
+    from tools.catalog import resolve_inputs
+    name, tape_dir = SAM_TAPE_FILE
+    tape = Path(tape_dir) / name
+    persistent = Path(tape_dir.replace("/tape/", "/persistent/datasets/")) / name
+    fake = FakeCatalogs(locations={name: [tape, persistent]},
+                        on_disk=[tape, persistent])
+    absolute = "/some/where/else.art"
+    # bare, as a DID, and next to a path that is passed through untouched
+    resolved = resolve_inputs([name, f"mu2e:{name}", absolute], client=fake)
+    assert resolved.paths == [persistent, persistent, Path(absolute)], resolved.paths
+    assert resolved.source == {"locations": {"disk": 2}, "n_catalogued_files": 2}
+    # with only the tape copy, it is used, being staged
+    fake = FakeCatalogs(locations={name: [tape]}, on_disk=[tape],
+                        locality={tape: "ONLINE_AND_NEARLINE"})
+    assert resolve_inputs([name], client=fake).paths == [tape]
+    # paths alone never reach a catalog
+    fake = FakeCatalogs(down=True)
+    assert resolve_inputs([absolute], client=fake).paths == [Path(absolute)]
+    assert fake.asked == []
+
+
+def test_unstaged_tape_files_are_refused_with_the_command_that_stages_them():
+    from tools.catalog import standard_paths
+    names = [f"mcs.mu2e.X.v1.001430_0000000{i}.art" for i in range(2)]
+    tape = {n: standard_paths(n)[2] for n in names}
+    locality = {tape[names[0]]: "ONLINE", tape[names[1]]: "NEARLINE"}
+    fake = FakeCatalogs(sam_defs={"mcs.mu2e.X.v1.art": names},
+                        metacat={"mu2e:mcs.mu2e.Y.v1.art": names},
+                        on_disk=tape.values(), locality=locality)
+    _expect_catalog_error(
+        ["1 of 2", "not staged", "samweb prestage-dataset --defname=mcs.mu2e.X.v1.art"],
+        dataset="mcs.mu2e.X.v1.art", client=fake)
+    _expect_catalog_error(["mdh prestage-files mu2e:mcs.mu2e.Y.v1.art"],
+                          dataset="mu2e:mcs.mu2e.Y.v1.art", client=fake)
+    _expect_catalog_error([f"mdh prestage-files {names[1]}"],
+                          entries=names, client=fake)
+    # a locality dCache does not report is not held against the file
+    fake.localities = {}
+    from tools.catalog import resolve_inputs
+    assert len(resolve_inputs(entries=names, client=fake).paths) == 2
+
+
+def test_catalogued_input_errors_say_what_is_wrong():
+    from tools.catalog import MAX_DATASET_FILES, resolve_inputs, standard_paths
+    _expect_catalog_error(
+        ["no such dataset", "SAM definition nts.me.A.b.root",
+         "metacat dataset me:nts.me.A.b.root"],
+        dataset="nts.me.A.b.root", client=FakeCatalogs())
+    _expect_catalog_error(["has no files"], dataset="x.mu2e.e.art",
+                          client=FakeCatalogs(sam_defs={"x.mu2e.e.art": []}))
+    big = [f"sim.mu2e.B.v.{i:06d}_00000000.art" for i in range(MAX_DATASET_FILES + 1)]
+    fake = FakeCatalogs(sam_defs={"sim.mu2e.B.v.art": big})
+    _expect_catalog_error(["max_files", str(len(big))],
+                          dataset="sim.mu2e.B.v.art", client=fake)
+    first = standard_paths(big[0])[0]
+    fake.on_disk = {first}
+    assert resolve_inputs(dataset="sim.mu2e.B.v.art", max_files=1,
+                          client=fake).paths == [first]
+    name = "nts.mu2e.Nowhere.v1.001430_00000000.root"
+    _expect_catalog_error(["1 of 1", name, "no copy on disk", "/pnfs/mu2e/tape/"],
+                          entries=[name], client=FakeCatalogs())
+    _expect_catalog_error(["my_ntuple.root", "neither registered", "absolute path"],
+                          entries=["my_ntuple.root"], client=FakeCatalogs())
+    _expect_catalog_error(["cannot list dataset", "connection refused"],
+                          dataset="a.mu2e.b.art", client=FakeCatalogs(down=True))
+    _expect_catalog_error(["cannot look up", "SAM"],
+                          entries=[name], client=FakeCatalogs(down=True))
+
+
+def test_run_analysis_runs_over_a_dataset_it_resolved(tmp_dir):
+    from tools import catalog
+    names = [f"dig.mu2e.X.v1.001430_0000000{i}.art" for i in range(3)]
+    copies = {n: Path(tmp_dir) / n for n in names}
+    for path in copies.values():
+        path.touch()
+    fake_catalog = FakeCatalogs(sam_defs={"dig.mu2e.X.v1.art": names},
+                                locations={n: [p] for n, p in copies.items()})
+    fake_job, _ = _fake_edep_job(tmp_dir)
+    seen = []
+
+    def job(**kwargs):
+        seen.append((kwargs["input_paths"], kwargs["single"]))
+        return fake_job(**kwargs)
+
+    real_client, real_job = catalog.CLIENT, edep_mod.run_mu2e_job
+    catalog.CLIENT, edep_mod.run_mu2e_job = fake_catalog, job
+    try:
+        result = run_analysis(analysis="edep", dataset="dig.mu2e.X.v1.art",
+                              max_files=2, output_dir=str(Path(tmp_dir) / "out"))
+        one = run_analysis(analysis="edep", data_file=names[2],
+                           output_dir=str(Path(tmp_dir) / "one"))
+    finally:
+        catalog.CLIENT, edep_mod.run_mu2e_job = real_client, real_job
+    assert result.status == "success", result.message
+    # the job saw the resolved paths, and as a file list
+    assert seen[0] == ([copies[n] for n in names[:2]], False), seen
+    meta = result.metadata
+    assert meta["data_files"] == [str(copies[n]) for n in names[:2]]
+    assert meta["inputs_from"]["dataset"] == "dig.mu2e.X.v1.art"
+    assert meta["inputs_from"]["n_files_in_dataset"] == 3
+    # a registered name passed as data_file is still one -s file
+    assert one.status == "success", one.message
+    assert seen[1] == ([copies[names[2]]], True), seen
+
+
+def test_run_analysis_reports_dataset_misuse(tmp_dir):
+    from tools import catalog
+    names = ["nts.mu2e.S.v1.001430_00000000.root", "nts.mu2e.S.v1.001430_00000001.root"]
+    for name in names:
+        (Path(tmp_dir) / name).touch()
+    fake = FakeCatalogs(sam_defs={"nts.mu2e.S.v1.root": names},
+                        locations={n: [Path(tmp_dir) / n] for n in names})
+    real = catalog.CLIENT
+    catalog.CLIENT = fake
+    try:
+        cases = [
+            (dict(analysis="edep", dataset="d.art", data_file="/a.art"),
+             "not data_file and dataset"),
+            (dict(analysis="edep", data_files=["/a.art"], max_files=1),
+             "max_files applies only to a dataset"),
+            (dict(analysis="edep", dataset="no.such.def.art"), "no such dataset"),
+            (dict(analysis="approx_ce_sensitivity", dataset="nts.mu2e.S.v1.root",
+                  parameters={"sig_eff": 0.1}), "max_files=1"),
+        ]
+        for kwargs, needle in cases:
+            result = run_analysis(output_dir=tmp_dir, **kwargs)
+            assert result.status == "error", kwargs
+            assert needle in result.message, (needle, result.message)
+    finally:
+        catalog.CLIENT = real
+
+
 # --- run_analysis argument validation (no job, no computation) ---------------
 
 def test_relative_data_file_is_rejected(tmp_dir):
@@ -2141,7 +2389,7 @@ def test_both_inputs_at_once_are_rejected(tmp_dir):
     result = run_analysis(analysis="edep", data_file="/a.art",
                           data_files=["/b.art"], output_dir=tmp_dir)
     assert result.status == "error"
-    assert "not both" in result.message
+    assert "not data_file and data_files" in result.message
 
 
 def test_root_file_analysis_rejects_a_file_list(tmp_dir):

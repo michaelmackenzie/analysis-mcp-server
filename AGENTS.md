@@ -47,6 +47,7 @@ python3 -m analysis_mcp_server --transport stdio [--work-area DIR | --musing 'Si
   descriptions are what agents read, so write them for an agent.
 - **Shared machinery knows nothing about physics.** That covers
   `mu2e_job.py` (running jobs), `mu2e_env.py` (where Offline comes from),
+  `catalog.py` (SAM/metacat names and datasets to `/pnfs` paths),
   `spectrum.py` (uniform-binned histograms: rebin, regrid, smear) and
   `selection.py` (cut expressions). Put physics in the analysis modules.
 - **Errors are worded for the caller.** A runner returns
@@ -92,6 +93,11 @@ python3 -m analysis_mcp_server --transport stdio [--work-area DIR | --musing 'Si
 - **Never use `tpr_` or `mpr_` paths** in defaults, tests or examples: they
   are in the trigger menu but not meant for the real trigger. Use `apr_`,
   `cpr_` and `calo_` paths.
+- **Catalogued inputs** (`dataset`, or a file name with no `/`) become
+  paths in `run_analysis` before anything else, so runners only ever see
+  paths. All network and dCache access goes through `catalog.Catalogs`;
+  tests swap `catalog.CLIENT` for a fake and never reach SAM or metacat.
+  An unstaged tape file is refused, not read: reading it blocks on tape.
 - **Default inputs.** An `AnalysisSpec` with `default_inputs` runs without
   `data_file(s)`; the trigger rate and timing default to
   `mu2e-trig-config/ci/data_files.txt`, found with `Mu2eEnv.find_code_file`

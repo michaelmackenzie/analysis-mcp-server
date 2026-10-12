@@ -11,6 +11,7 @@ from typing import Annotated, Any, Literal
 
 from pydantic import Field, validate_call
 
+from .catalog import CatalogError, resolve_inputs
 from .mu2e_env import current as current_env
 from .mu2e_job import validate_input_paths
 from .registry import ANALYSES, ANALYSIS_NAMES
@@ -31,8 +32,9 @@ def list_analyses() -> ArtifactResult:
     server runs mu2e jobs in — a muse work area, a Musing, or a code tarball —
     which is fixed when the server starts. `input_kind` says what to feed it:
 
-      "art_files"  mu2e art file(s) — pass data_file or data_files, or
-                   neither where `default_inputs` says what is used instead
+      "art_files"  mu2e art file(s) — pass data_file, data_files or a
+                   dataset, or none where `default_inputs` says what is used
+                   instead
       "root_file"  a ROOT file, written by an earlier analysis (see
                    `produced_by`) or by a production job (see
                    `input_hint`) — pass data_file, or data_files where
@@ -65,6 +67,8 @@ def run_analysis(
     output_dir: Annotated[str, Field(min_length=1)],
     data_file: Annotated[str | None, Field(min_length=1)] = None,
     data_files: Annotated[list[str] | None, Field(min_length=1)] = None,
+    dataset: Annotated[str | None, Field(min_length=1)] = None,
+    max_files: Annotated[int | None, Field(ge=1)] = None,
     parameters: dict[str, Any] | None = None,
     max_events: Annotated[int | None, Field(ge=1)] = None,
     timeout_s: Annotated[int, Field(ge=1, le=7200)] = 900,
@@ -92,14 +96,29 @@ def run_analysis(
             logs, figures. Created if missing, and safe to reuse: a rerun
             overwrites the previous run's output rather than failing. Use a
             fresh directory per run only when you want the outputs kept apart.
-        data_file: Absolute path to one input file. Pass exactly one of
-            data_file or data_files — or neither, for an analysis that lists
-            `default_inputs` (e.g. the trigger rate and timing default to
-            mu2e-trig-config's pileup sample).
-        data_files: Absolute paths to several input files, analyzed together
-            into one result: one mu2e job for "art_files" analyses, combined
+        data_file: One input file: an absolute path, or the name of a file
+            registered in SAM or metacat (e.g. "nts.mu2e.CeMLeadingLogMix1BB.
+            MDC2025au_best_v1_1-001.001430_00000000.root", or as a DID
+            "mu2e:<name>"), which is located in dCache for you. Pass exactly
+            one of data_file, data_files or dataset — or none, for an
+            analysis that lists `default_inputs` (e.g. the trigger rate and
+            timing default to mu2e-trig-config's pileup sample).
+        data_files: Several input files, each an absolute path or a
+            registered file name as for data_file, analyzed together into
+            one result: one mu2e job for "art_files" analyses, combined
             histograms for a "root_file" analysis that takes them (see
             `takes_data_files` in list_analyses).
+        dataset: A catalogued dataset whose files are the input, located in
+            dCache: a SAM definition name (e.g. "nts.mu2e.
+            CeMLeadingLogMix1BB.MDC2025au_best_v1_1.root") or a metacat
+            dataset DID ("<namespace>:<name>"). A bare name not defined in
+            SAM is looked up in metacat under its owner's namespace. Disk
+            copies are preferred to tape, and a run whose tape files are not
+            staged is refused with the command that stages them. The files
+            run together as with data_files.
+        max_files: With dataset only: use the first this many files, by
+            name. Needed for a dataset over 2000 files; useful for a quick
+            check.
         parameters: Analysis-specific physics knobs, e.g.
             {"sig_eff": 2.5e-4} for approx_ce_sensitivity. list_analyses reports
             each analysis' parameters, defaults, and which are required.
@@ -119,14 +138,21 @@ def run_analysis(
             metadata={"analysis": analysis, **extra},
         )
 
-    if data_file is not None and data_files is not None:
-        return fail("pass one of data_file (one input file) or data_files "
-                    "(a list of input files), not both.",
-                    data_file=data_file, data_files=data_files)
-    if data_file is None and data_files is None:
+    given = {name: value for name, value in (("data_file", data_file),
+                                             ("data_files", data_files),
+                                             ("dataset", dataset))
+             if value is not None}
+    if len(given) > 1:
+        return fail(f"pass one of data_file (one input file), data_files (a "
+                    f"list of input files) or dataset, not {' and '.join(given)}.",
+                    **given)
+    if max_files is not None and dataset is None:
+        return fail("max_files applies only to a dataset; pick the files "
+                    "yourself with data_files.")
+    if not given:
         if spec.default_inputs is None:
-            return fail("pass exactly one of data_file (one input file) or "
-                        "data_files (a list of input files).")
+            return fail("pass exactly one of data_file (one input file), "
+                        "data_files (a list of input files) or dataset.")
         try:
             data_files = [str(p) for p in spec.default_inputs()]
         except ValueError as exc:
@@ -147,8 +173,19 @@ def run_analysis(
     except ValueError as exc:
         return fail(str(exc), parameters=parameters)
 
-    inputs = [data_file] if data_file is not None else list(data_files)
-    paths = [Path(p) for p in inputs]
+    # Catalogued names and datasets become paths here, so everything after
+    # sees paths alone, as if the caller had passed them.
+    try:
+        resolved = resolve_inputs(
+            [data_file] if data_file is not None else data_files,
+            dataset=dataset, max_files=max_files)
+    except CatalogError as exc:
+        return fail(str(exc), **given)
+    paths = resolved.paths
+    if len(paths) > 1 and not spec.takes_file_list:
+        return fail(f"takes a single ROOT file, but dataset {dataset} has "
+                    f"{len(paths)}: pass max_files=1, or one file as data_file. "
+                    f"{spec.input_hint}", dataset=dataset)
     problems = validate_input_paths(paths)
     if problems:
         return fail("invalid input file(s): " + "; ".join(problems),
@@ -167,7 +204,7 @@ def run_analysis(
         params=params,
         timeout_s=timeout_s,
         max_events=max_events,
-        wants_file_list=data_files is not None,
+        wants_file_list=data_file is None,
     ))
 
     # Describes the run in every result, so a caller chaining analyses can tell
@@ -177,6 +214,7 @@ def run_analysis(
         "input_kind": spec.input_kind,
         "data_files": [str(p) for p in paths],
         "n_input_files": len(paths),
+        **({"inputs_from": resolved.source} if resolved.source else {}),
         **({"parameters": params} if params else {}),
         **({"max_events": max_events} if max_events is not None else {}),
         **({"fcl": str(spec.fcl), "environment": env.describe()}

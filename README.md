@@ -45,6 +45,8 @@ tools/
   spec.py             AnalysisSpec, ParamSpec, RunContext/RunOutcome, ArtifactResult
   mu2e_env.py         where Offline comes from: work area, Musing, or tarball
   mu2e_job.py         running mu2e: -s/-S inputs, logs, timeouts
+  catalog.py          SAM definitions, metacat datasets and registered file
+                      names -> /pnfs paths; tape staging check
   spectrum.py         bin contents on a uniform grid: rebin, regrid, smear
   selection.py        event selections: a safe cut expression over arrays
   registry.py         the catalogue: name -> AnalysisSpec
@@ -91,7 +93,7 @@ layer needs to know about the difference between them:
 | tool | what it does |
 |---|---|
 | `list_analyses()` | catalogue: description, `input_kind`, metric names + units, parameters and their defaults, what the input must contain |
-| `run_analysis(analysis, output_dir, data_file=None, data_files=None, parameters=None, max_events=None, timeout_s=900)` | run one analysis, return its metrics |
+| `run_analysis(analysis, output_dir, data_file=None, data_files=None, dataset=None, max_files=None, parameters=None, max_events=None, timeout_s=900)` | run one analysis, return its metrics |
 
 Both return the same `{status, files, message, metadata}` contract, so a
 workflow can chain several runs and collect `metadata` uniformly.
@@ -168,9 +170,38 @@ Pass **exactly one** of the following — or neither, for an analysis that
 `mu2e-trig-config/ci/data_files.txt`, found by following its `backing`
 links):
 
-- `data_file` — a single absolute art file path → `mu2e -s <file>`
-- `data_files` — a list of absolute art file paths → written one per line to
+- `data_file` — a single input file → `mu2e -s <file>`
+- `data_files` — a list of input files → written one per line to
   `filelist.txt` in `output_dir` → `mu2e -S <filelist.txt>`
+- `dataset` — a catalogued dataset, whose files run as with `data_files`:
+  a SAM definition name, or a metacat DID `<namespace>:<name>`. A bare name
+  that is not a SAM definition is looked up in metacat under its owner's
+  namespace (`nts.mmackenz.X...` → `mmackenz:`). `max_files=N` takes the
+  first N files by name; a dataset over 2000 files needs it.
+
+A file is given either as an absolute path or as the name of a file
+registered in SAM or metacat, bare or as a DID (`mu2e:<name>`). Names and
+datasets are resolved by `tools/catalog.py` to `/pnfs` paths before
+anything else happens:
+
+- Where a file is comes from SAM's location records, then from Mu2e's
+  standard dCache layout (mdh's: `<prefix>/<family>/<tier>/<owner>/<desc>/
+  <config>/<format>/<h0h1>/<h2h3>/<name>`, `h` the sha256 of the name), so a
+  file catalogued only in metacat is found too. The first copy that exists
+  wins, preferring persistent disk, then scratch, then tape.
+- A tape file that is not staged (dCache locality `NEARLINE`) would leave
+  the job waiting on tape, so the run is refused with the command that
+  stages it: `samweb prestage-dataset --defname=<def>` for a SAM
+  definition, `mdh prestage-files <names>` otherwise.
+- SAM and metacat are read over plain HTTPS, without a token or a client.
+  A 500-file definition resolves in about 20 s, most of it the locality
+  checks.
+
+```python
+run_analysis(analysis="count",
+             dataset="mmackenz:dts.mmackenz.CeEndpoint.MDC2025ax.art",
+             max_files=2, max_events=10, output_dir=".../count")
+```
 
 With `data_files` the whole set runs as **one** job, so the metrics cover all
 the inputs together, not one file each — call the tool once per file for
@@ -190,9 +221,12 @@ it writes (`<file>.edep.json`, not listed in `files`), and
 
 ### Results
 
-Every result carries `analysis`, `input_kind`, `data_files`, `n_input_files`,
-`log_path`, the resolved `parameters`, and — for the `-S` case —
-`file_list_path`. `output_dir` can be reused: a rerun overwrites the previous
+Every result carries `analysis`, `input_kind`, `data_files` (the resolved
+paths), `n_input_files`, `log_path`, the resolved `parameters`, and — for the
+`-S` case — `file_list_path`. Catalogued inputs add `inputs_from`: the
+`dataset`, which `catalog` listed it (`sam` or `metacat`) and its
+`n_files_in_dataset`, and how many files came from each dCache
+`locations`. `output_dir` can be reused: a rerun overwrites the previous
 run's ROOT output, log, file list and figures, and `files` reports what this
 run wrote whether or not the name was there before. On success the analysis' metrics are merged into `metadata`
 under the names `list_analyses` advertises. `files` lists what the run wrote:
@@ -698,7 +732,8 @@ goes to `mu2e`, art resolves it on `FHICL_FILE_PATH`, `fcl_exists` comes back
 python3 tests/test_tools.py
 ```
 
-124 tests, none of which start a mu2e job. (The `ana` env has no pytest, so
+133 tests, none of which start a mu2e job or reach SAM or metacat (the
+catalog tests use a fake). (The `ana` env has no pytest, so
 these are bare asserts.)
 
 ## Run the server
