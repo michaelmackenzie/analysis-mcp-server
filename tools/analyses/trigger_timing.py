@@ -18,7 +18,7 @@ import numpy as np
 from ..spec import AnalysisSpec, ParamSpec, RunContext, RunOutcome
 from .trigger import (DEFAULT_PILEUP_LIST, FCL, TIMING_DB_NAME, TriggerError,
                       TriggerRun, default_pileup_inputs, read_timing_db,
-                      run_trigger_job, trigger_paths_param)
+                      run_trigger_job, trigger_job_params)
 
 SKIP_EVENTS = 1
 
@@ -108,7 +108,7 @@ SPEC = AnalysisSpec(
     metrics=METRICS,
     units={name: "ms" for name in METRICS if name.endswith("_ms")},
     parameters=(
-        trigger_paths_param(),
+        *trigger_job_params(),
         ParamSpec(
             name="skip_events",
             description="Events at the start of the job left out of the "

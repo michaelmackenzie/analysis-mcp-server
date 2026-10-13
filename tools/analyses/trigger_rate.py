@@ -14,7 +14,7 @@ event once however many paths pass it.
 from ..spec import AnalysisSpec, ParamSpec, RunContext, RunOutcome
 from .trigger import (DEFAULT_PILEUP_LIST, FCL, TrigReport, TriggerRun,
                       TriggerError, binomial, default_pileup_inputs,
-                      per_path_fractions, run_trigger_job, trigger_paths_param)
+                      per_path_fractions, run_trigger_job, trigger_job_params)
 
 # On-spill microbunch rate: one event per 1695 ns.
 MICROBUNCH_RATE_HZ = 1.0 / 1.695e-6
@@ -106,7 +106,7 @@ SPEC = AnalysisSpec(
     units={"rate_hz": "Hz", "rate_hz_err": "Hz", "onspill_rate_hz": "Hz",
            "event_rate_hz": "Hz", "microbunch_rate_hz": "Hz"},
     parameters=(
-        trigger_paths_param(),
+        *trigger_job_params(),
         ParamSpec(
             name="batch_mode",
             description="Proton batches per accelerator cycle, which sets "

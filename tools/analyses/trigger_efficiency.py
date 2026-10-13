@@ -8,7 +8,7 @@ selection's efficiency in separately.
 
 from ..spec import AnalysisSpec, RunContext, RunOutcome
 from .trigger import (FCL, TrigReport, TriggerRun, binomial,
-                      per_path_fractions, run_trigger_job, trigger_paths_param)
+                      per_path_fractions, run_trigger_job, trigger_job_params)
 
 METRICS = ("n_events", "n_triggered", "efficiency", "efficiency_err")
 
@@ -55,7 +55,7 @@ SPEC = AnalysisSpec(
         "each path's own efficiency (metadata.paths)."
     ),
     metrics=METRICS,
-    parameters=(trigger_paths_param(),),
+    parameters=trigger_job_params(),
     summarize=summarize,
     input_hint=(
         "Signal digi art file(s) the online trigger can run on, e.g. "

@@ -101,16 +101,62 @@ def prescale_module(path: str) -> str:
     return "".join(word[:1].upper() + word[1:] for word in path.split("_")) + "PS"
 
 
-def job_fcl_text(paths: list[tuple[str, int]], base: Path = FCL) -> str:
-    """The run's fcl: the shipped base, then the requested paths and prescales.
+_INCLUDE_LINE = re.compile(r'^#include\s+"[^"]*"[ \t]*$', re.M)
+# A base_fcl is spliced into an #include, so it is a FHICL_FILE_PATH name.
+_FCL_NAME = re.compile(r"^[A-Za-z0-9_./+-]+\.fcl$")
+
+
+def parse_base_fcl(text: str) -> str:
+    """'' or the name of an fcl on FHICL_FILE_PATH to use as the job's base."""
+    name = text.strip()
+    if name and (not _FCL_NAME.match(name) or ".." in name.split("/")
+                 or name.startswith("/")):
+        raise TriggerError(
+            f"base_fcl '{name}' must be a relative fcl name found through "
+            "FHICL_FILE_PATH, e.g. 'trigger/reduced_tracker/redigi_trigger_tuned.fcl'")
+    return name
+
+
+def parse_leading_paths(text: str) -> list[str]:
+    """Comma/space separated path names run before the requested ones."""
+    names = [n for n in re.split(r"[,\s]+", text.strip()) if n]
+    for name in names:
+        if not _PATH_NAME.match(name):
+            raise TriggerError(f"leading_paths: '{name}' does not name a path")
+    return names
+
+
+def job_fcl_text(paths: list[tuple[str, int]], base: Path = FCL, *,
+                 base_fcl: str = "", overrides: str = "",
+                 leading_paths: list[str] = ()) -> str:
+    """The run's fcl: the base, any overrides, then the requested paths and prescales.
+
+    `base_fcl` replaces the shipped base's `#include` (the timing test's menu)
+    with another fcl, found through FHICL_FILE_PATH; what the shipped file
+    sets after that include (the timing database) is kept. `overrides` is
+    FHiCL appended after the base, so it can change anything in it, and may
+    itself `#include` fcl files (e.g. a tuning fcl). The paths and prescales
+    come last, so `trigger_paths` always decides what runs.
+    `leading_paths` are put first in `physics.trigger_paths`, with no
+    prescale, for a base whose output needs one (a re-digitization's
+    TriggerablePath).
 
     The prescale is set for both spill modes, so it holds whichever the input
     is marked as.
     """
-    lines = [base.read_text(encoding="utf-8").rstrip(), "",
-             "# --- set by tools/analyses/trigger.py for this run ---",
-             "physics.trigger_paths : [ "
-             + ", ".join(f'"{name}"' for name, _ in paths) + " ]"]
+    text = base.read_text(encoding="utf-8").rstrip()
+    if base_fcl:
+        text, n = _INCLUDE_LINE.subn(f'#include "{base_fcl}"', text, count=1)
+        if n == 0:
+            text = f'#include "{base_fcl}"\n' + text
+    lines = [text, ""]
+    if overrides.strip():
+        lines += ["# --- fcl_overrides, from the request ---",
+                  overrides.strip(), ""]
+    names = [*leading_paths, *(name for name, _ in paths)]
+    lines += ["# --- set by tools/analyses/trigger.py for this run ---",
+              "physics.trigger_paths : [ "
+              + ", ".join(f'"{name}"' for name in names) + " ]"]
     for name, prescale in paths:
         lines.append(
             f"physics.filters.{prescale_module(name)}.eventModeConfig : [ "
@@ -148,6 +194,52 @@ def trigger_paths_param() -> ParamSpec:
             "online (event number % prescale == 0)."
         ),
         kind="text",
+    )
+
+
+def trigger_job_params() -> tuple[ParamSpec, ...]:
+    """The parameters every trigger analysis takes: the paths, and how the
+    default job's fcl is changed (for testing trigger changes)."""
+    return (
+        trigger_paths_param(),
+        ParamSpec(
+            name="fcl_overrides",
+            description=(
+                "FHiCL text appended to the job's fcl after its base, to "
+                "test a change to the trigger: parameter overrides such as "
+                "'physics.producers.TrigCalHelixFinderDe.HelixFinderAlg."
+                "minNHit : 7', or '#include \"trigger/reduced_tracker/"
+                "helix_tuning.fcl\"' (resolved through FHICL_FILE_PATH, so "
+                "the file must be in the configured code). Applied before "
+                "trigger_paths and the prescales, which always win. Empty "
+                "(the default) runs the menu unchanged."
+            ),
+            default="", kind="text", allow_empty=True,
+        ),
+        ParamSpec(
+            name="base_fcl",
+            description=(
+                "Replace the default base job (mu2e-trig-config's timing "
+                "test of the physics menu) with this fcl, named as on "
+                "FHICL_FILE_PATH, e.g. 'trigger/reduced_tracker/"
+                "redigi_trigger_tuned.fcl' to re-digitize with the reduced "
+                "tracker and run the tuned trigger. The timing database "
+                "setting is kept. Such a base has no Prefetch module, so "
+                "trigger_timing then charges reading the data to the first "
+                "module. Empty (the default) keeps the timing test."
+            ),
+            default="", kind="text", allow_empty=True,
+        ),
+        ParamSpec(
+            name="leading_paths",
+            description=(
+                "Paths put first in physics.trigger_paths, with no prescale "
+                "and not reported, for a base_fcl whose output needs one, "
+                "e.g. 'TriggerablePath' for the redigi_trigger*.fcl bases. "
+                "Names separated by commas or spaces. Empty by default."
+            ),
+            default="", kind="text", allow_empty=True,
+        ),
     )
 
 
@@ -354,11 +446,15 @@ def run_trigger_job(context: RunContext) -> TriggerRun | RunOutcome:
     """
     try:
         paths = parse_trigger_paths(context.params["trigger_paths"])
+        base_fcl = parse_base_fcl(context.params.get("base_fcl", ""))
+        leading = parse_leading_paths(context.params.get("leading_paths", ""))
     except TriggerError as exc:
         return RunOutcome(error=str(exc))
+    overrides = context.params.get("fcl_overrides", "")
     context.outdir.mkdir(parents=True, exist_ok=True)
     fcl = context.outdir / JOB_FCL_NAME
-    fcl.write_text(job_fcl_text(paths), encoding="utf-8")
+    fcl.write_text(job_fcl_text(paths, base_fcl=base_fcl, overrides=overrides,
+                                leading_paths=leading), encoding="utf-8")
     # A stale database must not pass for this run's.
     (context.outdir / TIMING_DB_NAME).unlink(missing_ok=True)
 
@@ -372,6 +468,10 @@ def run_trigger_job(context: RunContext) -> TriggerRun | RunOutcome:
     )
     extra = {"returncode": job.returncode, "job_fcl": str(fcl),
              "prescales": dict(paths)}
+    if base_fcl:
+        extra["base_fcl"] = base_fcl
+    if overrides.strip():
+        extra["fcl_overrides"] = overrides.strip()
     if job.file_list_path is not None:
         extra["file_list_path"] = str(job.file_list_path)
     if job.timed_out:

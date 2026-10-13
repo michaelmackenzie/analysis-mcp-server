@@ -382,6 +382,26 @@ that text with `physics.trigger_paths` and each path's prescale filter set.
 FHiCL can only `#include` through `FHICL_FILE_PATH`, not an absolute path,
 so the base is copied in rather than included.
 
+- **Testing a trigger change.** All three also take `fcl_overrides` (FHiCL
+  appended after the base, which may `#include` a tuning fcl found on
+  `FHICL_FILE_PATH`), `base_fcl` (an fcl to use instead of the timing test)
+  and `leading_paths` (paths put first in `physics.trigger_paths`, unprescaled
+  and not reported). Overrides go before the paths and prescales, which
+  always win. For example the reduced-tracker tuned trigger, re-digitizing
+  an existing digi file:
+
+  ```python
+  parameters={"trigger_paths": "apr_TrkDe_80m70p, cpr_TrkDe_80m70p",
+              "base_fcl": "trigger/reduced_tracker/redigi_trigger_tuned.fcl",
+              "leading_paths": "TriggerablePath"}
+  ```
+
+  or a single cut on the default menu:
+  `"fcl_overrides": "physics.producers.TrigCalHelixFinderDe.HelixFinderAlg.minNHit : 7"`.
+  The files named must be in the configured code. A custom base has no
+  Prefetch module, so `trigger_timing` then charges reading the data to the
+  first module. The `trigger_job.fcl` written to `output_dir` is the exact
+  job, and `metadata` echoes `base_fcl` and `fcl_overrides`.
 - **Prescales are applied in the job**, by each path's `PrescaleEvent` filter
   (`event % prescale == 0`), as online. The overall count therefore carries
   the real overlap between prescaled paths, and a prescaled-away path costs
