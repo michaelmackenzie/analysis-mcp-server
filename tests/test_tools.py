@@ -958,6 +958,29 @@ def test_timing_leaves_out_the_data_fetch_and_the_warm_up_events(tmp_dir):
         raise AssertionError("a missing database should be reported")
 
 
+def test_ignored_modules_are_left_out_of_the_event_and_path_times(tmp_dir):
+    db = Path(tmp_dir) / "triggerTiming.db"
+    _write_timing_db(db)
+    base = trig.read_timing_db(db, skip_events=1)
+    timed = trig.read_timing_db(db, skip_events=1,
+                                ignore=trig.parse_ignore_modules("C, TypeB"))
+    # B (by type) and C (by label) removed: only A's 75% is left
+    assert np.allclose(timed.times, [0.0075, 0.015, 0.0225])
+    assert np.allclose(timed.ignored_times, base.times - timed.times)
+    assert "apr" not in timed.per_path or abs(timed.per_path["apr"]) < 1e-12
+    rows = {r["label"]: r for r in timed.module_table()}
+    assert rows["B"]["counted"] is False and rows["C"]["counted"] is False
+    assert rows["A"]["counted"] is True
+    assert not base.ignored_times.any()
+    assert trig.parse_ignore_modules("") == frozenset()
+    try:
+        trig.parse_ignore_modules("a;b")
+    except trig.TriggerError:
+        pass
+    else:
+        raise AssertionError("accepted a;b")
+
+
 def test_module_timing_counts_the_events_each_module_ran_on(tmp_dir):
     db = Path(tmp_dir) / "triggerTiming.db"
     _write_timing_db(db)

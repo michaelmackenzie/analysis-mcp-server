@@ -434,6 +434,12 @@ so the base is copied in rather than included.
   carries the database and geometry initialization the running trigger
   does not pay, ~1 s against a few ms per event, and would double the mean
   of a few hundred events.
+  `ignore_modules` (labels or module types, comma or space separated) leaves
+  out work the real trigger would not do, such as `makeSD` re-making digis
+  from MC truth in a `base_fcl` re-digitization job: they are timed apart
+  like the fetch, listed in `metadata.modules` with `counted: false`, and
+  their mean time is `metadata.ignored_time_mean_ms`. Names that never ran
+  are in `metadata.ignored_modules_not_seen`, to catch typos.
   `metadata.modules` lists every module in the order it ran, with **N(seen)**
   (`n_seen`, the timed events it ran on after the filters and prescale
   upstream of it in its path, and `seen_fraction`), its time per run (mean,

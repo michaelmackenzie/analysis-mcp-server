@@ -313,11 +313,14 @@ class ModuleTimes:
     label: str
     type: str
     times: list[float] = field(default_factory=list)
+    # set by the caller's ignore list: work the real trigger would not do
+    ignored: bool = False
 
     @property
     def counted(self) -> bool:
-        """False for a data fetch, which is left out of the event time."""
-        return self.type not in FETCH_MODULE_TYPES
+        """False for a data fetch or an ignored module, which are left out of
+        the event time."""
+        return not self.ignored and self.type not in FETCH_MODULE_TYPES
 
     def summary(self, n_events: int) -> dict:
         """N(seen) and the time per run and per event, in ms.
@@ -349,6 +352,7 @@ class EventTimes:
     fetch_times: np.ndarray      # time fetching its data (left out of `times`)
     full_event_times: np.ndarray  # TimeTracker's whole-event time, fetch included
     n_skipped: int
+    ignored_times: np.ndarray    # time in the ignored modules (left out of `times`)
     per_path: dict[str, float]   # mean processing s/event charged to each path
     # every module that ran on a timed event, fetch included, in the order
     # they first ran, keyed "path:label:type"
@@ -378,8 +382,23 @@ class EventTimes:
         return rows
 
 
-def read_timing_db(db: Path, skip_events: int) -> EventTimes:
+def parse_ignore_modules(text: str) -> frozenset[str]:
+    """'modA, modB' -> {'modA', 'modB'}: module labels (or types) to leave out."""
+    names = [n for n in re.split(r"[,\s]+", text.strip()) if n]
+    for name in names:
+        if not _PATH_NAME.match(name):
+            raise TriggerError(f"ignore_modules: '{name}' does not name a module")
+    return frozenset(names)
+
+
+def read_timing_db(db: Path, skip_events: int,
+                   ignore: frozenset[str] = frozenset()) -> EventTimes:
     """Per-event processing times, leaving out the first `skip_events` events.
+
+    Modules whose label or type is in `ignore` are timed apart like the data
+    fetch: simulation the real trigger would not run, e.g. a module that
+    re-makes digis from MC truth. They stay in the module table, flagged
+    `counted: false`, and their total is in `ignored_times`.
 
     An event's processing time is the sum of its modules' times, without the
     data fetch (FETCH_MODULE_TYPES) and the input source, which is timed
@@ -402,6 +421,7 @@ def read_timing_db(db: Path, skip_events: int) -> EventTimes:
     n = max(len(timed), 1)
     times = np.zeros(len(timed))
     fetch = np.zeros(len(timed))
+    ignored = np.zeros(len(timed))
     per_path: dict[str, float] = {}
     per_module: dict[str, ModuleTimes] = {}
     for run, subrun, event, path, label, mtype, t in modules:
@@ -410,8 +430,12 @@ def read_timing_db(db: Path, skip_events: int) -> EventTimes:
             continue
         key = f"{path}:{label}:{mtype}"
         if key not in per_module:
-            per_module[key] = ModuleTimes(path, label, mtype)
+            per_module[key] = ModuleTimes(
+                path, label, mtype, ignored=label in ignore or mtype in ignore)
         per_module[key].times.append(t)
+        if per_module[key].ignored:
+            ignored[i] += t
+            continue
         if mtype in FETCH_MODULE_TYPES:
             fetch[i] += t
             continue
@@ -422,6 +446,7 @@ def read_timing_db(db: Path, skip_events: int) -> EventTimes:
         full_event_times=np.array([t for *_, t in events[skip_events:]],
                                   dtype=np.float64),
         n_skipped=min(skip_events, len(events)),
+        ignored_times=ignored,
         per_path=per_path, modules=per_module,
     )
 
