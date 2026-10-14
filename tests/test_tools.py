@@ -824,6 +824,44 @@ def test_job_fcl_sets_the_paths_and_their_prescales(tmp_dir):
     assert trig.FCL.exists() and "timingTest.fcl" in trig.FCL.read_text()
 
 
+def test_job_fcl_takes_a_base_overrides_and_leading_paths(tmp_dir):
+    base = Path(tmp_dir) / "base.fcl"
+    base.write_text('#include "mu2e-trig-config/test/timingTest.fcl"\n'
+                    'services.TimeTracker.dbOutput.overwrite : true\n')
+    text = trig.job_fcl_text(
+        [("apr_TrkDe_80m70p", 2)], base,
+        base_fcl="trigger/reduced_tracker/redigi_trigger_tuned.fcl",
+        overrides='#include "trigger/reduced_tracker/helix_tuning.fcl"\n'
+                  "physics.producers.X.minNHit : 7",
+        leading_paths=["TriggerablePath"])
+    assert text.startswith('#include "trigger/reduced_tracker/redigi_trigger_tuned.fcl"')
+    assert "timingTest" not in text and "TimeTracker.dbOutput.overwrite" in text
+    # overrides come after the base and before the paths, which always win
+    assert text.index("helix_tuning.fcl") < text.index("physics.trigger_paths")
+    assert 'physics.trigger_paths : [ "TriggerablePath", "apr_TrkDe_80m70p" ]' in text
+    assert "AprTrkDe80m70pPS.eventModeConfig" in text and "prescale: 2" in text
+    plain = trig.job_fcl_text([("apr_TrkDe_80m70p", 1)], base)
+    assert "fcl_overrides" not in plain and "TriggerablePath" not in plain
+
+
+def test_base_fcl_and_leading_paths_refuse_what_cannot_be_included():
+    assert trig.parse_base_fcl("") == ""
+    assert trig.parse_base_fcl(" a/b_c.fcl ") == "a/b_c.fcl"
+    for bad in ("/abs/x.fcl", "../x.fcl", 'x".fcl', "x.txt", "a b.fcl"):
+        try:
+            trig.parse_base_fcl(bad)
+        except trig.TriggerError:
+            continue
+        raise AssertionError(f"accepted {bad!r}")
+    assert trig.parse_leading_paths("A, B C") == ["A", "B", "C"]
+    try:
+        trig.parse_leading_paths("a;b")
+    except trig.TriggerError:
+        pass
+    else:
+        raise AssertionError("accepted a;b")
+
+
 def test_trig_report_parses_events_and_every_path():
     report = trig.parse_trig_report(SAMPLE_TRIGGER_STDOUT)
     assert (report.n_events, report.n_passed) == (200, 182)
@@ -918,6 +956,29 @@ def test_timing_leaves_out_the_data_fetch_and_the_warm_up_events(tmp_dir):
         assert "no timing database" in str(exc)
     else:
         raise AssertionError("a missing database should be reported")
+
+
+def test_ignored_modules_are_left_out_of_the_event_and_path_times(tmp_dir):
+    db = Path(tmp_dir) / "triggerTiming.db"
+    _write_timing_db(db)
+    base = trig.read_timing_db(db, skip_events=1)
+    timed = trig.read_timing_db(db, skip_events=1,
+                                ignore=trig.parse_ignore_modules("C, TypeB"))
+    # B (by type) and C (by label) removed: only A's 75% is left
+    assert np.allclose(timed.times, [0.0075, 0.015, 0.0225])
+    assert np.allclose(timed.ignored_times, base.times - timed.times)
+    assert "apr" not in timed.per_path or abs(timed.per_path["apr"]) < 1e-12
+    rows = {r["label"]: r for r in timed.module_table()}
+    assert rows["B"]["counted"] is False and rows["C"]["counted"] is False
+    assert rows["A"]["counted"] is True
+    assert not base.ignored_times.any()
+    assert trig.parse_ignore_modules("") == frozenset()
+    try:
+        trig.parse_ignore_modules("a;b")
+    except trig.TriggerError:
+        pass
+    else:
+        raise AssertionError("accepted a;b")
 
 
 def test_module_timing_counts_the_events_each_module_ran_on(tmp_dir):

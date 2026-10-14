@@ -17,8 +17,9 @@ import numpy as np
 
 from ..spec import AnalysisSpec, ParamSpec, RunContext, RunOutcome
 from .trigger import (DEFAULT_PILEUP_LIST, FCL, TIMING_DB_NAME, TriggerError,
-                      TriggerRun, default_pileup_inputs, read_timing_db,
-                      run_trigger_job, trigger_paths_param)
+                      TriggerRun, default_pileup_inputs, parse_ignore_modules,
+                      read_timing_db,
+                      run_trigger_job, trigger_job_params)
 
 SKIP_EVENTS = 1
 
@@ -51,7 +52,8 @@ def run(context: RunContext) -> RunOutcome:
         return result
     skip = int(context.params["skip_events"])
     try:
-        timed = read_timing_db(context.outdir / TIMING_DB_NAME, skip)
+        ignore = parse_ignore_modules(context.params.get("ignore_modules", ""))
+        timed = read_timing_db(context.outdir / TIMING_DB_NAME, skip, ignore)
     except TriggerError as exc:
         return RunOutcome(log_path=result.job.log_path, extra=result.extra,
                           error=str(exc))
@@ -61,6 +63,9 @@ def run(context: RunContext) -> RunOutcome:
             error=f"only {timed.times.size} event(s) left to time after "
                   f"skipping {timed.n_skipped}; process more events",
         )
+    seen = {m.label for m in timed.modules.values()} | \
+           {m.type for m in timed.modules.values()}
+    unmatched = sorted(ignore - seen)
     return RunOutcome(
         metrics=timing_metrics(timed.times),
         files=[str(context.outdir / TIMING_DB_NAME)],
@@ -68,6 +73,11 @@ def run(context: RunContext) -> RunOutcome:
         extra={
             **result.extra,
             "skipped_events": timed.n_skipped,
+            "ignored_modules": sorted(ignore),
+            # ignored names that ran on no timed event: a typo, or a module
+            # a filter or prescale kept from running
+            "ignored_modules_not_seen": unmatched,
+            "ignored_time_mean_ms": float(timed.ignored_times.mean() * 1e3),
             # left out of the metrics above, reported so the split is visible
             "fetch_time_mean_ms": float(timed.fetch_times.mean() * 1e3),
             "full_event_time_mean_ms": float(timed.full_event_times.mean() * 1e3),
@@ -108,7 +118,21 @@ SPEC = AnalysisSpec(
     metrics=METRICS,
     units={name: "ms" for name in METRICS if name.endswith("_ms")},
     parameters=(
-        trigger_paths_param(),
+        *trigger_job_params(),
+        ParamSpec(
+            name="ignore_modules",
+            description="Modules left out of the timing, as labels or "
+                        "module types separated by commas or spaces, e.g. "
+                        "'makeSD'. For simulation work the job does that the "
+                        "real trigger would not, such as re-making digis from "
+                        "MC truth. They are removed from the event and path "
+                        "times and listed in metadata.modules with counted = "
+                        "false; their mean time is "
+                        "metadata.ignored_time_mean_ms, and names that never "
+                        "ran are in metadata.ignored_modules_not_seen. Empty "
+                        "(the default) ignores none.",
+            default="", kind="text", allow_empty=True,
+        ),
         ParamSpec(
             name="skip_events",
             description="Events at the start of the job left out of the "
