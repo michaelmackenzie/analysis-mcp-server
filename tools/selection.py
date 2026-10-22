@@ -120,6 +120,37 @@ def _eval(node: ast.AST, variables: Mapping[str, np.ndarray]):
     )
 
 
+def _evaluate(expression: str, variables: Mapping[str, np.ndarray]) -> np.ndarray:
+    try:
+        tree = ast.parse(_pythonize(expression).strip(), mode="eval")
+    except SyntaxError as exc:
+        raise SelectionError(f"expression {expression!r} does not parse: {exc.msg}")
+    _check_names(tree, variables)
+    with np.errstate(all="ignore"):
+        return np.asarray(_eval(tree, variables))
+
+
+def evaluate_expression(expression: str, variables: Mapping[str, np.ndarray],
+                        nevents: int) -> np.ndarray:
+    """One float per event: `expression` (same syntax as a selection) as a
+    quantity rather than a cut, e.g. `p_front - mc_p_front`.
+
+    Raises SelectionError for an empty expression, or one that is a
+    true/false condition rather than a number.
+    """
+    if not expression.strip():
+        raise SelectionError("the expression is empty: name a variable")
+    result = _evaluate(expression, variables)
+    if result.dtype == bool:
+        raise SelectionError(f"{expression!r} is a true/false condition, not a "
+                             "quantity")
+    if result.ndim == 0:
+        return np.full(nevents, float(result))
+    if result.shape != (nevents,):
+        raise SelectionError(f"{expression!r} did not give one value per event")
+    return result.astype(np.float64)
+
+
 def apply_selection(expression: str, variables: Mapping[str, np.ndarray],
                     nevents: int) -> np.ndarray:
     """The boolean mask of the nevents events passing `expression`.
@@ -130,13 +161,7 @@ def apply_selection(expression: str, variables: Mapping[str, np.ndarray],
     """
     if not expression.strip():
         return np.ones(nevents, dtype=bool)
-    try:
-        tree = ast.parse(_pythonize(expression).strip(), mode="eval")
-    except SyntaxError as exc:
-        raise SelectionError(f"selection {expression!r} does not parse: {exc.msg}")
-    _check_names(tree, variables)
-    with np.errstate(all="ignore"):
-        result = np.asarray(_eval(tree, variables))
+    result = _evaluate(expression, variables)
     if result.dtype != bool:
         raise SelectionError(
             f"selection {expression!r} is not a true/false condition "

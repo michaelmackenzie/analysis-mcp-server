@@ -108,6 +108,12 @@ python3 -m analysis_mcp_server --transport stdio [--work-area DIR | --musing 'Si
   downstream-going TT_Front crossing, and fit parameters are taken at the
   TT_Mid segment's index. Add a variable to both `TRACK_VARIABLES` and
   `track_variables`; a test checks that every advertised one is usable.
+  MC truth (`MC_VARIABLES`, `mc_*`) is optional: read only where the file
+  has the branches, and `check_mc_names` turns a request for it on data into
+  a plain error. `evtinfomc/nprotons` is read by full path, because a leaf
+  name filter would also match `evtinfo`'s unfilled `nprotons`.
+  `trigger_efficiency_ntuple_binned` reuses that module's reading and must
+  keep reporting the same overall counts.
 - **`approx_ce_sensitivity` has a numerics trap.** Window sums run outward
   from each window's own edge, never as differences of prefix sums: the DIO
   spectrum spans ~18 orders of magnitude, and cancellation silently zeroes

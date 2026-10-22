@@ -13,8 +13,9 @@ deposition (`edep`), event counts (`count`), muon stopping rate
 (`muon_stop_rate`), approximate CE sensitivity (`approx_ce_sensitivity`),
 muon stops per material (`stop_materials`), and the online trigger's
 efficiency, rate and processing time (`trigger_efficiency`, `trigger_rate`,
-`trigger_timing`), and the trigger efficiency read from EventNtuples
-(`trigger_efficiency_ntuple`). Adding more is one small module each.
+`trigger_timing`), and the trigger efficiency read from EventNtuples,
+overall and as a function of a variable (`trigger_efficiency_ntuple`,
+`trigger_efficiency_ntuple_binned`). Adding more is one small module each.
 
 Built to the same pattern as
 [`spectra-mcp-server`](https://github.com/HEP-KE/spectra-mcp-server), so the
@@ -64,6 +65,8 @@ tools/
     trigger_timing.py          trigger processing time per event on pileup
     trigger_efficiency_ntuple.py  trigger efficiency from EventNtuple
                                trig_<path> branches, for a track selection
+    trigger_efficiency_ntuple_binned.py  the same, in bins of a track or
+                               MC variable (p_front, mc_p_front, mc_npot, ...)
     fullsim/                   full-simulation analyses of EventNtuple
       eventntuple.py           reading EventNtuple/ntuple; MC origin of a track
       cuts.py                  the CE-like track cuts (pyfitter cut-set 80)
@@ -112,6 +115,7 @@ workflow can chain several runs and collect `metadata` uniformly.
 | `trigger_rate` | pileup digi art file(s); default: mu2e-trig-config's CI sample | trigger rate in Hz averaged over the cycle (duty factor from `batch_mode`) and on spill, overall and per path |
 | `trigger_timing` | pileup digi art file(s); default: mu2e-trig-config's CI sample | trigger processing time per event: mean, median, tail; per path and per module |
 | `trigger_efficiency_ntuple` | EventNtuple file(s) with `trig_<path>` branches | of events with a track passing a selection, the fraction any given path accepted, and per path |
+| `trigger_efficiency_ntuple_binned` | EventNtuple file(s) with `trig_<path>` branches | the same, in bins of a track variable or expression (reco or true momentum at the tracker front, beam intensity, ...), with a figure, CSV table and ROOT histograms |
 
 `approx_ce_sensitivity` declares `produced_by = ["edep"]`, so chaining is
 discoverable: run `edep`, then pass the `nts.*.root` from its `files` to the
@@ -500,6 +504,65 @@ leaves the variables need are read, about 2 s per file; `data_files`
 combines several files into one result, with per-file counts in
 `metadata.per_file`.
 
+In a simulated file the selection can also use the track's **MC truth**
+(`MC_VARIABLES`): its sim particle from `trkmcsim` (`mc_pdg`,
+`mc_start_code`, `mc_p_start`, ...), its true crossings from `trksegsmc`
+(`mc_p_front`, `mc_cos_front`, `mc_t_front`, `mc_p_mid`, ...; the MC
+TT_Front crossing is the *earliest* with pz > 0, as the true steps are not
+stored in time order), and the event's true beam intensity `mc_npot`
+(`evtinfomc.nprotons`, protons on target in the microbunch; read by its full
+path, since `evtinfo.nprotons` is a different, unfilled leaf). A file without
+those branches is read without them, and naming an `mc_*` variable on it is
+an error saying the file has no MC truth.
+
+## trigger_efficiency_ntuple_binned
+
+`trigger_efficiency_ntuple` as a curve: the selected events are also binned
+in `variable`, any track variable or an expression of them in the selection
+syntax, and the efficiency (any path, and each path) is reported per bin:
+
+```python
+run_analysis(analysis="trigger_efficiency_ntuple_binned",
+             data_file=".../nts.mu2e.CeMLeadingLogMix1BB.MDC2025au_best_v1_1-001.001430_00000000.root",
+             output_dir=".../eff_vs_npot",
+             parameters={"trigger_paths": "apr_TrkDe_80m70p, cpr_TrkDe_80m70p",
+                         "variable": "mc_npot / 1e6", "low": 0, "high": 80,
+                         "n_bins": 8})
+```
+
+- `variable` (default `p_front`): e.g. `mc_p_front`, `p_front - mc_p_front`,
+  `cos_front`, or the beam intensity `mc_npot / 1e6`. An event with several
+  passing tracks is entered once, at its **first** passing track's value.
+- Binning: `n_bins` uniform bins over `[low, high)` (default 15 over 80-110,
+  2 MeV/c), or explicit `bin_edges` (`"80, 95, 100, 103, 105, 110"`).
+- `trigger_paths` and `selection` are as in `trigger_efficiency_ntuple`, with
+  the same default. For a curve in a true quantity, loosen the cut on the
+  reconstructed one so it does not sculpt the curve. Events without any
+  track are never in the denominator, so a curve in `mc_p_front` is the
+  efficiency given a selected reconstructed track, not the full
+  reconstruction-plus-trigger efficiency.
+
+The overall metrics (`n_selected`, `n_triggered`, `efficiency`, ...) are the
+same as `trigger_efficiency_ntuple`'s at the same selection. Added to them:
+`n_bins`, `n_in_range`, `n_triggered_in_range`, `efficiency_in_range(_err)`,
+and the selected events outside the binning (`n_underflow`, `n_overflow`)
+or with no value (`n_undefined`, e.g. NaN `mc_p_front` for a track with no
+true downstream TT_Front crossing). `metadata.bins` has one row per bin:
+`low`, `high`, `n_selected`, `n_triggered`, `efficiency`, `efficiency_err`
+and `paths` (each path's `passed` and efficiency). Each run writes into
+`output_dir`, overwriting a previous run's:
+
+- `trigger_efficiency_binned.png`: the curve, any path and (for several
+  paths) each one, with the selection as title;
+- `trigger_efficiency_binned.csv`: the `metadata.bins` table;
+- `trigger_efficiency_binned.root`: TH1Ds `selected`, `triggered` and
+  `triggered_<path>` (sumw2 = counts), for a `TEfficiency` in ROOT.
+
+On the CeMLeadingLogMix1BB example file at the default selection, apr or cpr
+`TrkDe_80m70p` is 97-98% efficient up to 40M protons per microbunch and drops
+to about 88% at 50-70M (few events); in `p_front` it rises from about 62% at
+80-82 MeV/c to 97% above 98 MeV/c.
+
 ## approx_ce_sensitivity
 
 A Python conversion of `Mu2eOptAna/scripts/rough_run1a_sensitivity.C`. Signal
@@ -758,7 +821,7 @@ goes to `mu2e`, art resolves it on `FHICL_FILE_PATH`, `fcl_exists` comes back
 python3 tests/test_tools.py
 ```
 
-133 tests, none of which start a mu2e job or reach SAM or metacat (the
+142 tests, none of which start a mu2e job or reach SAM or metacat (the
 catalog tests use a fake). (The `ana` env has no pytest, so
 these are bare asserts.)
 
