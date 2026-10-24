@@ -32,12 +32,13 @@ from tools.analyses.stop_materials import combine_tables, material_rates
 from tools.analyses import trigger as trig
 from tools.analyses.trigger_efficiency import efficiency_metrics
 from tools.analyses import trigger_efficiency_ntuple as ntrig
+from tools.analyses import trigger_efficiency_ntuple_binned as bntrig
 from tools.analyses.trigger_rate import duty_factor, rate_metrics
 from tools.analyses.trigger_timing import timing_metrics
 from tools.mu2e_env import EnvError, Mu2eEnv, configure, current
 from tools.mu2e_job import (build_input_args, root_snapshot,
                             validate_input_paths, written_root_files)
-from tools.selection import SelectionError, apply_selection
+from tools.selection import SelectionError, apply_selection, evaluate_expression
 from tools.spectrum import Kernel, Spectrum
 from tools.spec import FCL_DIR, ParamSpec
 
@@ -406,6 +407,21 @@ def test_selection_fails_a_cut_on_a_missing_value():
     x = {"a": np.array([np.nan, 5.0])}
     assert apply_selection("a > 0", x, 2).tolist() == [False, True]
     assert apply_selection("a <= 0", x, 2).tolist() == [False, False]
+
+
+def test_expression_gives_a_quantity_and_refuses_a_cut():
+    x = {"a": np.array([1.0, 2.0]), "b": np.array([0.5, np.nan])}
+    assert evaluate_expression("a - b", x, 2)[0] == 0.5
+    assert np.isnan(evaluate_expression("a - b", x, 2)[1])
+    assert evaluate_expression("3", x, 2).tolist() == [3.0, 3.0]
+    for bad, words in (("", "empty"), ("a > 1", "true/false"),
+                       ("c", "unknown variable")):
+        try:
+            evaluate_expression(bad, x, 2)
+        except SelectionError as exc:
+            assert words in str(exc), (bad, str(exc))
+        else:
+            raise AssertionError(f"{bad!r} should have been refused")
 
 
 def test_selection_refuses_what_it_should_not_run():
@@ -1157,6 +1173,91 @@ def test_ntuple_efficiency_is_over_events_with_a_selected_track():
     assert metrics["efficiency"] == 1.0 and metrics["efficiency_err"] > 0.0
 
 
+def _ntuple_mc_arrays():
+    """_ntuple_arrays with MC truth: the e- track's particle crosses TT_Front
+    downstream at 105 MeV/c, the step stored after a later TT_Mid step and an
+    earlier upstream TT_Front one; the other two tracks have no true steps."""
+    import awkward as ak
+
+    def step(sid, pz, time, pt=0.0):
+        return {"sid": sid, "time": time,
+                "mom": {"fCoordinates": {"fX": 0.0, "fY": pt, "fZ": pz}}}
+
+    def sim(pdg, code, p):
+        return {"pdg": pdg, "startCode": code, "gen": 0, "time": 600.0,
+                "nhits": 30, "nactive": 28,
+                "mom": {"fCoordinates": {"fX": 0.0, "fY": 0.0, "fZ": p}}}
+
+    arrays = _ntuple_arrays()
+    arrays["trksegsmc"] = ak.Array([
+        [[step(1, 60.0, 905.0, 80.0), step(0, -60.0, 850.0, 80.0),
+          step(0, 63.0, 901.0, 84.0), step(0, 70.0, 990.0, 10.0)], []], [[]]])
+    arrays["trkmcsim"] = ak.Array([[[sim(11, 168, 104.9), sim(13, 0, 50.0)], []],
+                                   [[sim(-11, 179, 70.0)]]])
+    arrays[ntrig.NPOT_BRANCH] = ak.Array([3.0e7, 1.5e7])
+    return arrays
+
+
+def test_ntuple_mc_variables_take_the_earliest_downstream_front_crossing():
+    v = ntrig.track_variables(_ntuple_mc_arrays())
+    assert abs(v["mc_p_front"][0] - 105.0) < 1e-4 and v["mc_t_front"][0] == 901.0
+    assert abs(v["mc_cos_front"][0] - 63.0 / 105.0) < 1e-6
+    assert v["mc_p_mid"][0] == 100.0 and v["mc_has_front"].tolist() == [True, False, False]
+    assert np.isnan(v["mc_p_front"][1]) and np.isnan(v["mc_pdg"][1])  # no MC
+    assert v["mc_pdg"].tolist()[::2] == [11, -11] and v["mc_start_code"][2] == 179
+    assert abs(v["mc_p_start"][0] - 104.9) < 1e-4
+    assert v["mc_npot"].tolist() == [3.0e7, 3.0e7, 1.5e7]     # per event
+    assert set(v) - {"_event"} == set(ntrig.TRACK_VARIABLES) | set(ntrig.MC_VARIABLES)
+    for name in ntrig.MC_VARIABLES:
+        apply_selection(f"{name} == {name}", v, v["_event"].size)
+
+
+def test_ntuple_mc_variables_on_data_say_there_is_no_truth():
+    v = ntrig.track_variables(_ntuple_arrays())
+    ntrig.check_mc_names(v, "p_front > 80")                   # no MC asked for
+    try:
+        ntrig.check_mc_names(v, "p_front > 80", "mc_npot / 1e6")
+    except ntrig.NtupleError as exc:
+        assert "mc_npot" in str(exc) and "no " in str(exc)
+    else:
+        raise AssertionError("mc_npot on a file without MC should be refused")
+
+
+def test_binned_ntuple_edges_are_uniform_or_explicit():
+    assert bntrig.bin_edges(3, 80, 110, "").tolist() == [80, 90, 100, 110]
+    assert bntrig.bin_edges(3, 80, 110, "0, 1 5").tolist() == [0, 1, 5]
+    for args in ((3, 110, 80, ""), (2.5, 0, 1, ""), (3, 0, 1, "1, 1, 2"),
+                 (3, 0, 1, "5"), (3, 0, 1, "a, b")):
+        try:
+            bntrig.bin_edges(*args)
+        except ntrig.NtupleError:
+            pass
+        else:
+            raise AssertionError(f"{args} should have been refused")
+
+
+def test_binned_ntuple_enters_each_event_once_at_its_first_selected_track():
+    variables = {"_event": np.array([0, 0, 1, 2, 3]),
+                 "p": np.array([50.0, 95.0, 105.0, 101.0, 120.0]),
+                 "q": np.array([1.0, 1.0, 1.0, np.nan, 1.0])}
+    selected, value, n_tracks = bntrig.event_values(variables, 5, "p > 90", "p * q")
+    assert selected.tolist() == [True, True, True, True, False] and n_tracks == 4
+    assert value[:2].tolist() == [95.0, 105.0] and np.isnan(value[2])
+    triggers = {"a": np.array([True, False, True, True, True]),
+                "b": np.array([False, True, False, False, False])}
+    edges = np.array([90.0, 100.0, 104.0])
+    counts = bntrig.binned_counts(selected, value, triggers, edges)
+    assert counts["selected"].tolist() == [1, 0] and counts["n_overflow"] == 2
+    assert counts["n_undefined"] == 1 and counts["n_underflow"] == 0
+    assert counts["n_selected"] == 4 and counts["n_triggered"] == 4
+    both = bntrig.add_counts(counts, counts)
+    assert both["selected"].tolist() == [2, 0] and both["per_path"] == {"a": 6, "b": 2}
+    rows = bntrig.bin_rows(both, edges)
+    assert rows[0]["efficiency"] == 1.0 and rows[0]["paths"]["b"]["passed"] == 0
+    metrics = bntrig.binned_metrics(both, 8, 2)
+    assert tuple(metrics) == bntrig.METRICS and metrics["n_in_range"] == 2.0
+
+
 def test_ntuple_trigger_efficiency_on_a_real_file(tmp_dir):
     if not NTUPLE_FILE.exists():
         return
@@ -1174,6 +1275,28 @@ def test_ntuple_trigger_efficiency_on_a_real_file(tmp_dir):
                            data_file=str(NTUPLE_FILE), output_dir=tmp_dir,
                            parameters={"trigger_paths": "not_a_path"})
     assert missing.status == "error" and "It has: " in missing.message
+
+
+def test_binned_ntuple_trigger_efficiency_on_a_real_file(tmp_dir):
+    if not NTUPLE_FILE.exists():
+        return
+    paths = "apr_TrkDe_80m70p, cpr_TrkDe_80m70p"
+    overall = run_analysis(analysis="trigger_efficiency_ntuple",
+                           data_file=str(NTUPLE_FILE), output_dir=tmp_dir,
+                           parameters={"trigger_paths": paths})
+    for variable, low, high in (("p_front", 80, 110), ("mc_npot / 1e6", 0, 50)):
+        result = run_analysis(analysis="trigger_efficiency_ntuple_binned",
+                              data_file=str(NTUPLE_FILE), output_dir=tmp_dir,
+                              parameters={"trigger_paths": paths, "variable": variable,
+                                          "low": low, "high": high})
+        assert result.status == "success", result.message
+        meta = result.metadata
+        for key in ("n_selected", "n_triggered", "efficiency"):   # same events
+            assert meta[key] == overall.metadata[key], key
+        assert sum(r["n_selected"] for r in meta["bins"]) == meta["n_in_range"]
+        assert (meta["n_in_range"] + meta["n_underflow"] + meta["n_overflow"]
+                + meta["n_undefined"]) == meta["n_selected"]
+        assert len(result.files) == 3 and all(Path(f).exists() for f in result.files)
 
 
 # --- stop_materials ----------------------------------------------------------
