@@ -199,19 +199,38 @@ def track_variables(arrays) -> dict[str, np.ndarray]:
 
 # --- reading ---------------------------------------------------------------------
 
+def open_tree(path: Path):
+    """The file's EventNtuple tree, or an NtupleError saying it has none."""
+    import uproot
+
+    try:
+        return uproot.open(path)[TREE_PATH]
+    except (KeyError, OSError, ValueError) as exc:
+        raise NtupleError(f"{path}: no {TREE_PATH} ({exc}) — is this an "
+                          "EventNtuple file?") from None
+
+
+def read_track_arrays(tree, path: Path, extra_leaves: tuple[str, ...] = ()):
+    """LEAVES plus `extra_leaves`, as awkward arrays (events * tracks ...).
+
+    A caller with extra leaves checks they exist first, to say what kind of
+    file would have them.
+    """
+    names = {key.rsplit("/", 1)[-1] for key in tree.keys()}
+    absent = [leaf for leaf in LEAVES if leaf not in names]
+    if absent:
+        raise NtupleError(f"{path.name}: missing branch(es) {', '.join(absent)} "
+                          "— an EventNtuple version this analysis does not know?")
+    return tree.arrays(filter_name=[*LEAVES, *extra_leaves], library="ak")
+
+
 def read_file(path: Path, paths: list[str]) -> tuple[dict, dict[str, np.ndarray], int]:
     """(track variables, {path: per-event decision}, number of events).
 
     With no `paths`, only the track variables are read (no trig_ branches
     needed), as selection_efficiency_ntuple does.
     """
-    import uproot
-
-    try:
-        tree = uproot.open(path)[TREE_PATH]
-    except (KeyError, OSError, ValueError) as exc:
-        raise NtupleError(f"{path}: no {TREE_PATH} ({exc}) — is this an "
-                          "EventNtuple file?") from None
+    tree = open_tree(path)
     available = [k[len(TRIGGER_PREFIX):] for k in tree.keys(recursive=False)
                  if k.startswith(TRIGGER_PREFIX)]
     missing = [p for p in paths if p not in available]
@@ -220,12 +239,7 @@ def read_file(path: Path, paths: list[str]) -> tuple[dict, dict[str, np.ndarray]
             f"{path.name}: no trigger branch for {', '.join(missing)}. "
             f"It has: {', '.join(available) or '(none)'}"
         )
-    names = {key.rsplit("/", 1)[-1] for key in tree.keys()}
-    absent = [leaf for leaf in LEAVES if leaf not in names]
-    if absent:
-        raise NtupleError(f"{path.name}: missing branch(es) {', '.join(absent)} "
-                          "— an EventNtuple version this analysis does not know?")
-    arrays = tree.arrays(filter_name=list(LEAVES), library="ak")
+    arrays = read_track_arrays(tree, path)
     triggers: dict[str, np.ndarray] = {}
     if paths:
         decisions = tree.arrays(filter_name=[TRIGGER_PREFIX + p for p in paths],

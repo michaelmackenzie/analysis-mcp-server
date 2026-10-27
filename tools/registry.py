@@ -16,7 +16,7 @@ from .spec import AnalysisSpec
 _ANALYSIS_MODULES = ("edep", "count", "muon_stop_rate", "approx_ce_sensitivity",
                      "stop_materials", "trigger_efficiency", "trigger_rate",
                      "trigger_timing", "trigger_efficiency_ntuple",
-                     "selection_efficiency_ntuple",
+                     "selection_efficiency_ntuple", "momentum_resolution_ntuple",
                      "fullsim.sensitivity")
 
 

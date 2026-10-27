@@ -111,6 +111,7 @@ workflow can chain several runs and collect `metadata` uniformly.
 | `trigger_timing` | pileup digi art file(s); default: mu2e-trig-config's CI sample | trigger processing time per event: mean, median, tail; per path and per module |
 | `trigger_efficiency_ntuple` | EventNtuple file(s) with `trig_<path>` branches | of events with a track passing a selection, the fraction any given path accepted, and per path |
 | `selection_efficiency_ntuple` | EventNtuple file(s) | fraction of events with a track passing a selection, of all ntuple events or of those passing a `denominator` cut |
+| `momentum_resolution_ntuple` | simulated EventNtuple file(s) (MC truth) | momentum resolution and energy loss before the tracker for tracks passing a selection: plots, histograms, mean/rms/median/sigma68 |
 
 `approx_ce_sensitivity` declares `produced_by = ["edep"]`, so chaining is
 discoverable: run `edep`, then pass the `nts.*.root` from its `files` to the
@@ -469,6 +470,48 @@ Of those, 6503 (90.6%) have a track at 100 < p_front < 110 MeV/c. Track
 counts are in `n_tracks_denominator` and `n_tracks_passed`, and `data_files`
 combines several files, with per-file counts in `metadata.per_file`.
 
+## momentum_resolution_ntuple
+
+The two parts of the tracker's momentum response, from the MC truth in a
+simulated EventNtuple, for every track passing `selection`:
+
+- **resolution**: reconstructed minus true momentum at the tracker front
+  (TT_Front), i.e. how well the fit measures the momentum it sees;
+- **energy loss**: true momentum at birth minus true momentum at TT_Front,
+  i.e. what the particle lost before reaching the tracker.
+
+Their difference, reconstructed at TT_Front minus true at birth, is the
+combined response `fullsim_sensitivity` folds the DIO spectrum with.
+
+```python
+run_analysis(analysis="momentum_resolution_ntuple",
+             data_file=".../nts.mu2e.CeMLeadingLogMix1BB.MDC2025au_best_v1_1-001.001430_00000000.root",
+             output_dir=".../resolution",
+             parameters={"selection": "status == 1 and pdg == 11 and downstream "
+                                      "and p_front > 80 and mc_startcode == 168"})
+```
+
+The truth comes from the track's own branches: `trksegsmc` (true steps at
+each surface) and the first entry of `trkmcsim` (the track's particle). As
+for the reconstructed `*_front` variables, the true TT_Front step is the
+first downstream-going one. On top of `trigger_efficiency_ntuple`'s track
+variables, the selection can use `mc_p_front`, `mc_p_birth`, `mc_pdg`,
+`mc_startcode`, `resolution` and `energy_loss`. Its default is that
+analysis's default cut. A file without `trksegsmc`/`trkmcsim` (e.g. data) is
+refused with a message saying the analysis needs simulation.
+
+Both distributions have long tails, so besides the mean and rms the metrics
+give the median and `sigma68`, half the width of the central 68% (the sigma
+of a Gaussian, without a fit), and `energy_loss_p90`. The metrics use every
+track; the `*_min`/`*_max`/`*_bin_width` parameters set only the histograms
+(`momentum_resolution.root`, TH1D `resolution` and `energy_loss`) and the
+plots (`figures/resolution.png`, `figures/energy_loss.png`). How many tracks
+fall outside them is in `metadata.outside_histogram_range`. On the
+CeMLeadingLogMix1BB example file, with the default selection, 7192 tracks
+in 7178 events give a resolution sigma68 of 0.22 MeV/c (median -0.005, rms
+1.5) and an energy loss with median 0.73 MeV/c (mean 1.39, 90% below
+2.5 MeV/c).
+
 ## approx_ce_sensitivity
 
 A Python conversion of `Mu2eOptAna/scripts/rough_run1a_sensitivity.C`. Signal
@@ -727,7 +770,7 @@ goes to `mu2e`, art resolves it on `FHICL_FILE_PATH`, `fcl_exists` comes back
 python3 tests/test_tools.py
 ```
 
-128 tests, none of which start a mu2e job. (The `ana` env has no pytest, so
+133 tests, none of which start a mu2e job. (The `ana` env has no pytest, so
 these are bare asserts.)
 
 ## Run the server

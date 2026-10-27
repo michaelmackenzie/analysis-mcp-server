@@ -33,6 +33,7 @@ from tools.analyses import trigger as trig
 from tools.analyses.trigger_efficiency import efficiency_metrics
 from tools.analyses import trigger_efficiency_ntuple as ntrig
 from tools.analyses import selection_efficiency_ntuple as nsel
+from tools.analyses import momentum_resolution_ntuple as nres
 from tools.analyses.trigger_rate import duty_factor, rate_metrics
 from tools.analyses.trigger_timing import timing_metrics
 from tools.mu2e_env import EnvError, Mu2eEnv, configure, current
@@ -1147,7 +1148,10 @@ def test_selection_efficiency_refuses_a_bad_cut_and_needs_a_selection(tmp_dir):
         raise AssertionError("an unknown variable should have been refused")
     result = run_analysis(analysis="selection_efficiency_ntuple",
                           data_file="/a.root", output_dir=tmp_dir)
-    assert result.status == "error" and "selection" in result.message
+    # not just "selection" in the message: the analysis name contains it too
+    assert result.status == "error", result.message
+    assert "missing required parameter(s)" in result.message, result.message
+    assert result.message.endswith(": selection"), result.message
 
 
 def test_selection_efficiency_on_a_real_file(tmp_dir):
@@ -1168,6 +1172,121 @@ def test_selection_efficiency_on_a_real_file(tmp_dir):
     assert narrower.status == "success", narrower.message
     assert narrower.metadata["n_denominator"] == 7178
     assert 0 < narrower.metadata["n_passed"] < 7178
+
+
+def _ntuple_mc_arrays():
+    """_ntuple_arrays plus truth. Event 0's good track (reconstructed at 104
+    MeV/c) was born at 105 MeV/c and crossed TT_Front upstream first, then
+    downstream at 104.5; its segment-less track has no truth. Event 1's
+    upstream-going track never crosses TT_Front downstream."""
+    import awkward as ak
+
+    def step(sid, pz, p):
+        return {"sid": sid, "mom": {"fCoordinates": {
+            "fX": 0.0, "fY": float(np.sqrt(p * p - pz * pz)), "fZ": pz}}}
+
+    def sim(p, pdg=11, code=168):
+        return {"pdg": pdg, "startCode": code,
+                "mom": {"fCoordinates": {"fX": 0.0, "fY": 0.0, "fZ": p}}}
+
+    arrays = dict(_ntuple_arrays())
+    arrays["trksegsmc"] = ak.Array([
+        [[step(0, -80.0, 104.8), step(0, 66.0, 104.5), step(1, 65.0, 104.4)], []],
+        [[step(1, -60.0, 92.0)]]])
+    arrays["trkmcsim"] = ak.Array([[[sim(105.0), sim(30.0, 13, 0)], []],
+                                   [[sim(93.0, -11, 166)]]])
+    return arrays
+
+
+def test_resolution_compares_the_downstream_true_front_with_the_reco_one():
+    arrays = _ntuple_mc_arrays()
+    reco = ntrig.track_variables(arrays)
+    mc = nres.mc_variables(arrays, reco)
+    assert abs(mc["mc_p_front"][0] - 104.5) < 1e-4          # not the upstream leg
+    assert abs(mc["resolution"][0] - (104.0 - 104.5)) < 1e-3
+    assert abs(mc["energy_loss"][0] - (105.0 - 104.5)) < 1e-4
+    assert mc["mc_pdg"].tolist()[0::2] == [11, -11]           # the track's own
+    assert mc["mc_startcode"][2] == 166 and mc["mc_p_birth"][2] == 93.0
+    for name in ("mc_p_front", "mc_p_birth", "resolution", "energy_loss"):
+        assert np.isnan(mc[name][1]), name                    # no truth at all
+    assert np.isnan(mc["mc_p_front"][2]) and np.isnan(mc["resolution"][2])
+    assert set(mc) == set(nres.MC_VARIABLES)
+    variables = {**reco, **mc}
+    for name in nres.MC_VARIABLES:                 # every advertised one is usable
+        nres.select_tracks(variables, f"{name} == {name}")
+    assert nres.select_tracks(variables, "mc_startcode == 168").tolist() == [
+        True, False, False]
+
+
+def test_resolution_sigma68_is_the_gaussian_sigma_and_ignores_the_tail():
+    rng = np.random.default_rng(1)
+    core = rng.normal(0.0, 0.2, 100_000)
+    s = nres.summary(core, "x")
+    assert abs(s["x_sigma68"] - 0.2) < 0.004 and abs(s["x_median"]) < 0.004
+    assert abs(s["x_rms"] - 0.2) < 0.004
+    # a 2% tail far out moves the rms a lot and sigma68 hardly at all
+    tailed = np.concatenate([core, np.full(2_000, -20.0), [np.nan]])
+    t = nres.summary(tailed, "x")
+    assert t["x_rms"] > 2.0 and abs(t["x_sigma68"] - 0.2) < 0.01
+
+
+def test_resolution_writes_histograms_and_refuses_bad_binning(tmp_dir):
+    import uproot
+    params = {name: p.default for name, p in
+              ((p.name, p) for p in nres.SPEC.parameters)}
+    nres._check_binning(params)
+    for bad in ({"resolution_max": -5.0}, {"energy_loss_bin_width": 1e-6}):
+        try:
+            nres._check_binning({**params, **bad})
+        except nres.ResolutionError as exc:
+            assert next(iter(bad)) in str(exc) or "resolution_max" in str(exc)
+        else:
+            raise AssertionError(f"{bad} should have been refused")
+    res = np.array([-0.1, 0.0, 0.02, 9.0])                    # 9.0 off the axis
+    eloss = np.array([0.5, 0.7, 1.5, 2.0])
+    metrics = nres.resolution_metrics(
+        {"n_events": 3, "n_events_selected": 3, "n_tracks_selected": 4}, res, eloss)
+    assert tuple(metrics) == nres.METRICS and metrics["n_tracks_with_truth"] == 4
+    hists = {"resolution": nres.histogram(res, -5.0, 3.0, 0.05, "resolution"),
+             "energy_loss": nres.histogram(eloss, 0.0, 10.0, 0.1, "energy_loss")}
+    assert hists["resolution"].values.size == 160 and hists["resolution"].values.sum() == 3
+    files = nres._write_outputs(Path(tmp_dir), hists, metrics, "")
+    assert [Path(f).name for f in files] == ["momentum_resolution.root",
+                                             "resolution.png", "energy_loss.png"]
+    with uproot.open(files[0]) as f:
+        assert f["energy_loss"].values().tolist() == hists["energy_loss"].values.tolist()
+
+
+def test_resolution_says_a_file_without_truth_needs_simulation(tmp_dir):
+    import uproot
+    path = Path(tmp_dir) / "data.root"
+    with uproot.recreate(path) as f:
+        f.mkdir("EventNtuple").mktree("ntuple", {"event": "int32"}).extend(
+            {"event": np.arange(3, dtype=np.int32)})
+    result = run_analysis(analysis="momentum_resolution_ntuple",
+                          data_file=str(path), output_dir=tmp_dir)
+    assert result.status == "error" and "MC truth" in result.message, result.message
+
+
+def test_resolution_on_a_real_file(tmp_dir):
+    if not NTUPLE_FILE.exists():
+        return
+    result = run_analysis(analysis="momentum_resolution_ntuple",
+                          data_file=str(NTUPLE_FILE), output_dir=tmp_dir)
+    assert result.status == "success", result.message
+    meta = result.metadata
+    # the default selection is trigger_efficiency_ntuple's: the same 7178 events
+    assert meta["n_events_selected"] == 7178
+    assert meta["n_tracks_with_truth"] <= meta["n_tracks_selected"]
+    assert 0.1 < meta["resolution_sigma68"] < 0.5 and abs(meta["resolution_median"]) < 0.1
+    assert 0.0 < meta["energy_loss_median"] < meta["energy_loss_mean"]  # a long tail
+    assert all(Path(f).exists() for f in result.files) and len(result.files) == 3
+    ce = run_analysis(analysis="momentum_resolution_ntuple",
+                      data_file=str(NTUPLE_FILE), output_dir=tmp_dir,
+                      parameters={"selection": ntrig.DEFAULT_SELECTION
+                                  + " and mc_startcode == 168"})
+    assert ce.status == "success", ce.message
+    assert ce.metadata["n_tracks_with_truth"] <= meta["n_tracks_with_truth"]
 
 
 # --- stop_materials ----------------------------------------------------------
