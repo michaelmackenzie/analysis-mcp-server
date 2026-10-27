@@ -110,6 +110,7 @@ workflow can chain several runs and collect `metadata` uniformly.
 | `trigger_rate` | pileup digi art file(s); default: mu2e-trig-config's CI sample | trigger rate in Hz averaged over the cycle (duty factor from `batch_mode`) and on spill, overall and per path |
 | `trigger_timing` | pileup digi art file(s); default: mu2e-trig-config's CI sample | trigger processing time per event: mean, median, tail; per path and per module |
 | `trigger_efficiency_ntuple` | EventNtuple file(s) with `trig_<path>` branches | of events with a track passing a selection, the fraction any given path accepted, and per path |
+| `selection_efficiency_ntuple` | EventNtuple file(s) | fraction of events with a track passing a selection, of all ntuple events or of those passing a `denominator` cut |
 
 `approx_ce_sensitivity` declares `produced_by = ["edep"]`, so chaining is
 discoverable: run `edep`, then pass the `nts.*.root` from its `files` to the
@@ -440,6 +441,34 @@ leaves the variables need are read, about 2 s per file; `data_files`
 combines several files into one result, with per-file counts in
 `metadata.per_file`.
 
+## selection_efficiency_ntuple
+
+A plain selection efficiency from EventNtuple file(s): the fraction of events
+with a track passing `selection`, using the same track variables as
+`trigger_efficiency_ntuple` (`TRACK_VARIABLES`), so a cut means the same thing
+in both:
+
+```python
+run_analysis(analysis="selection_efficiency_ntuple",
+             data_file=".../nts.mu2e.CeMLeadingLogMix1BB.MDC2025au_best_v1_1-001.001430_00000000.root",
+             output_dir=".../sel_eff",
+             parameters={"selection": "100 < p_front < 110",
+                         "denominator": "status == 1 and pdg == 11 and downstream "
+                                        "and p_front > 80 and nactive >= 15 "
+                                        "and chisq / ndof < 5"})
+```
+
+`selection` is required. `denominator` defaults to `""`, which is every event
+in the ntuple, including events with no track. An event passes when **one and
+the same track** passes both cuts, so the passing events are always a subset
+of the denominator events. The denominator counts ntuple entries, not
+generated events: a production ntuple may already have dropped events
+upstream. On the CeMLeadingLogMix1BB example file, the
+`trigger_efficiency_ntuple` default cut passes 7178 of 8212 events (87.4%).
+Of those, 6503 (90.6%) have a track at 100 < p_front < 110 MeV/c. Track
+counts are in `n_tracks_denominator` and `n_tracks_passed`, and `data_files`
+combines several files, with per-file counts in `metadata.per_file`.
+
 ## approx_ce_sensitivity
 
 A Python conversion of `Mu2eOptAna/scripts/rough_run1a_sensitivity.C`. Signal
@@ -698,7 +727,7 @@ goes to `mu2e`, art resolves it on `FHICL_FILE_PATH`, `fcl_exists` comes back
 python3 tests/test_tools.py
 ```
 
-124 tests, none of which start a mu2e job. (The `ana` env has no pytest, so
+128 tests, none of which start a mu2e job. (The `ana` env has no pytest, so
 these are bare asserts.)
 
 ## Run the server

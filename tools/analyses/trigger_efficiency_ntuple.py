@@ -200,7 +200,11 @@ def track_variables(arrays) -> dict[str, np.ndarray]:
 # --- reading ---------------------------------------------------------------------
 
 def read_file(path: Path, paths: list[str]) -> tuple[dict, dict[str, np.ndarray], int]:
-    """(track variables, {path: per-event decision}, number of events)."""
+    """(track variables, {path: per-event decision}, number of events).
+
+    With no `paths`, only the track variables are read (no trig_ branches
+    needed), as selection_efficiency_ntuple does.
+    """
     import uproot
 
     try:
@@ -222,10 +226,12 @@ def read_file(path: Path, paths: list[str]) -> tuple[dict, dict[str, np.ndarray]
         raise NtupleError(f"{path.name}: missing branch(es) {', '.join(absent)} "
                           "— an EventNtuple version this analysis does not know?")
     arrays = tree.arrays(filter_name=list(LEAVES), library="ak")
-    decisions = tree.arrays(filter_name=[TRIGGER_PREFIX + p for p in paths],
-                            library="np")
-    triggers = {p: np.asarray(decisions[TRIGGER_PREFIX + p], dtype=bool)
-                for p in paths}
+    triggers: dict[str, np.ndarray] = {}
+    if paths:
+        decisions = tree.arrays(filter_name=[TRIGGER_PREFIX + p for p in paths],
+                                library="np")
+        triggers = {p: np.asarray(decisions[TRIGGER_PREFIX + p], dtype=bool)
+                    for p in paths}
     return track_variables(arrays), triggers, tree.num_entries
 
 

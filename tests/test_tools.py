@@ -32,6 +32,7 @@ from tools.analyses.stop_materials import combine_tables, material_rates
 from tools.analyses import trigger as trig
 from tools.analyses.trigger_efficiency import efficiency_metrics
 from tools.analyses import trigger_efficiency_ntuple as ntrig
+from tools.analyses import selection_efficiency_ntuple as nsel
 from tools.analyses.trigger_rate import duty_factor, rate_metrics
 from tools.analyses.trigger_timing import timing_metrics
 from tools.mu2e_env import EnvError, Mu2eEnv, configure, current
@@ -1113,6 +1114,60 @@ def test_ntuple_trigger_efficiency_on_a_real_file(tmp_dir):
                            data_file=str(NTUPLE_FILE), output_dir=tmp_dir,
                            parameters={"trigger_paths": "not_a_path"})
     assert missing.status == "error" and "It has: " in missing.message
+
+
+def test_selection_efficiency_counts_every_ntuple_event_by_default():
+    v = ntrig.track_variables(_ntuple_arrays())
+    # a third event with no track at all still counts in the denominator
+    counts = nsel.efficiency_counts(v, 3, ntrig.DEFAULT_SELECTION)
+    assert counts["n_denominator"] == 3 and counts["n_tracks_denominator"] == 3
+    assert counts["n_passed"] == 1 and counts["n_tracks_passed"] == 1
+    metrics = nsel.efficiency_metrics(counts)
+    assert abs(metrics["efficiency"] - 1 / 3) < 1e-12 and metrics["efficiency_err"] > 0
+    assert tuple(metrics) == nsel.METRICS
+
+
+def test_selection_efficiency_needs_one_track_to_pass_both_cuts():
+    v = ntrig.track_variables(_ntuple_arrays())
+    counts = nsel.efficiency_counts(v, 3, "pdg == 11", denominator="nactive >= 25")
+    assert counts["n_denominator"] == 2 and counts["n_passed"] == 1
+    # event 0's short track passes the denominator and its good track the
+    # selection: not the same track, so the event does not pass
+    split = nsel.efficiency_counts(v, 3, "p_front > 100", denominator="nactive < 10")
+    assert split["n_denominator"] == 1 and split["n_passed"] == 0
+
+
+def test_selection_efficiency_refuses_a_bad_cut_and_needs_a_selection(tmp_dir):
+    v = ntrig.track_variables(_ntuple_arrays())
+    try:
+        nsel.efficiency_counts(v, 2, "p_front > 100", denominator="no_such_var > 1")
+    except SelectionError as exc:
+        assert "no_such_var" in str(exc)
+    else:
+        raise AssertionError("an unknown variable should have been refused")
+    result = run_analysis(analysis="selection_efficiency_ntuple",
+                          data_file="/a.root", output_dir=tmp_dir)
+    assert result.status == "error" and "selection" in result.message
+
+
+def test_selection_efficiency_on_a_real_file(tmp_dir):
+    if not NTUPLE_FILE.exists():
+        return
+    result = run_analysis(analysis="selection_efficiency_ntuple",
+                          data_file=str(NTUPLE_FILE), output_dir=tmp_dir,
+                          parameters={"selection": ntrig.DEFAULT_SELECTION})
+    assert result.status == "success", result.message
+    meta = result.metadata
+    # the same events trigger_efficiency_ntuple selects (README: 7178 of 8212)
+    assert meta["n_events"] == 8212 and meta["n_denominator"] == 8212
+    assert meta["n_passed"] == 7178
+    narrower = run_analysis(analysis="selection_efficiency_ntuple",
+                            data_file=str(NTUPLE_FILE), output_dir=tmp_dir,
+                            parameters={"selection": "100 < p_front < 110",
+                                        "denominator": ntrig.DEFAULT_SELECTION})
+    assert narrower.status == "success", narrower.message
+    assert narrower.metadata["n_denominator"] == 7178
+    assert 0 < narrower.metadata["n_passed"] < 7178
 
 
 # --- stop_materials ----------------------------------------------------------
