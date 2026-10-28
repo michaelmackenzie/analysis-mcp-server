@@ -1,0 +1,38 @@
+# Per-event occupancy (collection sizes) of the tracker, calorimeter and CRV, from OccupancyAna
+# (Offline/Analyses/src/OccupancyAna_module.cc, Offline PR #2070). Based on
+# Offline/Analyses/test/occupancy.fcl.
+#
+# This file configures no collection on purpose: OccupancyAna throws if none is configured. The
+# occupancy_digi and occupancy_reco analyses write a per-run copy of this file (tools/analyses/
+# occupancy.py) with the collection tags the caller asked for appended, e.g.
+#   physics.analyzers.OccupancyAna.StrawHitCollection : "makeSH"
+# A collection left out is skipped; one configured but missing from an event counts as -1.
+
+#include "Offline/fcl/minimalMessageService.fcl"
+#include "Offline/fcl/standardServices.fcl"
+
+process_name : Occupancy
+
+services : @local::Services.Core
+
+source: {
+  module_type: RootInput
+}
+services.TFileService.fileName : "nts.owner.occupancy.version.sequencer.root"
+
+physics : {
+
+  analyzers : {
+    OccupancyAna : {
+      module_type      : OccupancyAna
+      # Window for the *_sel hit counts (times in ns, energy in MeV)
+      HitTimeMin       : -1.e9
+      HitTimeMax       : 1.e9
+      CaloHitEnergyMin : 0.
+      RequireAll       : false
+      DebugLevel       : 0
+    }
+  }
+  EndPath : [ OccupancyAna ]
+  end_paths : [ EndPath ]
+}

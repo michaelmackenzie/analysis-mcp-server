@@ -8,6 +8,7 @@ a Musing, or a code tarball — is `mu2e_env`'s business; this module asks it
 for the commands and for where the fcl lives.
 """
 
+import re
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -175,3 +176,55 @@ def run_mu2e_job(
         file_list_path=file_list_path,
         written_root_files=written_root_files(outdir, before),
     )
+
+
+# --- what a module in the configured Offline accepts ---------------------------
+
+class ModuleProbeError(RuntimeError):
+    """`mu2e --print-description` could not describe a module, worded for the caller."""
+
+
+# (environment, module type) -> the description text. The environment is a
+# property of the deployment (see mu2e_env), so one probe per process answers
+# for every later job; a failed probe is not cached.
+_MODULE_DESCRIPTIONS: dict[tuple[Mu2eEnv, str], str] = {}
+
+
+def module_description(module_type: str, outdir: Path, *, env: Mu2eEnv | None = None,
+                       timeout_s: int = 300) -> str:
+    """art's description of `module_type` (`mu2e --print-description`) in `env`.
+
+    Asks the code that will run the job, so it knows what the configured
+    Offline's module accepts without guessing from a release name.
+    """
+    env = env or current_env()
+    key = (env, module_type)
+    if key not in _MODULE_DESCRIPTIONS:
+        outdir.mkdir(parents=True, exist_ok=True)
+        script = " && ".join([*env.setup_commands(outdir), 'cd "$2"',
+                              'mu2e --print-description "$1"'])
+        try:
+            proc = subprocess.run(["bash", "-lc", script, "_", module_type, str(outdir)],
+                                  cwd=outdir, capture_output=True, text=True,
+                                  timeout=timeout_s)
+        except subprocess.TimeoutExpired:
+            raise ModuleProbeError(f"mu2e --print-description {module_type} "
+                                   f"timed out after {timeout_s}s") from None
+        if proc.returncode != 0 or not proc.stdout.strip():
+            tail = "\n".join((proc.stdout + proc.stderr).splitlines()[-5:])
+            raise ModuleProbeError(f"mu2e --print-description {module_type} failed "
+                                   f"in {env.describe()} (exit {proc.returncode}): {tail}")
+        _MODULE_DESCRIPTIONS[key] = proc.stdout
+    return _MODULE_DESCRIPTIONS[key]
+
+
+def module_accepts(module_type: str, parameter: str, outdir: Path, *,
+                   env: Mu2eEnv | None = None) -> bool:
+    """Whether `module_type` in the configured Offline declares `parameter`.
+
+    Generic on purpose: it lets an analysis pass a parameter that only newer
+    Offline has, without this module knowing what it means. Raises
+    ModuleProbeError if the module cannot be described.
+    """
+    text = module_description(module_type, outdir, env=env)
+    return re.search(rf"^\s*{re.escape(parameter)}\s*:", text, re.MULTILINE) is not None

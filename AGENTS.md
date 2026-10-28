@@ -66,7 +66,16 @@ python3 -m analysis_mcp_server --transport stdio [--work-area DIR | --musing 'Si
   (absolute), so it is the same file under every environment. Its
   `#include`s resolve through art's `FHICL_FILE_PATH`.
 - **EdepAna is in Offline from v13_39_00** (`SimJob MDC2025ay` and later).
-  An environment on an older Offline cannot run `edep`.
+  An environment on an older Offline cannot run `edep`. The step counts
+  (`*_nsteps_*` metrics, `event_*_nsteps*` branches) need Offline PR #2067
+  (merged 2026-10-27, not yet in a Musing), whose EdepAna *requires* six
+  step parameters that an older EdepAna rejects. `edep` therefore probes the
+  configured Offline once (`mu2e_job.module_accepts`, via `mu2e
+  --print-description`) and, with the PR, runs a per-run `edep_job.fcl` with
+  the parameters appended (never put them in `fcl/edep.fcl`); without it,
+  the shipped fcl runs, the step metrics are absent and a non-default step
+  parameter is an error. The default environment (MDC2025ay) is the old
+  case, and the Mu2eBO workflow's metrics must keep working there.
 - **Selections over the EdepAna tree** (`EDepAna/tree`) go through
   `read_edep_tree` / `select_events` / `EDEP_VARIABLES` in
   `tools/analyses/edep.py`, so every analysis of EdepAna output uses the same
@@ -90,6 +99,11 @@ python3 -m analysis_mcp_server --transport stdio [--work-area DIR | --musing 'Si
   TimeTracker sqlite database, not stdout: an event's time is the sum of its
   module times without the data fetch (`FETCH_MODULE_TYPES`, i.e. Prefetch;
   the source is timed apart), and the first event (DB setup) is skipped.
+- **OccupancyAna is in Offline only after PR #2070** (merged 2026-10-28, in no
+  Musing release yet), so `occupancy_digi` / `occupancy_reco` need a work area
+  built on it. They share `tools/analyses/occupancy.py` (per-run fcl, summary
+  table, tree). A skipped collection's metrics are -1, never absent, so every
+  listed metric is always reported; keep that when adding collections.
 - **Never use `tpr_` or `mpr_` paths** in defaults, tests or examples: they
   are in the trigger menu but not meant for the real trigger. Use `apr_`,
   `cpr_` and `calo_` paths.

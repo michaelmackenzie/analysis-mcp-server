@@ -25,6 +25,9 @@ handed to `mu2e` and art resolves it — or says plainly that it cannot.
 > such a release runs `edep`. On an older Offline art dies with `Library
 > specification "EdepAna" does not correspond to any library` — the analysis
 > is simply not available in that environment.
+>
+> The step counts added to it by Offline PR #2067 (merged 2026-10-27) are
+> optional: `edep` probes the environment for them (`mu2e_job.module_accepts`).
 
 Configured once, when the server starts (`--work-area`, `--musing`,
 `--code-tarball`, or the MU2E_WORK_AREA / MU2E_MUSING / MU2E_CODE_TARBALL

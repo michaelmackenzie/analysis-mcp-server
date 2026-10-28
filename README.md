@@ -8,14 +8,18 @@ mu2e -c <the analysis' fcl> -s <data file>     # one file
 mu2e -c <the analysis' fcl> -S <file list>     # several, one path per line
 ```
 
-or a Python computation over a ROOT file. Nine analyses ship: energy
-deposition (`edep`), event counts (`count`), muon stopping rate
-(`muon_stop_rate`), approximate CE sensitivity (`approx_ce_sensitivity`),
-muon stops per material (`stop_materials`), and the online trigger's
-efficiency, rate and processing time (`trigger_efficiency`, `trigger_rate`,
-`trigger_timing`), and the trigger efficiency read from EventNtuples,
-overall and as a function of a variable (`trigger_efficiency_ntuple`,
-`trigger_efficiency_ntuple_binned`). Adding more is one small module each.
+or a Python computation over a ROOT file. Fourteen analyses ship: energy
+deposition and approximate step-count occupancy (`edep`), event counts
+(`count`), muon stopping rate (`muon_stop_rate`), approximate CE sensitivity
+(`approx_ce_sensitivity`) and its full-simulation counterpart
+(`fullsim_sensitivity`), muon stops per material (`stop_materials`), the
+online trigger's efficiency, rate and processing time (`trigger_efficiency`,
+`trigger_rate`, `trigger_timing`), the trigger efficiency read from
+EventNtuples, overall and as a function of a variable
+(`trigger_efficiency_ntuple`, `trigger_efficiency_ntuple_binned`), and
+detector occupancy from digi, reco and EventNtuple files
+(`occupancy_digi`, `occupancy_reco`, `occupancy_ntuple`). Adding more is one
+small module each.
 
 Built to the same pattern as
 [`spectra-mcp-server`](https://github.com/HEP-KE/spectra-mcp-server), so the
@@ -67,6 +71,11 @@ tools/
                                trig_<path> branches, for a track selection
     trigger_efficiency_ntuple_binned.py  the same, in bins of a track or
                                MC variable (p_front, mc_p_front, mc_npot, ...)
+    occupancy.py               the OccupancyAna job (per-run fcl, summary
+                               table, tree), shared by the two below
+    occupancy_digi.py          digi occupancy of dig files
+    occupancy_reco.py          hit/cluster occupancy of mcs/rec files
+    occupancy_ntuple.py        the same counts read from an EventNtuple
     fullsim/                   full-simulation analyses of EventNtuple
       eventntuple.py           reading EventNtuple/ntuple; MC origin of a track
       cuts.py                  the CE-like track cuts (pyfitter cut-set 80)
@@ -105,7 +114,7 @@ workflow can chain several runs and collect `metadata` uniformly.
 
 | analysis | input | reports |
 |---|---|---|
-| `edep` | art file(s) | average calo/tracker energy deposition per event and per generated event, and the events passing a `selection` |
+| `edep` | art file(s) | average calo/tracker energy deposition per event and per generated event, the events passing a `selection`, and (with an Offline that has the step counts) approximate calo/tracker hit counts from detector steps |
 | `count` | any art file with subrun bookkeeping | events kept per generated event, dividing out a prescale only if you name the filter |
 | `muon_stop_rate` | `sim.*.TargetStops.*.art` | stopped muons per generated event and per POT, from the file's event count, generated-event count and output prescale |
 | `approx_ce_sensitivity` | `nts.*.root` from `edep` | `S/sqrt(B)` for the best momentum window, with the window and its signal/DIO/cosmic counts |
@@ -158,6 +167,12 @@ variables are the first primary's, as EdepAna's own histograms use; derived
 ones (`primary_start_r` in the detector frame, `primary_trk_front_energy_diff`,
 `has_trk_front`, ...) are computed in Python. A missing value (no primary, or
 no tracker-front step) is NaN, so any cut on it fails. `""` selects every event.
+
+Six more variables, the per-event step counts `event_{calo,trk}_nsteps`,
+`..._nsteps_ecut` and `..._nsteps_ecut_tcut` (see `edep` below), exist only in
+a tree written by an EdepAna with the step counts. They are read only where the
+file has them; a selection naming one against a tree without them is refused
+with a plain error (for `edep` on an older Offline, before the job runs).
 
 The defaults reproduce the fixed cuts the module's histograms and summary had:
 `event_calo_edep_vis > 50` for `edep` (so `n_events_selected` equals
@@ -252,6 +267,36 @@ last 20 log lines, so an agent can diagnose without re-running.
 | `avg_trk_edep_per_gen_event_mev` | MeV | `... per gen event` |
 | `n_events_selected` | | weighted count of tree events passing `selection` |
 | `selected_per_gen_event` | events / gen event | `n_events_selected / n_gen_events` |
+| `{calo,trk}_nsteps[_ecut[_tcut]]_{total,per_event,per_gen_event}` (18) | steps, steps / event, steps / gen event | the `Calo` / `Tracker` `step counts` blocks, see below |
+
+**Step counts** (Offline PR [#2067](https://github.com/Mu2e/Offline/pull/2067),
+merged 2026-10-27; not yet in a Musing release). EdepAna counts detector steps
+as an approximate hit count: `calo` is `CaloShowerStep`s (energy cut on
+`energyDepBirks`), `trk` is `StrawGasStep`s (energy cut on `ionizingEdep`).
+Three counts per detector: `nsteps` (all), `nsteps_ecut` (energy above the
+threshold; strict) and `nsteps_ecut_tcut` (also with the step time inside the
+inclusive window). Each is reported as the weighted `total`, `per_event` and
+`per_gen_event`; the last two are -1 when the module had no events or no
+generated events. Caveats: step times are raw Geant4 times, with no time
+offsets and no microbunch folding; a `CaloShowerStep` is per particle per
+crystal, so it is not a crystal-hit count; a `StrawGasStep` is roughly one
+particle crossing one straw. The six parameters (defaults from the PR's example
+fcl, all required by the module) are `trk_step_energy_threshold_mev` (0.0005),
+`trk_step_time_min_ns` (500), `trk_step_time_max_ns` (1e9),
+`calo_step_energy_threshold_mev` (0.5), `calo_step_time_min_ns` (500) and
+`calo_step_time_max_ns` (1e9). What the module printed (thresholds and
+windows) is in `metadata.step_count_windows`. The tree gets the same counts per
+event, as the optional selection variables above.
+
+The step counts depend on the Offline, which the server asks once per
+environment (`mu2e --print-description EdepAna`, cached): with the PR the job
+runs a per-run `edep_job.fcl` in the output directory (the shipped
+`fcl/edep.fcl` plus the six parameter lines, since FHiCL cannot `#include` an
+absolute path and an older EdepAna rejects the keys); without it the shipped fcl
+runs unchanged, the step metrics are absent from the result (listed in
+`list_analyses`, but not reported; `metadata.step_counts` says so), and
+setting any step parameter away from its default is an error naming
+Offline PR #2067. Existing metric names are the same either way.
 
 `count` runs `print_counts.fcl` and reports what any art file with subrun
 bookkeeping can say about itself:
@@ -600,7 +645,8 @@ The numbers are rough by construction: this is a figure of merit for comparing
 beamline configurations, not a sensitivity calculation. Note it needs a **CE
 signal** sample — given a file where no event passes the selection and
 reaches the tracker it reports that plainly instead of dividing by zero. It
-also needs an ntuple from EdepAna in Offline v13_39_00 or later: older ones
+also needs an ntuple from EdepAna in Offline v13_39_00 or later (the step
+counts, from PR #2067, are not needed): older ones
 have only the histograms, and are refused with a message saying to rerun
 `edep`.
 
@@ -701,6 +747,79 @@ window. `tests/test_tools.py` locks this in.
 Unlike `approx_ce_sensitivity`, whose normalization is its macro's (signal
 NPOT x BR and DIO NPOT x (1 - capture fraction), with no stopped muons per
 POT), the signal and DIO here are counts for the stopped muons NPOT gives.
+
+## The occupancy analyses
+
+How many hits, digis and clusters an event holds: `occupancy_digi` (dig files),
+`occupancy_reco` (mcs/rec files) and `occupancy_ntuple` (EventNtuple files).
+The first two run `fcl/occupancy.fcl`, i.e. the `OccupancyAna` analyzer of
+Offline PR #2070 (merged 2026-10-28, in no Musing release yet, so they need a
+work area built on an Offline with it; on any other, the result says so and
+names the PR). It needs no geometry or conditions. Both are configured by
+a tag per collection, `<collection>_tag`, where an empty string skips the
+collection:
+
+| analysis | collections (default tag) |
+|---|---|
+| `occupancy_digi` | `strawdigis` (`makeSD`), `calodigis` (`CaloDigiMaker`), `crvdigis` (`CrvDigi`) |
+| `occupancy_reco` | `strawhits` (`makeSH`, the single-straw ComboHits), `combohits` (`makePH`, the panel ComboHits), `calohits` (`CaloHitMaker`), `caloclusters` (`CaloClusterMaker`), `calorecodigis` (off) |
+
+The defaults are the production labels; check a file's with
+`mu2e -c Offline/Print/fcl/dumpDataProducts.fcl -s FILE -n 1`. An mcs file's
+digi, CRV pulse and CRV cluster collections are SelectReco subsets, kept for
+the reconstructed objects, not the full occupancy, so `occupancy_reco` does not
+offer them, and CaloRecoDigis only as an option that is off by default. Use
+`occupancy_digi` on a dig file for digi occupancy. `occupancy_reco` also takes
+a window, `hit_time_min`, `hit_time_max` (ns) and `calo_hit_energy_min` (MeV),
+default everything, applied to the straw hit and panel ComboHit corrected time
+and the calo hit time and energy.
+
+```python
+run_analysis(analysis="occupancy_reco",
+             data_file=".../mcs.mu2e.CeEndpointMix1BB-KL.Run1Baw_best_v1_5.001470_00000001.art",
+             output_dir=".../occupancy", max_events=50,
+             parameters={"hit_time_min": 700, "calo_hit_energy_min": 10})
+```
+
+Each run writes its own `occupancy_job.fcl` in `output_dir`: the shipped
+`fcl/occupancy.fcl` (which configures no collection) with the tags and window
+appended. For every collection of the analysis there are `<c>_mean`, `<c>_rms`
+and `<c>_max` (per event, over the events that have it), and
+`<c>_events_found` and `<c>_events_missing`, from the summary table
+OccupancyAna prints. From the per-event tree come `n_events`, the mean count in
+the busiest tracker plane (`strawdigis_`/`strawhits_busiest_plane_mean`, with
+every plane's mean in `metadata.per_plane_mean`) and in each calorimeter disk
+(`calodigis_disk0_mean`, `calohits_disk1_mean`, ...), and for `occupancy_reco`
+the windowed counts `strawhits_sel_mean`, `combohits_sel_mean`,
+`calohits_sel_mean` and `combohit_straws_mean` (the straw hits in the panel
+ComboHits). A skipped collection's metrics are -1 so every listed metric is
+always there, and so are the statistics of a collection no event had. A
+configured collection missing from every event is flagged in
+`metadata.warnings` and the message, since it nearly always means a wrong tag.
+There is no per-generated-event normalization: OccupancyAna has no gen count.
+
+`occupancy_ntuple` runs no job. From an EventNtuple it reads `hitcount` (the
+whole event, not a SelectReco subset: `nsd`, the straw digis, and the straw
+hits flagged energy-, radius-, time-selected and background, `nesel`,
+`nrsel`, `ntsel`, `nbkg`), the sizes of `calohits`, `caloclusters` and
+`crvcoincs`, `crvsummary` (`nHitCounters`, `totalPEs`) and `tcnt.ntrk`, each
+as `<q>_mean`, `<q>_rms` and `<q>_max` (`strawdigis`, `strawhits_esel`,
+`calohits`, `crv_total_pes`, `ntracks`, ...). The calo window
+parameters give `calohits_sel_mean`. Every group is optional: what a file
+lacks is listed in `metadata.missing` and its metrics are -1, and it is an
+error only if none is there. `data_files` combines several files; a quantity
+missing from one of them is dropped for the set. It has no per-generated-event
+normalization either: the `n_gen_events` histogram counts the generated events
+behind the file, but the ntuple holds only the events that survived
+production (622 of 1e6 in the Run1B example), so a per-gen-event rate would
+mix occupancy with that filtering.
+
+On the Run1B `CeEndpointMix1BB-KL` dataset, `occupancy_reco` (50 events of
+`...001470_00000001.art`) gives about 779 straw hits, 276 panel ComboHits
+(410 straws), 56 calo hits (46 on disk 0) and 5.5 clusters per event, and
+`occupancy_ntuple` (622 events of `...001470_00000010.root`) gives
+749 straw digis, 54 calo hits and 5.7 clusters, CRV and background
+branches all zero.
 
 ## Adding an analysis
 
@@ -811,9 +930,17 @@ goes to `mu2e`, art resolves it on `FHICL_FILE_PATH`, `fcl_exists` comes back
 > **What the analyses here need from the environment**: `EdepAna` is in
 > Offline (`Offline/Analyses/src/EdepAna_module.cc`) from v13_39_00, so any
 > Musing built on it — `SimJob MDC2025ay` and later — or a work area backed by
-> one runs `edep` as is. With an older Offline, art stops with `Library
+> one runs `edep` as is, without the step counts: those need an EdepAna with
+> Offline PR #2067 (merged 2026-10-27), and `SimJob MDC2025ay` predates it.
+> With an older Offline, art stops with `Library
 > specification "EdepAna" does not correspond to any library`, and the result
 > carries it in `metadata.stdout_tail`.
+
+> `occupancy_digi` and `occupancy_reco` need `OccupancyAna`, which is in Offline
+> only after PR #2070 (merged 2026-10-28, in no Musing release yet). On an
+> Offline without it the job fails with the same `Library specification
+> "OccupancyAna" does not correspond to any library`, and the result says that
+> it needs the PR. `occupancy_ntuple` runs no job and works anywhere.
 
 ## Test
 
@@ -821,7 +948,7 @@ goes to `mu2e`, art resolves it on `FHICL_FILE_PATH`, `fcl_exists` comes back
 python3 tests/test_tools.py
 ```
 
-142 tests, none of which start a mu2e job or reach SAM or metacat (the
+171 tests, none of which start a mu2e job or reach SAM or metacat (the
 catalog tests use a fake). (The `ana` env has no pytest, so
 these are bare asserts.)
 
