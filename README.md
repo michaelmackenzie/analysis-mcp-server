@@ -125,6 +125,7 @@ workflow can chain several runs and collect `metadata` uniformly.
 | `trigger_timing` | pileup digi art file(s); default: mu2e-trig-config's CI sample | trigger processing time per event: mean, median, tail; per path and per module |
 | `trigger_efficiency_ntuple` | EventNtuple file(s) with `trig_<path>` branches | of events with a track passing a selection, the fraction any given path accepted, and per path |
 | `trigger_efficiency_ntuple_binned` | EventNtuple file(s) with `trig_<path>` branches | the same, in bins of a track variable or expression (reco or true momentum at the tracker front, beam intensity, ...), with a figure, CSV table and ROOT histograms |
+| `total_edep_per_pot` | none: parameters only (earlier `edep` and `muon_stop_rate` metrics) | the early electron-beam flash, early muon-beam flash and muon-stop pileup depositions per POT, their total and each one's share |
 
 `approx_ce_sensitivity` declares `produced_by = ["edep"]`, so chaining is
 discoverable: run `edep`, then pass the `nts.*.root` from its `files` to the
@@ -183,7 +184,11 @@ sensitivity is unchanged.
 
 ### Inputs
 
-Pass **exactly one** of the following — or neither, for an analysis that
+An analysis whose `input_kind` is `"parameters"` (`total_edep_per_pot`)
+reads no file: pass only `parameters`, and any `data_file`, `data_files`,
+`dataset` or `max_events` is refused.
+
+Otherwise pass **exactly one** of the following — or neither, for an analysis that
 `list_analyses` shows with `default_inputs` (`trigger_rate` and
 `trigger_timing`, which then run over the files in the configured code's
 `mu2e-trig-config/ci/data_files.txt`, found by following its `backing`
@@ -820,6 +825,26 @@ On the Run1B `CeEndpointMix1BB-KL` dataset, `occupancy_reco` (50 events of
 `occupancy_ntuple` (622 events of `...001470_00000010.root`) gives
 749 straw digis, 54 calo hits and 5.7 clusters, CRV and background
 branches all zero.
+
+## total_edep_per_pot
+
+The dose from the three beam-related sources, per POT. Each source is
+simulated from its own sample and `edep` reports it per generated event: a
+resampled beam electron (early electron-beam flash), a resampled MuBeamCat
+event (early muon-beam flash, unprescaled), or a muon stop (MuStopPileup on
+the target stops). This puts them on one footing and adds them:
+
+```
+per POT = ebeam / pot_per_ebeam_event      (default 11.5367: Run1Baa EleBeamCat, 25.0M POT / 2.17M electrons)
+        + mubeam * mubeam_events_per_pot   (default 0.01278168: muon_stop_rate's upstream_eff)
+        + mustop * stops_per_pot           (muon_stop_rate on the same geometry)
+```
+
+Pass the same detector's deposition (`avg_trk_edep_per_gen_event_mev`, or
+the calo one) for all three. It reports `total_edep_per_pot_mev`, each
+source's `*_edep_per_pot_mev` and `*_fraction`. A workflow chains it by
+passing the earlier metrics as its parameters; Mu2eBO's
+`foilsflash_col5bf_ax` uses the tracker total as its dose objective.
 
 ## Adding an analysis
 
