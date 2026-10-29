@@ -8,6 +8,7 @@ The registry tests loop over every registered analysis, so a new analysis is
 covered by them as soon as it is added to registry.py.
 """
 
+import contextlib
 import sys
 from pathlib import Path
 
@@ -38,6 +39,10 @@ from tools.analyses import momentum_resolution_ntuple as nres
 from tools.analyses import muon_stops as mstops
 from tools.analyses import calo_cluster_resolution_ntuple as ncalo
 from tools.analyses import variable_comparison_ntuple as vcmp
+from tools.analyses import occupancy as occ
+from tools.analyses import occupancy_digi as occ_digi
+from tools.analyses import occupancy_ntuple as occ_ntuple
+from tools.analyses import occupancy_reco as occ_reco
 from tools.analyses.trigger_rate import duty_factor, rate_metrics
 from tools.analyses.trigger_timing import timing_metrics
 from tools.mu2e_env import EnvError, Mu2eEnv, configure, current
@@ -61,6 +66,44 @@ EdepAna summary:
   Average tracker energy deposition per gen event: 3.2052 MeV
 Art has completed and will exit with status 0.
 """
+
+# The same, from an EdepAna with the step counts (Offline PR #2067): two more
+# blocks after the summary. The tracker's per-event value is -1, as the module
+# prints it for a zero denominator.
+SAMPLE_EDEP_STEPS_STDOUT = SAMPLE_EDEP_STDOUT.replace(
+    "Art has completed", """\
+  Calo step counts (E > 0.5 MeV, 500 <= t <= 1e+09 ns):
+    all       : total = 19           per event = 0.019029     per gen event = 0.019
+    E cut     : total = 16           per event = 0.016024     per gen event = 0.016
+    E + t cut : total = 12.5         per event = 0.012519     per gen event = 0.0125
+  Tracker step counts (E > 0.0005 MeV, 500 <= t <= 1e+09 ns):
+    all       : total = 1.70683e+06  per event = -1           per gen event = 1706.8
+    E cut     : total = 16204        per event = -1           per gen event = 16.204
+    E + t cut : total = 0            per event = -1           per gen event = -1
+Art has completed""")
+
+# What `mu2e --print-description EdepAna` lists, abridged, for each Offline.
+EDEP_DESCRIPTION_OLD = """\
+    EdepAna
+        Primary: <art::InputTag>
+        DebugLevel: <int>
+"""
+EDEP_DESCRIPTION_NEW = EDEP_DESCRIPTION_OLD + """\
+        TrkStepEnergyThreshold: <double>
+        CaloStepEnergyThreshold: <double>
+"""
+
+# edep asks the configured Offline whether EdepAna has the step counts, which
+# would start mu2e: no test may, so the answer is stubbed. Tests set it.
+_OFFLINE_HAS_STEPS = [True]
+
+
+def _stub_module_accepts(module_type, parameter, outdir, **_):
+    assert (module_type, parameter) == ("EdepAna", "TrkStepEnergyThreshold")
+    return _OFFLINE_HAS_STEPS[0]
+
+
+edep_mod.module_accepts = _stub_module_accepts
 
 # Verbatim shape of what print_counts.fcl prints, with art's usual noise. One
 # prescale block per filter the production job ran; only the target-stop one
@@ -110,6 +153,33 @@ TrigReport        210        200        200          0          0 Prefetch
 Art has completed and will exit with status 0.
 """
 
+# The table OccupancyAna_module.cc prints at endJob (printf "  %-14s %-28s %8li
+# %8li %12.3f %12.3f %8i"), after art's usual noise. A configured collection
+# that no event had has found 0 and a mean of 0.
+SAMPLE_OCCUPANCY_RECO_STDOUT = """\
+Begin processing the 1st record. run: 1470 subRun: 0 event: 1
+[OccupancyAna::analyze] Warning: calorecodigis collection CaloRecoDigiMaker not found, its count is set to -1
+[OccupancyAna::endJob] Occupancy summary over 50 events:
+  collection     tag                             found  missing         mean          rms      max
+  strawhits      makeSH                             50        0      779.420      460.005     2312
+  combohits      makePH                             50        0      276.100      163.666      859
+  calohits       CaloHitMaker                       50        0       56.280       28.993      139
+  caloclusters   CaloClusterMaker                   50        0        5.500        2.872       13
+  calorecodigis  CaloRecoDigiMaker                   0       50        0.000        0.000        0
+
+Art has completed and will exit with status 0.
+"""
+
+SAMPLE_OCCUPANCY_DIGI_STDOUT = """\
+[OccupancyAna::endJob] Occupancy summary over 50 events:
+  collection     tag                             found  missing         mean          rms      max
+  strawdigis     makeSD                             50        0       44.740       30.500       93
+  calodigis      CaloDigiMaker                      50        0        0.040        0.280        2
+  crvdigis       CrvDigi                            50        0        0.000        0.000        0
+
+Art has completed and will exit with status 0.
+"""
+
 # One stdout sample per art_files analysis, so the registry test can exercise
 # each parser. Add an entry when adding such an analysis.
 # The end of a muon_stops job (fcl/muon_stops.fcl on a TargetStops file):
@@ -130,7 +200,9 @@ SAMPLE_STDOUT = {"edep": SAMPLE_EDEP_STDOUT,
                  "trigger_efficiency": SAMPLE_TRIGGER_STDOUT,
                  "trigger_rate": SAMPLE_TRIGGER_STDOUT,
                  "trigger_timing": SAMPLE_TRIGGER_STDOUT,
-                 "muon_stops": SAMPLE_MUON_STOPS_STDOUT}
+                 "muon_stops": SAMPLE_MUON_STOPS_STDOUT,
+                 "occupancy_digi": SAMPLE_OCCUPANCY_DIGI_STDOUT,
+                 "occupancy_reco": SAMPLE_OCCUPANCY_RECO_STDOUT}
 
 
 # --- the edep parser ---------------------------------------------------------
@@ -161,6 +233,121 @@ def test_edep_parse_returns_none_without_summary():
 def test_edep_parse_returns_none_on_truncated_summary():
     truncated = SAMPLE_EDEP_STDOUT.split("Events with calo Edep")[0]
     assert parse_edep_summary(truncated) is None
+
+
+def test_edep_step_counts_parse_both_blocks_and_keep_minus_one():
+    parsed = edep_mod.parse_step_counts(SAMPLE_EDEP_STEPS_STDOUT)
+    assert parsed is not None
+    metrics, windows = parsed
+    assert tuple(metrics) == edep_mod.STEP_METRICS and len(metrics) == 18
+    assert metrics["calo_nsteps_total"] == 19.0
+    assert metrics["calo_nsteps_ecut_tcut_total"] == 12.5
+    assert metrics["calo_nsteps_ecut_tcut_per_gen_event"] == 0.0125
+    assert metrics["trk_nsteps_total"] == 1.70683e6
+    assert metrics["trk_nsteps_ecut_per_gen_event"] == 16.204
+    # -1 is the module's "no denominator" and is passed through
+    assert metrics["trk_nsteps_per_event"] == -1.0
+    assert metrics["trk_nsteps_ecut_tcut_per_gen_event"] == -1.0
+    assert windows == {
+        "calo": {"energy_threshold_mev": 0.5, "time_min_ns": 500.0, "time_max_ns": 1e9},
+        "trk": {"energy_threshold_mev": 0.0005, "time_min_ns": 500.0, "time_max_ns": 1e9}}
+    assert edep_mod.STEP_UNITS["trk_nsteps_ecut_per_event"] == "steps / event"
+    # the summary parser is unchanged by the extra blocks
+    assert parse_edep_summary(SAMPLE_EDEP_STEPS_STDOUT) == parse_edep_summary(SAMPLE_EDEP_STDOUT)
+
+
+def test_edep_step_counts_are_absent_from_old_stdout_or_incomplete():
+    assert edep_mod.parse_step_counts(SAMPLE_EDEP_STDOUT) is None
+    no_tracker = SAMPLE_EDEP_STEPS_STDOUT.split("  Tracker step counts")[0] + "Art has completed\n"
+    assert edep_mod.parse_step_counts(no_tracker) is None
+    no_row = SAMPLE_EDEP_STEPS_STDOUT.replace("    E cut     : total = 16204", "")
+    assert edep_mod.parse_step_counts(no_row) is None
+
+
+def test_edep_summary_mentions_step_counts_only_when_present():
+    base = {name: 1.0 for name in edep_mod.parse_edep_summary(SAMPLE_EDEP_STDOUT)}
+    base.update(edep_mod._SELECTION_METRICS and {"n_events_selected": 1.0,
+                                                 "selected_per_gen_event": 0.5})
+    assert "Steps per event" not in edep_mod.summarize_edep(base)
+    full = {**base, **edep_mod.parse_step_counts(SAMPLE_EDEP_STEPS_STDOUT)[0]}
+    text = edep_mod.summarize_edep(full)
+    assert "calo 0.01252" in text and "tracker -1" in text, text
+
+
+def test_edep_step_params_validate_with_the_example_fcl_defaults():
+    spec = ANALYSES["edep"]
+    params = spec.resolve_params({})
+    assert (params["trk_step_energy_threshold_mev"], params["trk_step_time_min_ns"],
+            params["trk_step_time_max_ns"], params["calo_step_energy_threshold_mev"],
+            params["calo_step_time_min_ns"], params["calo_step_time_max_ns"]) == (
+                0.0005, 500.0, 1e9, 0.5, 500.0, 1e9)
+    assert edep_mod.non_default_step_params(params) == []
+    assert edep_mod.non_default_step_params(
+        spec.resolve_params({"calo_step_energy_threshold_mev": 1})) == [
+            "calo_step_energy_threshold_mev"]
+    for bad in ({"trk_step_energy_threshold_mev": -1}, {"calo_step_time_max_ns": 1e13},
+                {"calo_step_time_min_ns": "soon"}):
+        try:
+            spec.resolve_params(bad)
+        except ValueError:
+            continue
+        raise AssertionError(f"{bad}: no error")
+    inverted = spec.resolve_params({"trk_step_time_min_ns": 900, "trk_step_time_max_ns": 800})
+    assert "trk_step_time_min_ns" in edep_mod.step_param_problem(inverted)
+    assert edep_mod.step_param_problem(params) is None
+
+
+def test_edep_job_fcl_appends_the_step_parameters_to_the_shipped_fcl():
+    params = ANALYSES["edep"].resolve_params({"trk_step_energy_threshold_mev": 0.001,
+                                              "calo_step_time_max_ns": 2e6})
+    text = edep_mod.job_fcl_text(params)
+    assert text.startswith((FCL_DIR / "edep.fcl").read_text(encoding="utf-8").rstrip())
+    # all six, after the base so they land in the analyzer's table
+    for key, value in (("TrkStepEnergyThreshold", "0.001"), ("TrkStepTimeMin", "500.0"),
+                       ("TrkStepTimeMax", "1000000000.0"),
+                       ("CaloStepEnergyThreshold", "0.5"), ("CaloStepTimeMin", "500.0"),
+                       ("CaloStepTimeMax", "2000000.0")):
+        assert f"physics.analyzers.EDepAna.{key} : {value}\n" in text, key
+    assert "StepEnergyThreshold" not in (FCL_DIR / "edep.fcl").read_text(encoding="utf-8"), \
+        "the shipped fcl must stay valid for an Offline without the step counts"
+
+
+def test_module_accepts_reads_the_description_once_per_environment(tmp_dir):
+    from tools import mu2e_job
+    calls = []
+
+    class Proc:
+        returncode, stderr = 0, ""
+        stdout = EDEP_DESCRIPTION_OLD
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        return Proc
+
+    real = mu2e_job.subprocess.run
+    mu2e_job.subprocess.run = fake_run
+    mu2e_job._MODULE_DESCRIPTIONS.clear()
+    try:
+        env = Mu2eEnv(kind="work_area", work_area=Path(tmp_dir))
+        out = Path(tmp_dir)
+        assert mu2e_job.module_accepts("EdepAna", "Primary", out, env=env)
+        assert not mu2e_job.module_accepts("EdepAna", "TrkStepEnergyThreshold", out, env=env)
+        Proc.stdout = EDEP_DESCRIPTION_NEW      # cached: not asked again
+        assert not mu2e_job.module_accepts("EdepAna", "TrkStepEnergyThreshold", out, env=env)
+        assert len(calls) == 1 and "--print-description" in calls[0][2]
+        mu2e_job._MODULE_DESCRIPTIONS.clear()
+        assert mu2e_job.module_accepts("EdepAna", "TrkStepEnergyThreshold", out, env=env)
+        assert not mu2e_job.module_accepts("EdepAna", "StepEnergy", out, env=env)  # a name, not a substring
+        Proc.returncode = 1
+        mu2e_job._MODULE_DESCRIPTIONS.clear()
+        try:
+            mu2e_job.module_accepts("EdepAna", "Primary", out, env=env)
+            raise AssertionError("no error for a failed probe")
+        except mu2e_job.ModuleProbeError:
+            pass
+    finally:
+        mu2e_job.subprocess.run = real
+        mu2e_job._MODULE_DESCRIPTIONS.clear()
 
 
 # --- the shared count parser (count.py) --------------------------------------
@@ -506,7 +693,36 @@ def test_edep_selection_counts_weighted_events_per_gen_event():
     assert edep_mod.selected_metrics(v, "", 10.0)["n_events_selected"] == 3.0
 
 
-def _write_edep_tree(path: Path, n: int = 4000, ngen_total: int | None = None) -> None:
+def test_edep_optional_step_branches_are_variables_only_where_present(tmp_dir):
+    path = Path(tmp_dir) / "nts.owner.edep.test.root"
+    _write_edep_tree(path, n=20)
+    old = edep_mod.read_edep_tree(path)
+    assert set(old) == set(edep_mod.EDEP_VARIABLES)       # no step columns
+    new_path = Path(tmp_dir) / "nts.owner.edep.steps.root"
+    _write_edep_tree(new_path, n=20, with_steps=True)
+    new = edep_mod.read_edep_tree(new_path)
+    assert set(new) == set(edep_mod.EDEP_VARIABLES) | set(edep_mod.OPTIONAL_EDEP_VARIABLES)
+    assert new["event_trk_nsteps_ecut_tcut"].tolist() == list(range(20))
+    mask = edep_mod.select_events(new, "event_trk_nsteps_ecut_tcut >= 15")
+    assert mask.sum() == 5
+    # a mixed set of files has them for neither
+    assert set(edep_mod.read_edep_tree([path, new_path])) == set(edep_mod.EDEP_VARIABLES)
+    # a selection naming one on an old file is a plain error, not a KeyError
+    try:
+        edep_mod.select_events(old, "event_trk_nsteps > 3")
+        raise AssertionError("no error")
+    except edep_mod.EdepTreeError as exc:
+        assert "event_trk_nsteps" in str(exc) and "PR #2067" in str(exc), exc
+    # a name that is merely unknown still gets the selection's own message
+    try:
+        edep_mod.select_events(old, "no_such_thing > 3")
+        raise AssertionError("no error")
+    except SelectionError:
+        pass
+
+
+def _write_edep_tree(path: Path, n: int = 4000, ngen_total: int | None = None,
+                     with_steps: bool = False) -> None:
     """A CE-like EdepAna tree: ~105 MeV electrons losing a little on the way.
 
     `ngen` is EdepAna's running generated-event count, raised at each subrun;
@@ -532,6 +748,10 @@ def _write_edep_tree(path: Path, n: int = 4000, ngen_total: int | None = None) -
         "primary_trk_front_p": one(front), "primary_trk_front_energy": one(front),
         "primary_start_e": one(e0), "primary_start_pdg": one(np.full(n, 11, np.int32)),
     }
+    if with_steps:      # the int branches of Offline PR #2067: i for every cut
+        for det in ("calo", "trk"):
+            for cut in ("", "_ecut", "_ecut_tcut"):
+                tree[f"event_{det}_nsteps{cut}"] = np.arange(n, dtype=np.int32)
     zeros = np.zeros(n, dtype=np.float32)
     for name in ("x", "y", "z", "px", "py", "pz", "m"):
         tree[f"primary_start_{name}"] = one(zeros)
@@ -719,19 +939,24 @@ def test_ce_acceptance_counts_only_events_passing_the_selection(tmp_dir):
     assert meta["sensitivity"] == by_eff.metadata["sensitivity"]
 
 
-def _fake_edep_job(tmp_dir):
+def _fake_edep_job(tmp_dir, stdout=None):
     """A stand-in for run_mu2e_job: writes an EdepAna tree where the job
     would and reports the summary block, recording the max_events it got."""
     from tools.mu2e_job import JobOutcome
-    calls = []
+    class Calls(list):
+        fcl: list = []      # the fcl each job was given
+    calls = Calls()
+    calls_fcl = calls.fcl = []
 
     def fake(*, fcl, input_paths, outdir, single, timeout_s, max_events=None, **_):
         calls.append(max_events)
         outdir.mkdir(parents=True, exist_ok=True)
         root = outdir / "nts.owner.edep.test.root"
-        _write_edep_tree(root, n=100)
+        _write_edep_tree(root, n=100, with_steps=_OFFLINE_HAS_STEPS[0])
+        calls_fcl.append(fcl)
         return JobOutcome(command="mu2e", returncode=0, timed_out=False,
-                          stdout=SAMPLE_EDEP_STDOUT, stderr="",
+                          stdout=stdout or (SAMPLE_EDEP_STEPS_STDOUT if _OFFLINE_HAS_STEPS[0]
+                                            else SAMPLE_EDEP_STDOUT), stderr="",
                           log_path=outdir / "mu2e.log", input_paths=input_paths,
                           input_flag="-s", environment="test", file_list_path=None,
                           written_root_files=[str(root)])
@@ -748,7 +973,8 @@ def test_edep_records_max_events_next_to_its_file(tmp_dir):
             outdir = Path(tmp_dir) / f"run{max_events}"
             outcome = edep_mod.run(RunContext(
                 input_paths=[Path(tmp_dir) / "in.art"], outdir=outdir,
-                params={"selection": ""}, timeout_s=60, max_events=max_events))
+                params=ANALYSES["edep"].resolve_params({"selection": ""}),
+                timeout_s=60, max_events=max_events))
             assert outcome.error is None, outcome.error
             root = Path(outcome.files[0])
             assert edep_mod.read_run_record(root) == {"max_events": max_events}
@@ -757,6 +983,89 @@ def test_edep_records_max_events_next_to_its_file(tmp_dir):
     finally:
         edep_mod.run_mu2e_job = real
     assert calls == [100, None], calls
+
+
+def _run_edep_with_fake_job(tmp_dir, has_steps, parameters=None, stdout=None):
+    from tools.spec import RunContext
+    fake, calls = _fake_edep_job(tmp_dir, stdout)
+    real, _OFFLINE_HAS_STEPS[0] = edep_mod.run_mu2e_job, has_steps
+    edep_mod.run_mu2e_job = fake
+    try:
+        params = ANALYSES["edep"].resolve_params(parameters)
+        outcome = edep_mod.run(RunContext(
+            input_paths=[Path(tmp_dir) / "in.art"], outdir=Path(tmp_dir) / "out",
+            params=params, timeout_s=60))
+    finally:
+        edep_mod.run_mu2e_job, _OFFLINE_HAS_STEPS[0] = real, True
+    return outcome, calls.fcl
+
+
+def test_edep_with_the_step_counts_runs_a_per_run_fcl_and_reports_them(tmp_dir):
+    outcome, fcls = _run_edep_with_fake_job(tmp_dir, True,
+                                            {"calo_step_energy_threshold_mev": 0.5})
+    assert outcome.error is None, outcome.error
+    assert fcls == [Path(tmp_dir) / "out" / "edep_job.fcl"]
+    assert "CaloStepEnergyThreshold : 0.5" in fcls[0].read_text()
+    assert outcome.metrics["trk_nsteps_ecut_per_gen_event"] == 16.204
+    assert outcome.metrics["trk_nsteps_per_event"] == -1.0
+    assert outcome.extra["step_count_windows"]["calo"]["energy_threshold_mev"] == 0.5
+    assert outcome.extra["job_fcl"] == str(fcls[0])
+    # every metric the spec declares is there, in order
+    assert tuple(outcome.metrics) == ANALYSES["edep"].metrics
+
+
+def test_edep_on_an_old_offline_runs_the_shipped_fcl_and_leaves_steps_out(tmp_dir):
+    outcome, fcls = _run_edep_with_fake_job(tmp_dir, False)
+    assert outcome.error is None, outcome.error
+    assert fcls == [FCL_DIR / "edep.fcl"]
+    assert not (Path(tmp_dir) / "out" / "edep_job.fcl").exists()
+    assert not any("nsteps" in name for name in outcome.metrics)
+    assert outcome.metrics["n_events_calo_edep_above_50mev"] == 42.0
+    assert "PR #2067" in outcome.extra["step_counts"]
+    assert "step_count_windows" not in outcome.extra
+
+
+def test_edep_on_an_old_offline_refuses_a_changed_step_parameter(tmp_dir):
+    outcome, fcls = _run_edep_with_fake_job(
+        tmp_dir, False, {"trk_step_time_min_ns": 100, "calo_step_energy_threshold_mev": 1})
+    assert fcls == [], "no job may run"
+    assert "predates the step counts" in outcome.error and "PR #2067" in outcome.error
+    assert "trk_step_time_min_ns" in outcome.error
+    assert "calo_step_energy_threshold_mev" in outcome.error
+
+
+def test_edep_on_an_old_offline_refuses_a_step_selection_before_running(tmp_dir):
+    outcome, fcls = _run_edep_with_fake_job(
+        tmp_dir, False, {"selection": "event_trk_nsteps_ecut_tcut > 100"})
+    assert fcls == [] and "event_trk_nsteps_ecut_tcut" in outcome.error, outcome.error
+    outcome, fcls = _run_edep_with_fake_job(
+        tmp_dir, True, {"selection": "event_trk_nsteps_ecut_tcut > 100"})
+    assert outcome.error is None and len(fcls) == 1, outcome.error
+
+
+def test_edep_with_steps_refuses_an_empty_window_and_missing_blocks(tmp_dir):
+    outcome, fcls = _run_edep_with_fake_job(
+        tmp_dir, True, {"calo_step_time_min_ns": 900, "calo_step_time_max_ns": 800})
+    assert fcls == [] and "calo_step_time_min_ns" in outcome.error
+    outcome, _ = _run_edep_with_fake_job(tmp_dir, True, stdout=SAMPLE_EDEP_STDOUT)
+    assert "step-count blocks not found" in outcome.error
+
+
+def test_edep_reports_a_failed_probe_plainly(tmp_dir):
+    from tools.mu2e_job import ModuleProbeError
+    from tools.spec import RunContext
+
+    def broken(*args, **kwargs):
+        raise ModuleProbeError("mu2e --print-description EdepAna failed")
+    real = edep_mod.module_accepts
+    edep_mod.module_accepts = broken
+    try:
+        outcome = edep_mod.run(RunContext(
+            input_paths=[Path(tmp_dir) / "in.art"], outdir=Path(tmp_dir),
+            params=ANALYSES["edep"].resolve_params({}), timeout_s=60))
+    finally:
+        edep_mod.module_accepts = real
+    assert "step counts" in outcome.error and "failed" in outcome.error
 
 
 def test_stops_per_pot_refuses_a_file_from_a_max_events_run(tmp_dir):
@@ -2465,6 +2774,381 @@ def test_fullsim_measures_the_efficiency_on_ce_mix(tmp_dir):
     assert few.status == "error" and "n_generated 100" in few.message
 
 
+# --- occupancy (OccupancyAna: digi and reco from a job, ntuple from a file) ---------
+
+REAL_OCCUPANCY_NTUPLE = Path(
+    "/pnfs/mu2e/tape/phy-nts/nts/mu2e/CeEndpointMix1BB-KL/Run1Baw_best_v1_5/"
+    "root/e8/33/nts.mu2e.CeEndpointMix1BB-KL.Run1Baw_best_v1_5.001470_00000010.root")
+
+
+def test_occupancy_summary_table_parses_rows_found_missing_and_stats():
+    summary = occ.parse_summary(SAMPLE_OCCUPANCY_RECO_STDOUT)
+    assert summary.n_events == 50 and list(summary.rows) == [
+        "strawhits", "combohits", "calohits", "caloclusters", "calorecodigis"]
+    row = summary.rows["strawhits"]
+    assert (row.tag, row.found, row.missing, row.mean, row.rms, row.max) == (
+        "makeSH", 50, 0, 779.42, 460.005, 2312)
+    assert summary.rows["calorecodigis"].missing == 50
+    assert occ.parse_summary("Art has completed and will exit with status 0.") is None
+
+
+def test_occupancy_table_metrics_use_minus_one_for_skipped_and_missing():
+    names = occ_reco.COLLECTIONS
+    metrics = occ.table_metrics(names, occ.parse_summary(SAMPLE_OCCUPANCY_RECO_STDOUT))
+    assert metrics["strawhits_mean"] == 779.42 and metrics["strawhits_max"] == 2312.0
+    assert metrics["strawhits_events_found"] == 50.0
+    # configured but in no event: no statistics, the missing events counted
+    assert metrics["calorecodigis_mean"] == -1.0
+    assert metrics["calorecodigis_events_found"] == 0.0
+    assert metrics["calorecodigis_events_missing"] == 50.0
+    # not configured at all: everything -1
+    digi = occ.parse_summary(SAMPLE_OCCUPANCY_DIGI_STDOUT)
+    skipped = occ.table_metrics(("strawdigis", "crvpulses"), digi)
+    assert skipped["crvpulses_events_found"] == -1.0 == skipped["crvpulses_events_missing"]
+    assert tuple(occ.table_metrics(names, occ.parse_summary(SAMPLE_OCCUPANCY_RECO_STDOUT))
+                 ) == occ.table_metric_names(names)
+
+
+def test_occupancy_warns_of_a_collection_missing_from_every_event():
+    summary = occ.parse_summary(SAMPLE_OCCUPANCY_RECO_STDOUT)
+    (warning,) = occ.warnings(occ_reco.COLLECTIONS, summary)
+    assert "calorecodigis (CaloRecoDigiMaker)" in warning and "tag" in warning
+    assert not occ.warnings(occ_digi.COLLECTIONS,
+                            occ.parse_summary(SAMPLE_OCCUPANCY_DIGI_STDOUT))
+    metrics = {m: 1.0 for m in ANALYSES["occupancy_reco"].metrics}
+    metrics.update(calohits_events_found=0.0, caloclusters_events_found=-1.0)
+    text = ANALYSES["occupancy_reco"].summarize(metrics)
+    assert "calohits MISSING from every event" in text and "caloclusters" not in text
+
+
+def test_occupancy_defaults_are_the_production_labels_and_reco_leaves_digis_off():
+    digi = {p.name: p.default for p in ANALYSES["occupancy_digi"].parameters}
+    assert digi == {"strawdigis_tag": "makeSD", "calodigis_tag": "CaloDigiMaker",
+                    "crvdigis_tag": "CrvDigi"}
+    reco = {p.name: p.default for p in ANALYSES["occupancy_reco"].parameters}
+    assert reco["strawhits_tag"] == "makeSH" and reco["combohits_tag"] == "makePH"
+    assert reco["calohits_tag"] == "CaloHitMaker"
+    assert reco["caloclusters_tag"] == "CaloClusterMaker"
+    assert reco["calorecodigis_tag"] == ""                  # a SelectReco subset
+    assert not {"strawdigis_tag", "crvdigis_tag", "crvpulses_tag"} & set(reco)
+    # the window defaults to everything
+    assert (reco["hit_time_min"], reco["hit_time_max"], reco["calo_hit_energy_min"]
+            ) == (-1e9, 1e9, 0.0)
+    assert all(p.allow_empty for p in ANALYSES["occupancy_digi"].parameters)
+
+
+def test_occupancy_job_fcl_appends_the_tags_and_window_to_the_shipped_text():
+    text = occ.job_fcl_text({"strawhits": "makeSH", "calohits": "CaloHitMaker:x:P"},
+                            (700.0, 1695.0, 10.0))
+    assert text.startswith(occ.FCL.read_text(encoding="utf-8").rstrip())
+    assert "physics.analyzers.OccupancyAna.StrawHitCollection : \"makeSH\"" in text
+    assert "CaloHitCollection : \"CaloHitMaker:x:P\"" in text
+    assert "ComboHitCollection" not in text.split("set by tools")[1]    # skipped
+    assert "HitTimeMin : 700\n" in text and "HitTimeMax : 1695\n" in text
+    assert "CaloHitEnergyMin : 10\n" in text
+    assert "HitTime" not in occ.job_fcl_text({"strawdigis": "makeSD"}).split("set by tools")[1]
+    # the shipped fcl itself configures no collection: the run decides them
+    assert "Collection" not in "".join(
+        line for line in occ.FCL.read_text().splitlines() if not line.startswith("#"))
+
+
+def test_occupancy_tags_must_be_input_tags_and_one_must_be_left():
+    params = {"strawhits_tag": "makeSH", "combohits_tag": " ", "calohits_tag": "A:b:C"}
+    assert occ.parse_tags(params, occ_reco.COLLECTIONS) == {
+        "strawhits": "makeSH", "calohits": "A:b:C"}
+    for bad in ('make SH', 'a"b', "x:y:z:w", "a;b"):
+        try:
+            occ.parse_tags({"strawhits_tag": bad}, occ_reco.COLLECTIONS)
+        except occ.OccupancyError as exc:
+            assert "strawhits_tag" in str(exc) and "input tag" in str(exc)
+        else:
+            raise AssertionError(f"{bad!r} was accepted as a tag")
+    try:
+        occ.parse_tags({n + "_tag": "" for n in occ_digi.COLLECTIONS}, occ_digi.COLLECTIONS)
+    except occ.OccupancyError as exc:
+        assert "every collection is skipped" in str(exc) and "crvdigis_tag" in str(exc)
+    else:
+        raise AssertionError("an all-skipped request was accepted")
+
+
+def test_occupancy_parameters_validate():
+    spec = ANALYSES["occupancy_reco"]
+    assert spec.resolve_params({"strawhits_tag": ""})["strawhits_tag"] == ""
+    for bad in ({"calo_hit_energy_min": -1}, {"hit_time_min": "soon"},
+                {"strawhits_tag": 5}, {"crvdigis_tag": "CrvDigi"}):
+        try:
+            spec.resolve_params(bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"{bad} was accepted")
+
+
+def _write_occupancy_tree(path, events, ndisk=2, nplane=36):
+    """A synthetic OccupancyAna/tree: `events` rows of (strawhits, calohits,
+    plane counts, disk counts, windowed straw hits); -1 where skipped."""
+    import uproot
+
+    n = len(events)
+    with uproot.recreate(path) as f:
+        tree = f.mktree("OccupancyAna/tree", {
+            "nstrawhits": "i4", "ncalohits": "i4", "nstrawhits_sel": "i4",
+            "ncalohits_sel": "i4", "ncombohit_straws": "i4",
+            "strawhits_plane": np.dtype(("i4", (nplane,))),
+            "calohits_disk": np.dtype(("i4", (ndisk,)))})
+        planes = np.full((n, nplane), -1, dtype=np.int32)
+        disks = np.full((n, ndisk), -1, dtype=np.int32)
+        for i, (nsh, nch, plane0, disk0) in enumerate(events):
+            if nsh >= 0:
+                planes[i] = 1
+                planes[i, 0] = plane0
+            if nch >= 0:
+                disks[i] = (disk0, nch - disk0)
+        tree.extend({
+            "nstrawhits": np.array([e[0] for e in events], dtype=np.int32),
+            "ncalohits": np.array([e[1] for e in events], dtype=np.int32),
+            "nstrawhits_sel": np.array([e[0] // 2 if e[0] >= 0 else -1 for e in events],
+                                       dtype=np.int32),
+            "ncalohits_sel": np.array([e[1] // 2 if e[1] >= 0 else -1 for e in events],
+                                      dtype=np.int32),
+            "ncombohit_straws": np.full(n, -1, dtype=np.int32),
+            "strawhits_plane": planes, "calohits_disk": disks})
+
+
+def test_occupancy_tree_gives_plane_disk_and_windowed_means_over_events_that_have_them(tmp_dir):
+    path = Path(tmp_dir) / "occ.root"
+    # the second event lacks the straw hit collection, the third the calo hits
+    _write_occupancy_tree(path, [(100, 10, 9, 6), (-1, 20, 0, 12), (50, -1, 3, 0)])
+    tree = occ.read_tree([path])
+    assert tree["strawhits_plane"].shape == (3, 36)
+    metrics, extra = occ.tree_metrics(("strawhits", "combohits", "calohits"), tree)
+    assert metrics["strawhits_busiest_plane_mean"] == 6.0       # plane 0: (9 + 3) / 2
+    assert extra["busiest_plane"]["strawhits"] == 0
+    assert metrics["strawhits_sel_mean"] == 37.5                # (50 + 25) / 2
+    assert metrics["calohits_disk0_mean"] == 9.0 and metrics["calohits_disk1_mean"] == 6.0
+    assert metrics["calohits_sel_mean"] == 7.5
+    assert metrics["combohits_sel_mean"] == -1.0                # no such branch
+    assert metrics["combohit_straws_mean"] == -1.0              # -1 in every event
+    # a collection that is not counted stays -1
+    assert occ.tree_metrics(("calohits",), tree)[0].get("strawhits_sel_mean") is None
+    assert tuple(occ.tree_metrics(occ_reco.COLLECTIONS, tree)[0]) == \
+        occ.tree_metric_names(occ_reco.COLLECTIONS)
+
+
+@contextlib.contextmanager
+def _fake_occupancy_job(stdout, stderr="", returncode=0, events=((100, 10, 9, 6),)):
+    """Replace run_mu2e_job in occupancy.py with one that prints `stdout` and
+    writes a synthetic tree; returns the fcl text the job was given."""
+    from tools.mu2e_job import JobOutcome
+
+    seen: dict = {}
+
+    def fake(*, fcl, input_paths, outdir, single, timeout_s, max_events=None, **_):
+        seen["fcl"] = Path(fcl).read_text()
+        seen["max_events"] = max_events
+        _write_occupancy_tree(outdir / "nts.owner.occupancy.version.sequencer.root",
+                              list(events))
+        return JobOutcome(
+            command="mu2e", returncode=returncode, timed_out=False, stdout=stdout,
+            stderr=stderr, log_path=outdir / "mu2e.log", input_paths=input_paths,
+            input_flag="-s", environment="fake", file_list_path=None,
+            written_root_files=[str(outdir / "nts.owner.occupancy.version.sequencer.root")])
+
+    original = occ.run_mu2e_job
+    occ.run_mu2e_job = fake
+    try:
+        yield seen
+    finally:
+        occ.run_mu2e_job = original
+
+
+def _run_occupancy(name, tmp_dir, stdout, params=None, **kwargs):
+    from tools.spec import RunContext
+
+    spec = ANALYSES[name]
+    out = Path(tmp_dir) / "out"
+    out.mkdir(exist_ok=True)
+    with _fake_occupancy_job(stdout, **kwargs) as seen:
+        outcome = spec.run(RunContext(
+            input_paths=[Path("/a.art")], outdir=out,
+            params=spec.resolve_params(params), timeout_s=60, max_events=5))
+    return outcome, seen
+
+
+def test_occupancy_reco_runs_a_per_run_fcl_and_reports_every_declared_metric(tmp_dir):
+    outcome, seen = _run_occupancy(
+        "occupancy_reco", tmp_dir, SAMPLE_OCCUPANCY_RECO_STDOUT,
+        {"hit_time_min": 700, "calorecodigis_tag": "CaloRecoDigiMaker"})
+    assert outcome.error is None, outcome.error
+    assert "HitTimeMin : 700" in seen["fcl"] and seen["max_events"] == 5
+    assert "CaloRecoDigiCollection : \"CaloRecoDigiMaker\"" in seen["fcl"]
+    assert outcome.extra["job_fcl"] == str(Path(tmp_dir) / "out" / "occupancy_job.fcl")
+    assert tuple(outcome.metrics) == ANALYSES["occupancy_reco"].metrics
+    assert outcome.metrics["n_events"] == 50.0
+    assert outcome.metrics["strawhits_mean"] == 779.42
+    assert outcome.metrics["strawhits_busiest_plane_mean"] == 9.0
+    assert outcome.metrics["calohits_sel_mean"] == 5.0
+    assert "calorecodigis" in outcome.extra["warnings"][0]      # missing in every event
+
+
+def test_occupancy_digi_marks_skipped_collections_minus_one(tmp_dir):
+    # the job prints no row for a collection that has no tag
+    stdout = "\n".join(line for line in SAMPLE_OCCUPANCY_DIGI_STDOUT.splitlines()
+                       if "crvdigis" not in line)
+    outcome, seen = _run_occupancy("occupancy_digi", tmp_dir, stdout,
+                                   {"crvdigis_tag": ""})
+    assert outcome.error is None, outcome.error
+    assert "CrvDigiCollection" not in seen["fcl"].split("set by tools")[1]
+    assert "HitTime" not in seen["fcl"].split("set by tools")[1]     # digis have no window
+    assert outcome.extra["skipped"] == ["crvdigis"]
+    assert outcome.metrics["crvdigis_mean"] == -1.0
+    assert outcome.metrics["crvdigis_events_found"] == -1.0
+    assert outcome.metrics["strawdigis_mean"] == 44.74
+
+
+def test_occupancy_with_every_collection_skipped_never_starts_a_job(tmp_dir):
+    outcome, seen = _run_occupancy(
+        "occupancy_digi", tmp_dir, "", {"strawdigis_tag": "", "calodigis_tag": "",
+                                        "crvdigis_tag": ""})
+    assert "every collection is skipped" in outcome.error and "fcl" not in seen
+    outcome, seen = _run_occupancy("occupancy_reco", tmp_dir, "",
+                                   {"hit_time_min": 5, "hit_time_max": 1})
+    assert "hit_time_min" in outcome.error and "fcl" not in seen
+
+
+def test_occupancy_on_an_offline_without_the_module_says_it_needs_the_pr(tmp_dir):
+    art = ('Library specification "OccupancyAna" does not correspond to any library '
+           'in CET_PLUGIN_PATH of type "module"')
+    outcome, _ = _run_occupancy("occupancy_reco", tmp_dir, "", stderr=art, returncode=9)
+    assert "OccupancyAna needs an Offline that includes PR #2070" in outcome.error
+    assert "Traceback" not in outcome.error
+    # any other failure is reported as itself
+    outcome, _ = _run_occupancy("occupancy_reco", tmp_dir, "", stderr="boom", returncode=1)
+    assert outcome.error == "mu2e exited 1"
+    outcome, _ = _run_occupancy("occupancy_reco", tmp_dir, "Art has completed")
+    assert "summary table not found" in outcome.error
+
+
+def _write_event_ntuple(path, *, hitcount=True, crv=True, calo=True, tracks=True,
+                        n=3):
+    """A synthetic EventNtuple/ntuple with only the groups asked for. The
+    branches are flat and dotted, which is one of the layouts read."""
+    import awkward as ak
+    import uproot
+
+    types, data = {}, {}
+    if hitcount:
+        for leaf, values in (("nsd", [100, 200, 300]), ("nesel", [90, 190, 290]),
+                             ("nrsel", [80, 180, 280]), ("ntsel", [100, 200, 300]),
+                             ("nbkg", [0, 0, 3])):
+            types[f"hitcount.{leaf}"] = "i4"
+            data[f"hitcount.{leaf}"] = np.array(values, dtype=np.int32)
+    if calo:
+        types.update({"calohits.time_": "var * float32", "calohits.eDep_": "var * float32",
+                      "caloclusters.time_": "var * float32"})
+        data.update({
+            "calohits.time_": ak.Array([[100., 900., 1500.], [], [800., 850.]]),
+            "calohits.eDep_": ak.Array([[1., 20., 30.], [], [5., 15.]]),
+            "caloclusters.time_": ak.Array([[900.], [], [800., 850.]])})
+    if crv:
+        types.update({"crvcoincs.time": "var * float32", "crvsummary.nHitCounters": "i4",
+                      "crvsummary.totalPEs": "i4"})
+        data.update({"crvcoincs.time": ak.Array([[1.], [], [2., 3., 4.]]),
+                     "crvsummary.nHitCounters": np.array([1, 0, 4], dtype=np.int32),
+                     "crvsummary.totalPEs": np.array([10, 0, 40], dtype=np.int32)})
+    if tracks:
+        types["tcnt.ntrk"] = "i4"
+        data["tcnt.ntrk"] = np.array([0, 1, 1], dtype=np.int32)
+    with uproot.recreate(path) as f:
+        f.mktree("EventNtuple/ntuple", types).extend(data)
+
+
+def test_occupancy_ntuple_counts_jagged_calo_hits_and_the_window(tmp_dir):
+    path = Path(tmp_dir) / "full.root"
+    _write_event_ntuple(path)
+    result = run_analysis(analysis="occupancy_ntuple", data_file=str(path),
+                          output_dir=tmp_dir,
+                          parameters={"hit_time_min": 700, "hit_time_max": 1000,
+                                      "calo_hit_energy_min": 10})
+    assert result.status == "success", result.message
+    meta = result.metadata
+    assert meta["n_events"] == 3
+    assert meta["strawdigis_mean"] == 200.0 and meta["strawdigis_max"] == 300.0
+    assert abs(meta["strawdigis_rms"] - np.std([100, 200, 300])) < 1e-9
+    assert meta["strawhits_bkg_max"] == 3.0
+    assert meta["calohits_mean"] == 5 / 3 and meta["calohits_max"] == 3.0   # sizes of [3, 0, 2]
+    assert meta["caloclusters_mean"] == 1.0
+    # window 700-1000 ns and >= 10 MeV: the 20 MeV hit and the 15 MeV one
+    assert meta["calohits_sel_mean"] == 2 / 3
+    assert meta["crvcoincs_mean"] == 4 / 3 and meta["crv_total_pes_max"] == 40.0
+    assert meta["crv_hit_counters_mean"] == 5 / 3 and meta["ntracks_mean"] == 2 / 3
+    assert "missing" not in meta
+    assert set(ANALYSES["occupancy_ntuple"].metrics) <= set(meta)
+
+
+def test_occupancy_ntuple_reports_missing_groups_and_errors_only_if_all_are_missing(tmp_dir):
+    path = Path(tmp_dir) / "partial.root"
+    _write_event_ntuple(path, crv=False, calo=False)
+    result = run_analysis(analysis="occupancy_ntuple", data_file=str(path),
+                          output_dir=tmp_dir)
+    assert result.status == "success", result.message
+    meta = result.metadata
+    assert {"calohits", "caloclusters", "crvcoincs", "crv_hit_counters",
+            "crv_total_pes", "calohits_sel"} == set(meta["missing"])
+    assert meta["calohits_mean"] == -1.0 and meta["calohits_sel_mean"] == -1.0
+    assert meta["crvcoincs_max"] == -1.0 and meta["strawdigis_mean"] == 200.0
+    # the default window is everything
+    assert meta["window"]["hit_time_max"] == 1e9
+    empty = Path(tmp_dir) / "none.root"
+    # a tree with a single unrelated branch
+    import uproot
+    with uproot.recreate(empty) as f:
+        f.mktree("EventNtuple/ntuple", {"evtinfo.event": "i4"}).extend(
+            {"evtinfo.event": np.array([1, 2], dtype=np.int32)})
+    result = run_analysis(analysis="occupancy_ntuple", data_file=str(empty),
+                          output_dir=tmp_dir)
+    assert result.status == "error" and "none of the occupancy branches" in result.message
+    not_ntuple = Path(tmp_dir) / "other.root"
+    with uproot.recreate(not_ntuple) as f:
+        f.mktree("other", {"x": "i4"}).extend({"x": np.array([1], dtype=np.int32)})
+    result = run_analysis(analysis="occupancy_ntuple", data_file=str(not_ntuple),
+                          output_dir=tmp_dir)
+    assert result.status == "error" and "no EventNtuple/ntuple" in result.message
+
+
+def test_occupancy_ntuple_combines_files_and_drops_a_group_missing_from_one(tmp_dir):
+    a, b = Path(tmp_dir) / "a.root", Path(tmp_dir) / "b.root"
+    _write_event_ntuple(a)
+    _write_event_ntuple(b, crv=False)
+    result = run_analysis(analysis="occupancy_ntuple", data_files=[str(a), str(b)],
+                          output_dir=tmp_dir)
+    assert result.status == "success", result.message
+    assert result.metadata["n_events"] == 6
+    assert result.metadata["strawdigis_mean"] == 200.0
+    assert result.metadata["crvcoincs_mean"] == -1.0        # not in every file
+    assert "crvcoincs" in result.metadata["missing"]
+    assert len(result.metadata["per_file_events"]) == 2
+    both = run_analysis(analysis="occupancy_ntuple", data_files=[str(a), str(a)],
+                        output_dir=tmp_dir)
+    assert both.metadata["calohits_mean"] == 5 / 3
+
+
+def test_occupancy_ntuple_on_a_real_file(tmp_dir):
+    from tools import catalog
+
+    if (not catalog.CLIENT.exists(REAL_OCCUPANCY_NTUPLE)
+            or catalog.CLIENT.locality(REAL_OCCUPANCY_NTUPLE) not in catalog.ONLINE):
+        return
+    result = run_analysis(analysis="occupancy_ntuple", data_file=str(REAL_OCCUPANCY_NTUPLE),
+                          output_dir=tmp_dir)
+    assert result.status == "success", result.message
+    meta = result.metadata
+    assert meta["n_events"] == 622 and "missing" not in meta
+    assert 700 < meta["strawdigis_mean"] < 800 and meta["strawhits_bkg_max"] == 0.0
+    assert 50 < meta["calohits_mean"] < 60 and 5 < meta["caloclusters_mean"] < 6
+    assert meta["calohits_sel_mean"] == meta["calohits_mean"]     # full window
+
+
 # --- the registry (loops over every analysis) --------------------------------
 
 def test_registry_includes_every_analysis():
@@ -2512,7 +3196,9 @@ def test_every_art_analysis_parser_matches_its_declared_metrics():
         assert sample is not None, f"{name}: add a sample stdout to SAMPLE_STDOUT"
         if name == "edep":
             # the summary block, then what the selection adds from the tree
+            # (the step counts, absent on an older Offline, come last)
             assert (tuple(parse_edep_summary(sample)) + edep_mod._SELECTION_METRICS
+                    + tuple(edep_mod.parse_step_counts(SAMPLE_EDEP_STEPS_STDOUT)[0])
                     == spec.metrics)
         elif name == "count":
             assert tuple(saved_rates(parse_counts(sample))) == spec.metrics
@@ -2534,6 +3220,11 @@ def test_every_art_analysis_parser_matches_its_declared_metrics():
         elif name == "trigger_timing":
             # its numbers come from the timing database, not stdout
             assert tuple(timing_metrics(np.array([0.01, 0.02]))) == spec.metrics
+        elif name in ("occupancy_digi", "occupancy_reco"):
+            # the table's metrics, then what the per-event tree adds
+            names = (occ_digi if name == "occupancy_digi" else occ_reco).COLLECTIONS
+            table = occ.table_metrics(names, occ.parse_summary(sample))
+            assert ("n_events", *table, *occ.tree_metric_names(names)) == spec.metrics
         else:
             raise AssertionError(f"{name}: add its parser to this test")
 

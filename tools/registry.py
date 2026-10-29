@@ -20,6 +20,7 @@ _ANALYSIS_MODULES = ("edep", "count", "muon_stop_rate", "approx_ce_sensitivity",
                      "selection_efficiency_ntuple", "momentum_resolution_ntuple",
                      "muon_stops", "calo_cluster_resolution_ntuple",
                      "variable_comparison_ntuple",
+                     "occupancy_digi", "occupancy_reco", "occupancy_ntuple",
                      "fullsim.sensitivity")
 
 

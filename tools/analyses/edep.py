@@ -5,7 +5,10 @@ event, plus the number and rate of events passing a configurable selection.
 The averages come from the summary block EdepAna prints at endJob; the
 selection is applied to the per-event TTree it writes (EDepAna/tree). The
 module lives in Offline (Offline/Analyses/src/EdepAna_module.cc, from
-v13_39_00), so it comes with the configured Musing or its backing.
+v13_39_00), so it comes with the configured Musing or its backing. Offline
+PR #2067 (merged 2026-10-27) added approximate hit counts from detector steps
+to it; they are reported only where the configured Offline has them (see
+`run`).
 
 This module also owns the reading of that tree — `read_edep_tree` and
 `EDEP_VARIABLES` — so every analysis of EdepAna output selects events the
@@ -18,7 +21,7 @@ from pathlib import Path
 
 import numpy as np
 
-from ..mu2e_job import run_mu2e_job
+from ..mu2e_job import ModuleProbeError, module_accepts, run_mu2e_job
 from ..selection import SelectionError, apply_selection
 from ..spec import FCL_DIR, AnalysisSpec, ParamSpec, RunContext, RunOutcome
 
@@ -80,6 +83,25 @@ EDEP_VARIABLES: dict[str, str] = {
         "primary visible calo edep minus tracker-front energy (MeV)",
 }
 
+# Optional: only in a tree from an EdepAna with Offline PR #2067 (the step
+# counts). Read only where the file has them; `check_optional_names` turns a
+# selection naming one on an older file into a plain error.
+_STEP_BRANCHES = tuple(f"event_{det}_nsteps{cut}" for det in ("calo", "trk")
+                       for cut in ("", "_ecut", "_ecut_tcut"))
+OPTIONAL_EDEP_VARIABLES: dict[str, str] = {
+    "event_calo_nsteps": "CaloShowerSteps in the event (needs Offline PR #2067)",
+    "event_calo_nsteps_ecut":
+        "... with energyDepBirks above the calo step threshold",
+    "event_calo_nsteps_ecut_tcut":
+        "... and with step time inside the calo window",
+    "event_trk_nsteps": "StrawGasSteps in the event (needs Offline PR #2067)",
+    "event_trk_nsteps_ecut":
+        "... with ionizingEdep above the tracker step threshold",
+    "event_trk_nsteps_ecut_tcut":
+        "... and with step time inside the tracker window",
+}
+assert tuple(OPTIONAL_EDEP_VARIABLES) == _STEP_BRANCHES
+
 
 class EdepTreeError(RuntimeError):
     """The input is not an EdepAna file with the tree, worded for the caller."""
@@ -120,11 +142,19 @@ def edep_variables(branches: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
                                        - out["primary_start_e"])
     out["primary_trk_front_energy_edep_diff"] = (out["primary_calo_edep_vis"]
                                                  - out["primary_trk_front_energy"])
+    # Step counts, where the tree has them (the caller passes only those).
+    for name in _STEP_BRANCHES:
+        if name in branches:
+            out[name] = np.asarray(branches[name], dtype=np.float64)
     return out
 
 
 def read_edep_tree(paths: list[Path] | Path) -> dict[str, np.ndarray]:
-    """EDEP_VARIABLES for every event in the EdepAna file(s), concatenated."""
+    """EDEP_VARIABLES for every event in the EdepAna file(s), concatenated.
+
+    The optional step-count variables are included only if every file has
+    their branches (a mix would leave events without a value).
+    """
     import uproot
 
     paths = [paths] if isinstance(paths, Path) else list(paths)
@@ -133,8 +163,9 @@ def read_edep_tree(paths: list[Path] | Path) -> dict[str, np.ndarray]:
         try:
             with uproot.open(path) as rootfile:
                 tree = rootfile[TREE_PATH]
-                branches = tree.arrays(_EVENT_BRANCHES + _PRIMARY_BRANCHES,
-                                       library="np")
+                present = [name for name in _STEP_BRANCHES if name in tree]
+                branches = tree.arrays(_EVENT_BRANCHES + _PRIMARY_BRANCHES
+                                       + tuple(present), library="np")
         except KeyError as exc:
             raise EdepTreeError(
                 f"{path}: no {TREE_PATH} with the EdepAna branches ({exc}) — is "
@@ -143,7 +174,7 @@ def read_edep_tree(paths: list[Path] | Path) -> dict[str, np.ndarray]:
             ) from None
         parts.append(edep_variables(branches))
     return {name: np.concatenate([part[name] for part in parts])
-            for name in parts[0]}
+            for name in parts[0] if all(name in part for part in parts)}
 
 
 def generated_events(paths: list[Path] | Path) -> float:
@@ -221,8 +252,26 @@ def read_run_record(path: Path) -> dict | None:
     return data
 
 
+def check_optional_names(variables: dict[str, np.ndarray], selection: str) -> None:
+    """Refuse a selection naming a step-count variable the tree does not have.
+
+    Raises EdepTreeError, so the caller gets what is missing and why rather
+    than the selection parser's unknown-name message.
+    """
+    names = set(re.findall(r"[A-Za-z_][A-Za-z_0-9]*", selection))
+    missing = sorted(n for n in names
+                     if n in OPTIONAL_EDEP_VARIABLES and n not in variables)
+    if missing:
+        raise EdepTreeError(
+            f"the selection uses {', '.join(missing)}, but this EdepAna tree has no "
+            "step-count branches: they come from an EdepAna with Offline PR #2067 "
+            "(merged 2026-10-27). Rerun 'edep' in an Offline that has it, or drop "
+            "them from the selection.")
+
+
 def select_events(variables: dict[str, np.ndarray], selection: str) -> np.ndarray:
     """The mask of events passing `selection`, a cut over EDEP_VARIABLES."""
+    check_optional_names(variables, selection)
     nevents = variables["event_calo_edep_vis"].size
     return apply_selection(selection, variables, nevents)
 
@@ -234,7 +283,10 @@ def selection_help() -> str:
         "'event_calo_edep_vis > 10 && primary_start_z > 5400'. Comparisons, "
         "arithmetic, and/or/not (or &&/||/!) and abs/sqrt/hypot/min/max/log/"
         "exp over: " + ", ".join(EDEP_VARIABLES) + ". Per-primary variables "
-        "are the first primary's. An empty string selects every event."
+        "are the first primary's. Also, only for an EdepAna tree made with "
+        "Offline PR #2067 (the step counts): "
+        + ", ".join(OPTIONAL_EDEP_VARIABLES) + "; on an older tree a "
+        "selection naming one is an error. An empty string selects every event."
     )
 
 # Matches the block EdepAna_module.cc prints, e.g.:
@@ -266,6 +318,73 @@ _SUMMARY_FIELDS = [
 
 _SELECTION_METRICS = ("n_events_selected", "selected_per_gen_event")
 
+# --- step counts (Offline PR #2067) --------------------------------------------
+# Approximate hit counts from detector steps, printed after the summary block:
+#   Calo step counts (E > 0.5 MeV, 500 <= t <= 1e+09 ns):
+#     all       : total = 19           per event = 0.095       per gen event = 0.019
+#     E cut     : total = 16 ...
+#     E + t cut : total = 12 ...
+# then the same for "Tracker". The module's per-event and per-gen-event
+# values are -1 when their denominator is 0, and that is passed through.
+STEP_DETECTORS = (("Calo", "calo"), ("Tracker", "trk"))
+STEP_CUTS = (("all", ""), ("E cut", "_ecut"), ("E + t cut", "_ecut_tcut"))
+STEP_QUANTITIES = (("total", "total", "steps"),
+                   ("per event", "per_event", "steps / event"),
+                   ("per gen event", "per_gen_event", "steps / gen event"))
+
+STEP_METRICS = tuple(f"{det}_nsteps{cut}_{key}" for _, det in STEP_DETECTORS
+                     for _, cut in STEP_CUTS for _, key, _ in STEP_QUANTITIES)
+STEP_UNITS = {f"{det}_nsteps{cut}_{key}": unit for _, det in STEP_DETECTORS
+              for _, cut in STEP_CUTS for _, key, unit in STEP_QUANTITIES}
+
+_STEP_HEADER = re.compile(
+    rf"(Calo|Tracker) step counts \(E > ({_NUM}) MeV, ({_NUM}) <= t <= ({_NUM}) ns\):")
+_STEP_ROW = re.compile(
+    rf"^\s*(all|E cut|E \+ t cut)\s*:\s*total = ({_NUM})\s+per event = ({_NUM})\s+"
+    rf"per gen event = ({_NUM})\s*$", re.MULTILINE)
+
+# The step parameters EdepAna takes from PR #2067, all required there (no
+# module defaults): (analysis parameter, EdepAna key, default, minimum,
+# maximum, description). Defaults are the PR's example fcl.
+_STEP_NOTE = ("Needs an Offline with PR #2067 (merged 2026-10-27); on an older "
+              "one only the default is accepted, and the step-count metrics are "
+              "left out. The energy cut is strict (E must be above it) and the "
+              "time window is inclusive. Step times are raw Geant4 times: no "
+              "time offsets and no microbunch folding.")
+STEP_PARAMS = (
+    ("trk_step_energy_threshold_mev", "TrkStepEnergyThreshold", 0.0005, 0.0, 1000.0,
+     "Tracker step count: a StrawGasStep counts when its ionizingEdep (MeV) is "
+     "above this. A StrawGasStep is roughly one particle crossing one straw, so "
+     "this approximates a straw hit. " + _STEP_NOTE),
+    ("trk_step_time_min_ns", "TrkStepTimeMin", 500.0, 0.0, 1e12,
+     "Tracker step count: earliest step time (ns) counted in the E + t cut. "
+     + _STEP_NOTE),
+    ("trk_step_time_max_ns", "TrkStepTimeMax", 1e9, 0.0, 1e12,
+     "Tracker step count: latest step time (ns) counted in the E + t cut. "
+     + _STEP_NOTE),
+    ("calo_step_energy_threshold_mev", "CaloStepEnergyThreshold", 0.5, 0.0, 1e4,
+     "Calorimeter step count: a CaloShowerStep counts when its energyDepBirks "
+     "(MeV) is above this. A CaloShowerStep is per particle per crystal, so it "
+     "is not a crystal-hit count. " + _STEP_NOTE),
+    ("calo_step_time_min_ns", "CaloStepTimeMin", 500.0, 0.0, 1e12,
+     "Calorimeter step count: earliest step time (ns) counted in the E + t cut. "
+     + _STEP_NOTE),
+    ("calo_step_time_max_ns", "CaloStepTimeMax", 1e9, 0.0, 1e12,
+     "Calorimeter step count: latest step time (ns) counted in the E + t cut. "
+     + _STEP_NOTE),
+)
+
+# The module whose parameters decide whether the step counts exist, and the
+# one it gained them with.
+MODULE_TYPE = "EdepAna"
+STEP_PROBE_PARAMETER = "TrkStepEnergyThreshold"
+ANALYZER_LABEL = "EDepAna"           # in edep.fcl
+JOB_FCL_NAME = "edep_job.fcl"
+
+
+class StepCountError(ValueError):
+    """The step-count request cannot run, worded for the caller."""
+
 METRIC_UNITS = {
     "event_rate": "events / gen event",
     "selected_per_gen_event": "events / gen event",
@@ -293,6 +412,67 @@ def parse_edep_summary(stdout: str) -> dict[str, float] | None:
     return metrics
 
 
+def parse_step_counts(stdout: str) -> tuple[dict[str, float], dict[str, dict[str, float]]] | None:
+    """The step-count blocks of the EdepAna printout (Offline PR #2067).
+
+    Returns (metrics, windows): the 18 STEP_METRICS, and per detector ("calo",
+    "trk") the energy threshold and time window the module printed, i.e. what
+    it actually used. None if either block is missing or incomplete, which is
+    what an EdepAna without the step counts prints.
+    """
+    metrics: dict[str, float] = {}
+    windows: dict[str, dict[str, float]] = {}
+    headers = {m.group(1): m for m in _STEP_HEADER.finditer(stdout)}
+    for label, det in STEP_DETECTORS:
+        header = headers.get(label)
+        if header is None:
+            return None
+        end = min((m.start() for m in headers.values() if m.start() > header.start()),
+                  default=len(stdout))
+        rows = {m.group(1): m for m in _STEP_ROW.finditer(stdout, header.end(), end)}
+        for cut_label, cut in STEP_CUTS:
+            row = rows.get(cut_label)
+            if row is None:
+                return None
+            for i, (_, key, _) in enumerate(STEP_QUANTITIES, start=2):
+                metrics[f"{det}_nsteps{cut}_{key}"] = float(row.group(i))
+        windows[det] = {"energy_threshold_mev": float(header.group(2)),
+                        "time_min_ns": float(header.group(3)),
+                        "time_max_ns": float(header.group(4))}
+    return metrics, windows
+
+
+def job_fcl_text(step_params: dict[str, float], base: Path = FCL) -> str:
+    """The run's fcl: the shipped edep.fcl plus the step-count parameters.
+
+    EdepAna with PR #2067 requires them and an older one rejects them, so they
+    cannot live in fcl/edep.fcl. FHiCL cannot `#include` an absolute path, so
+    this is a copy with the lines appended, as the trigger analyses do.
+    """
+    lines = [base.read_text(encoding="utf-8").rstrip(), "",
+             "# --- set by tools/analyses/edep.py for this run (Offline PR #2067) ---"]
+    for name, key, *_ in STEP_PARAMS:
+        lines.append(f"physics.analyzers.{ANALYZER_LABEL}.{key} : "
+                     f"{float(step_params[name])!r}")
+    return "\n".join(lines) + "\n"
+
+
+def step_param_problem(params: dict[str, float | str]) -> str | None:
+    """A complaint if the requested step window is empty, else None."""
+    for det, label in (("trk", "tracker"), ("calo", "calo")):
+        if params[f"{det}_step_time_min_ns"] > params[f"{det}_step_time_max_ns"]:
+            return (f"{det}_step_time_min_ns ({params[f'{det}_step_time_min_ns']:g}) "
+                    f"is above {det}_step_time_max_ns "
+                    f"({params[f'{det}_step_time_max_ns']:g}): the {label} step "
+                    "time window would be empty")
+    return None
+
+
+def non_default_step_params(params: dict[str, float | str]) -> list[str]:
+    """The step parameters the caller set away from their defaults."""
+    return [name for name, _, default, *_ in STEP_PARAMS if params[name] != default]
+
+
 def selected_metrics(variables: dict[str, np.ndarray], selection: str,
                      n_gen_events: float) -> dict[str, float]:
     """Weighted count of events passing `selection`, and that per gen event."""
@@ -305,26 +485,72 @@ def selected_metrics(variables: dict[str, np.ndarray], selection: str,
 
 
 def summarize_edep(metrics: dict[str, float]) -> str:
-    return (
+    text = (
         f"saw {metrics['n_events']:g} events ({metrics['n_gen_events']:g} gen): "
         f"avg calo edep {metrics['avg_calo_edep_per_event_mev']:.4g} MeV/event, "
         f"avg tracker edep {metrics['avg_trk_edep_per_event_mev']:.4g} MeV/event; "
         f"{metrics['n_events_selected']:g} selected "
         f"({metrics['selected_per_gen_event']:.4g} / gen event)."
     )
+    calo = metrics.get("calo_nsteps_ecut_tcut_per_event")
+    trk = metrics.get("trk_nsteps_ecut_tcut_per_event")
+    if calo is not None and trk is not None:
+        text += (f" Steps per event after the E + t cuts: calo {calo:.4g}, "
+                 f"tracker {trk:.4g} (-1 means no events).")
+    return text
 
 
 def run(context: RunContext) -> RunOutcome:
-    """Run edep.fcl, parse the summary block, and apply the selection."""
+    """Run edep.fcl, parse the summary block, and apply the selection.
+
+    The step counts need an EdepAna with Offline PR #2067, which requires
+    their six parameters, while an older EdepAna rejects them as unknown (and
+    the default environment may be either). So the configured Offline is asked
+    once (`mu2e --print-description EdepAna`, cached per environment) whether
+    the module declares them, rather than running and parsing a fhicl error:
+    it is cheap, exact, and keeps the job's own failures out of the decision.
+    On an older one the shipped fcl runs unchanged and the step metrics are
+    left out of the result, as an optional part of it.
+    """
+    try:
+        with_steps = module_accepts(MODULE_TYPE, STEP_PROBE_PARAMETER, context.outdir)
+    except ModuleProbeError as exc:
+        return RunOutcome(error=f"could not tell whether the configured Offline's "
+                                f"EdepAna has the step counts: {exc}")
+    extra: dict = {}
+    fcl = FCL
+    if with_steps:
+        problem = step_param_problem(context.params)
+        if problem:
+            return RunOutcome(error=problem)
+        context.outdir.mkdir(parents=True, exist_ok=True)
+        fcl = context.outdir / JOB_FCL_NAME
+        fcl.write_text(job_fcl_text(context.params), encoding="utf-8")
+        extra["job_fcl"] = str(fcl)
+    else:
+        changed = non_default_step_params(context.params)
+        if changed:
+            return RunOutcome(error=(
+                "the configured Offline's EdepAna predates the step counts "
+                f"(Offline PR #2067), so {', '.join(changed)} cannot be set; "
+                "leave the step parameters at their defaults, or run in an "
+                "Offline that has the PR"))
+        try:        # no job needed to know the tree will lack the branches
+            check_optional_names({}, context.params["selection"])
+        except EdepTreeError as exc:
+            return RunOutcome(error=str(exc))
+        extra["step_counts"] = ("not available: the configured Offline's EdepAna "
+                                "predates Offline PR #2067, so the *_nsteps_* "
+                                "metrics are absent")
     outcome = run_mu2e_job(
-        fcl=FCL,
+        fcl=fcl,
         input_paths=context.input_paths,
         outdir=context.outdir,
         single=len(context.input_paths) == 1 and not context.wants_file_list,
         timeout_s=context.timeout_s,
         max_events=context.max_events,
     )
-    extra = {"returncode": outcome.returncode}
+    extra["returncode"] = outcome.returncode
     if outcome.file_list_path is not None:
         extra["file_list_path"] = str(outcome.file_list_path)
 
@@ -349,6 +575,18 @@ def run(context: RunContext) -> RunOutcome:
             error="EdepAna summary block not found in mu2e output",
         )
 
+    if with_steps:
+        steps = parse_step_counts(outcome.stdout)
+        if steps is None:
+            extra["stdout_tail"] = outcome.stdout_tail()
+            return RunOutcome(
+                files=outcome.written_root_files, log_path=outcome.log_path,
+                extra=extra,
+                error="the step-count blocks not found in mu2e output, though "
+                      "this EdepAna declares the step parameters")
+        # What the module printed, i.e. what it used.
+        extra["step_count_windows"] = steps[1]
+
     selection = context.params["selection"]
     extra["selection"] = selection
     ntuples = [Path(f) for f in outcome.written_root_files]
@@ -366,6 +604,8 @@ def run(context: RunContext) -> RunOutcome:
     except (EdepTreeError, SelectionError) as exc:
         return RunOutcome(files=outcome.written_root_files,
                           log_path=outcome.log_path, extra=extra, error=str(exc))
+    if with_steps:
+        metrics.update(steps[0])        # after the selection: the spec's order
     return RunOutcome(metrics=metrics, files=outcome.written_root_files,
                       log_path=outcome.log_path, extra=extra)
 
@@ -378,10 +618,17 @@ SPEC = AnalysisSpec(
     description=(
         "Average calorimeter and tracker energy deposition per event and per "
         "generated event (EdepAna), and the number and rate per generated "
-        "event of events passing a configurable selection."
+        "event of events passing a configurable selection. With an Offline "
+        "that has PR #2067 it also reports approximate hit counts from "
+        "detector steps (calo_nsteps_*, trk_nsteps_*: all steps, above an "
+        "energy threshold, and also inside a time window); with an older one "
+        "those metrics are absent."
     ),
-    metrics=tuple(name for name, _ in _SUMMARY_FIELDS) + _SELECTION_METRICS,
-    units=METRIC_UNITS,
+    # The *_nsteps_* metrics come last and only where the configured Offline's
+    # EdepAna has Offline PR #2067: otherwise they are absent from the result.
+    metrics=(tuple(name for name, _ in _SUMMARY_FIELDS) + _SELECTION_METRICS
+             + STEP_METRICS),
+    units={**METRIC_UNITS, **STEP_UNITS},
     parameters=(
         ParamSpec(
             name="selection",
@@ -390,6 +637,9 @@ SPEC = AnalysisSpec(
                         "n_events_calo_edep_above_50mev.",
             default=DEFAULT_SELECTION, kind="text", allow_empty=True,
         ),
+        *(ParamSpec(name=name, description=desc, default=default,
+                    minimum=lo, maximum=hi)
+          for name, _, default, lo, hi, desc in STEP_PARAMS),
     ),
     summarize=summarize_edep,
     input_hint=(
