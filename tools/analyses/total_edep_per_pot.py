@@ -53,6 +53,15 @@ def per_pot(params: dict[str, float]) -> dict[str, float]:
 
 def run(context: RunContext) -> RunOutcome:
     params = {k: float(v) for k, v in context.params.items()}
+    for name, value in params.items():
+        if not 0.0 <= value < float("inf"):
+            return RunOutcome(
+                error=f"parameter '{name}' must be finite and non-negative"
+            )
+    if params["pot_per_ebeam_event"] <= 0:
+        return RunOutcome(
+            error="parameter 'pot_per_ebeam_event' must be greater than zero"
+        )
     return RunOutcome(metrics=per_pot(params))
 
 
