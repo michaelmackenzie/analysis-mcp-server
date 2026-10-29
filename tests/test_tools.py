@@ -2577,7 +2577,10 @@ def test_occupancy_ntuple_combines_files_and_drops_a_group_missing_from_one(tmp_
 
 
 def test_occupancy_ntuple_on_a_real_file(tmp_dir):
-    if not REAL_OCCUPANCY_NTUPLE.exists():
+    from tools import catalog
+
+    if (not catalog.CLIENT.exists(REAL_OCCUPANCY_NTUPLE)
+            or catalog.CLIENT.locality(REAL_OCCUPANCY_NTUPLE) not in catalog.ONLINE):
         return
     result = run_analysis(analysis="occupancy_ntuple", data_file=str(REAL_OCCUPANCY_NTUPLE),
                           output_dir=tmp_dir)
