@@ -16,6 +16,16 @@ and `trkcalohit` branches and from the track's segments (`trksegs`,
   pz > 0; `downstream` means pz > 0 at TT_Mid.
 * The fit parameters (`trksegpars_lh`) share the segments' indexing, so a
   track's `d0`, `maxr`, `t0err`, ... are the entries at its TT_Mid segment.
+
+Simulated files also carry each track's MC truth, offered as the `mc_*`
+variables (MC_VARIABLES): the track's own sim particle (`trkmcsim`, whose
+first entry is the particle the track was matched to) and its true surface
+crossings (`trksegsmc`). The MC TT_Front crossing is the earliest one with
+pz > 0, since the true steps are not stored in time order. `mc_npot` is
+the event's true beam intensity (protons on target in its microbunch,
+`evtinfomc.nprotons`), the same for every track of the event. A file without
+these branches (data) is read without them, and naming an `mc_*` variable
+then is an error.
 """
 
 from __future__ import annotations
@@ -83,6 +93,28 @@ TRACK_VARIABLES: dict[str, str] = {
     "ntrk": "tracks in the event",
 }
 
+# MC truth per track, only in simulated files.
+MC_VARIABLES: dict[str, str] = {
+    "mc_pdg": "PDG id of the track's sim particle",
+    "mc_start_code": "creation process code of the track's sim particle "
+                     "(ProcessCode.hh, e.g. 167/168 CE-, 166/170 DIO)",
+    "mc_gen": "generator id of the track's sim particle",
+    "mc_p_start": "true momentum at creation (MeV/c)",
+    "mc_t_start": "true creation time (ns)",
+    "mc_nhits": "straw hits from the sim particle on the track",
+    "mc_nactive": "active straw hits from the sim particle on the track",
+    "mc_has_front": "the sim particle has a downstream-going TT_Front crossing",
+    "mc_p_front": "true momentum at TT_Front, downstream crossing (MeV/c)",
+    "mc_pt_front": "true transverse momentum at TT_Front (MeV/c)",
+    "mc_pz_front": "true pz at TT_Front (MeV/c)",
+    "mc_cos_front": "true cos(theta) at TT_Front",
+    "mc_t_front": "true time at TT_Front (ns)",
+    "mc_p_mid": "true momentum at TT_Mid (MeV/c)",
+    "mc_t_mid": "true time at TT_Mid (ns)",
+    "mc_npot": "true protons on target in the event's microbunch "
+               "(evtinfomc.nprotons; the beam intensity, ~1e7-1e8 for Run 1)",
+}
+
 # The leaves read, by name (uproot's filter_name): only what TRACK_VARIABLES
 # needs. Split struct members are named "<branch>.<member>"; evtinfo's are not.
 LEAVES = (
@@ -91,6 +123,11 @@ LEAVES = (
     "trkcalohit.did", "trkcalohit.edep", "trkcalohit.dt",
     "trksegs", "trksegpars_lh", "event", "run", "subrun",
 )
+# Read too where the file has them (simulation), for MC_VARIABLES.
+MC_LEAVES = ("trksegsmc", "trkmcsim")
+# The true beam intensity. Read by its full path: evtinfo has a leaf of the
+# same name (the reconstructed estimate, 0 in simulation).
+NPOT_BRANCH = "evtinfomc/nprotons"
 
 
 class NtupleError(ValueError):
@@ -128,11 +165,57 @@ def _flat(array, fill=np.nan) -> np.ndarray:
     return _numpy(ak.flatten(array, axis=1), fill)
 
 
+def _magnitude(vector):
+    xyz = vector.fCoordinates
+    return np.sqrt(xyz.fX ** 2 + xyz.fY ** 2 + xyz.fZ ** 2)
+
+
+def mc_track_variables(arrays) -> dict[str, np.ndarray]:
+    """MC_VARIABLES but mc_npot, one entry per track, from the trkmcsim and
+    trksegsmc leaves (events * tracks * sims, events * tracks * true steps)."""
+    import awkward as ak
+
+    out: dict[str, np.ndarray] = {}
+    sim = ak.firsts(arrays["trkmcsim"], axis=-1)     # the track's own particle
+    out["mc_pdg"] = _flat(sim.pdg)
+    out["mc_start_code"] = _flat(sim.startCode)
+    out["mc_gen"] = _flat(sim.gen)
+    out["mc_p_start"] = _flat(_magnitude(sim.mom))
+    out["mc_t_start"] = _flat(sim.time)
+    out["mc_nhits"] = _flat(sim.nhits)
+    out["mc_nactive"] = _flat(sim.nactive)
+
+    steps = arrays["trksegsmc"]
+    steps = steps[ak.argsort(steps.time, axis=-1)]  # stored out of time order
+    mom = steps.mom.fCoordinates
+    pz = mom.fZ
+    pt = np.sqrt(mom.fX ** 2 + mom.fY ** 2)
+    p = np.sqrt(mom.fX ** 2 + mom.fY ** 2 + mom.fZ ** 2)
+
+    def first(values, mask):
+        return _flat(ak.firsts(values[mask], axis=-1))
+
+    front = (steps.sid == SID_TT_FRONT) & (pz > 0)
+    out["mc_has_front"] = _flat(ak.any(front, axis=-1), False).astype(bool)
+    out["mc_p_front"] = first(p, front)
+    out["mc_pt_front"] = first(pt, front)
+    out["mc_pz_front"] = first(pz, front)
+    out["mc_t_front"] = first(steps.time, front)
+    with np.errstate(all="ignore"):
+        out["mc_cos_front"] = out["mc_pz_front"] / out["mc_p_front"]
+    mid = steps.sid == SID_TT_MID
+    out["mc_p_mid"] = first(p, mid)
+    out["mc_t_mid"] = first(steps.time, mid)
+    return out
+
+
 def track_variables(arrays) -> dict[str, np.ndarray]:
     """TRACK_VARIABLES, one entry per track, from one file's leaves.
 
     `arrays` maps each name in LEAVES to its awkward array (events * tracks
     [* segments]). Also returns `_event`: each track's event index in the file.
+    MC_VARIABLES are added when `arrays` has the MC_LEAVES too, and mc_npot
+    when it has NPOT_BRANCH (one value per event).
     """
     import awkward as ak
 
@@ -194,7 +277,24 @@ def track_variables(arrays) -> dict[str, np.ndarray]:
     for name in ("event", "run", "subrun"):
         out[name] = _numpy(arrays[name])[event_of_track]
     out["ntrk"] = ak.to_numpy(ntrk).astype(np.float64)[event_of_track]
+    if all(leaf in arrays for leaf in MC_LEAVES):
+        out.update(mc_track_variables(arrays))
+    if NPOT_BRANCH in arrays:
+        out["mc_npot"] = _numpy(arrays[NPOT_BRANCH])[event_of_track]
     return out
+
+
+def check_mc_names(variables: dict, *expressions: str) -> None:
+    """Refuse an mc_* variable on a file with no MC truth, saying why,
+    rather than as an unknown name."""
+    named = {name for text in expressions
+             for name in re.findall(r"[A-Za-z_][A-Za-z0-9_]*", text)}
+    asked = sorted((named & set(MC_VARIABLES)) - set(variables))
+    if asked:
+        raise NtupleError(
+            f"{', '.join(asked)} need MC truth, and this file has no "
+            f"{', '.join((*MC_LEAVES, NPOT_BRANCH))} branches (real data, or "
+            "an ntuple written without MC)")
 
 
 # --- reading ---------------------------------------------------------------------
@@ -210,18 +310,22 @@ def open_tree(path: Path):
                           "EventNtuple file?") from None
 
 
-def read_track_arrays(tree, path: Path, extra_leaves: tuple[str, ...] = ()):
-    """LEAVES plus `extra_leaves`, as awkward arrays (events * tracks ...).
-
-    A caller with extra leaves checks they exist first, to say what kind of
-    file would have them.
-    """
+def read_track_arrays(tree, path: Path) -> dict:
+    """The LEAVES, plus MC_LEAVES and NPOT_BRANCH where the file has them,
+    as awkward arrays by name (events * tracks ...)."""
     names = {key.rsplit("/", 1)[-1] for key in tree.keys()}
     absent = [leaf for leaf in LEAVES if leaf not in names]
     if absent:
         raise NtupleError(f"{path.name}: missing branch(es) {', '.join(absent)} "
                           "— an EventNtuple version this analysis does not know?")
-    return tree.arrays(filter_name=[*LEAVES, *extra_leaves], library="ak")
+    mc = [leaf for leaf in MC_LEAVES if leaf in names]
+    if len(mc) < len(MC_LEAVES):
+        mc = []
+    batch = tree.arrays(filter_name=list(LEAVES) + mc, library="ak")
+    arrays = {name: batch[name] for name in batch.fields}
+    if NPOT_BRANCH in tree.keys():
+        arrays[NPOT_BRANCH] = tree[NPOT_BRANCH].array(library="ak")
+    return arrays
 
 
 def read_file(path: Path, paths: list[str]) -> tuple[dict, dict[str, np.ndarray], int]:
@@ -296,6 +400,7 @@ def run(context: RunContext) -> RunOutcome:
         per_file = []
         for path in context.input_paths:
             variables, triggers, n_events = read_file(path, paths)
+            check_mc_names(variables, selection)
             counts = efficiency_counts(variables, triggers, n_events, selection)
             per_file.append({"file": str(path), "n_events": n_events,
                              "n_selected": counts["n_selected"],
@@ -357,7 +462,8 @@ SPEC = AnalysisSpec(
                 "Track selection: an event is selected if at least one track "
                 "passes. Comparisons, arithmetic, and/or/not (or &&/||/!) and "
                 "abs/sqrt/hypot/min/max/log/exp over: "
-                + ", ".join(TRACK_VARIABLES) + ". *_front quantities are at "
+                + ", ".join(TRACK_VARIABLES) + "; and, in simulated files, "
+                + ", ".join(MC_VARIABLES) + ". *_front quantities are at "
                 "the downstream-going TT_Front crossing; fit parameters (d0, "
                 "maxr, tandip, t0err, ...) at TT_Mid; a missing value is NaN "
                 "and fails any cut on it. The default is a converged "

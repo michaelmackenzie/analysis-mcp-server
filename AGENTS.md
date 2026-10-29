@@ -47,6 +47,7 @@ python3 -m analysis_mcp_server --transport stdio [--work-area DIR | --musing 'Si
   descriptions are what agents read, so write them for an agent.
 - **Shared machinery knows nothing about physics.** That covers
   `mu2e_job.py` (running jobs), `mu2e_env.py` (where Offline comes from),
+  `catalog.py` (SAM/metacat names and datasets to `/pnfs` paths),
   `spectrum.py` (uniform-binned histograms: rebin, regrid, smear) and
   `selection.py` (cut expressions). Put physics in the analysis modules.
 - **Errors are worded for the caller.** A runner returns
@@ -92,6 +93,16 @@ python3 -m analysis_mcp_server --transport stdio [--work-area DIR | --musing 'Si
 - **Never use `tpr_` or `mpr_` paths** in defaults, tests or examples: they
   are in the trigger menu but not meant for the real trigger. Use `apr_`,
   `cpr_` and `calo_` paths.
+- **Catalogued inputs** (`dataset`, or a file name with no `/`) become
+  paths in `run_analysis` before anything else, so runners only ever see
+  paths. All network and dCache access goes through `catalog.Catalogs`;
+  tests swap `catalog.CLIENT` for a fake and never reach SAM or metacat.
+  An unstaged tape file is refused, not read: reading it blocks on tape.
+- **Reference inputs.** An `AnalysisSpec` with `takes_reference` requires
+  a baseline (`reference_file(s)` / `reference_dataset` in `run_analysis`,
+  resolved like `data_file(s)`), which the runner gets as
+  `context.reference_paths`; every other analysis refuses one. Add another
+  comparison that way rather than with a new tool argument.
 - **Default inputs.** An `AnalysisSpec` with `default_inputs` runs without
   `data_file(s)`; the trigger rate and timing default to
   `mu2e-trig-config/ci/data_files.txt`, found with `Mu2eEnv.find_code_file`
@@ -102,6 +113,12 @@ python3 -m analysis_mcp_server --transport stdio [--work-area DIR | --musing 'Si
   downstream-going TT_Front crossing, and fit parameters are taken at the
   TT_Mid segment's index. Add a variable to both `TRACK_VARIABLES` and
   `track_variables`; a test checks that every advertised one is usable.
+  MC truth (`MC_VARIABLES`, `mc_*`) is optional: read only where the file
+  has the branches, and `check_mc_names` turns a request for it on data into
+  a plain error. `evtinfomc/nprotons` is read by full path, because a leaf
+  name filter would also match `evtinfo`'s unfilled `nprotons`.
+  `trigger_efficiency_ntuple_binned` reuses that module's reading and must
+  keep reporting the same overall counts.
 - **`approx_ce_sensitivity` has a numerics trap.** Window sums run outward
   from each window's own edge, never as differences of prefix sums: the DIO
   spectrum spans ~18 orders of magnitude, and cancellation silently zeroes

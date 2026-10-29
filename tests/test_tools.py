@@ -32,14 +32,18 @@ from tools.analyses.stop_materials import combine_tables, material_rates
 from tools.analyses import trigger as trig
 from tools.analyses.trigger_efficiency import efficiency_metrics
 from tools.analyses import trigger_efficiency_ntuple as ntrig
+from tools.analyses import trigger_efficiency_ntuple_binned as bntrig
 from tools.analyses import selection_efficiency_ntuple as nsel
 from tools.analyses import momentum_resolution_ntuple as nres
+from tools.analyses import muon_stops as mstops
+from tools.analyses import calo_cluster_resolution_ntuple as ncalo
+from tools.analyses import variable_comparison_ntuple as vcmp
 from tools.analyses.trigger_rate import duty_factor, rate_metrics
 from tools.analyses.trigger_timing import timing_metrics
 from tools.mu2e_env import EnvError, Mu2eEnv, configure, current
 from tools.mu2e_job import (build_input_args, root_snapshot,
                             validate_input_paths, written_root_files)
-from tools.selection import SelectionError, apply_selection
+from tools.selection import SelectionError, apply_selection, evaluate_expression
 from tools.spectrum import Kernel, Spectrum
 from tools.spec import FCL_DIR, ParamSpec
 
@@ -108,12 +112,25 @@ Art has completed and will exit with status 0.
 
 # One stdout sample per art_files analysis, so the registry test can exercise
 # each parser. Add an entry when adding such an analysis.
+# The end of a muon_stops job (fcl/muon_stops.fcl on a TargetStops file):
+# GenEventCountReader's totals. The stops themselves are in its ROOT file.
+SAMPLE_MUON_STOPS_STDOUT = """\
+%MSG-i GenEventCount:  GenEventCountReader:genCountLogger@EndSubRun  27-Oct-2026 09:06:50 CDT run: 1800 subRun: 0
+GenEventCount: 12500 events in run: 1800 subRun: 0
+%MSG
+%MSG-i GenEventCountSummary:  GenEventCountReader:genCountLogger@EndJob  27-Oct-2026 09:06:50 CDT ModuleEndJob
+GenEventCount total: 12500 events in 1 SubRuns
+%MSG
+TrigReport Events total = 735 passed = 735 failed = 0
+"""
+
 SAMPLE_STDOUT = {"edep": SAMPLE_EDEP_STDOUT,
                  "count": SAMPLE_COUNTS_STDOUT,
                  "muon_stop_rate": SAMPLE_COUNTS_STDOUT,
                  "trigger_efficiency": SAMPLE_TRIGGER_STDOUT,
                  "trigger_rate": SAMPLE_TRIGGER_STDOUT,
-                 "trigger_timing": SAMPLE_TRIGGER_STDOUT}
+                 "trigger_timing": SAMPLE_TRIGGER_STDOUT,
+                 "muon_stops": SAMPLE_MUON_STOPS_STDOUT}
 
 
 # --- the edep parser ---------------------------------------------------------
@@ -408,6 +425,21 @@ def test_selection_fails_a_cut_on_a_missing_value():
     x = {"a": np.array([np.nan, 5.0])}
     assert apply_selection("a > 0", x, 2).tolist() == [False, True]
     assert apply_selection("a <= 0", x, 2).tolist() == [False, False]
+
+
+def test_expression_gives_a_quantity_and_refuses_a_cut():
+    x = {"a": np.array([1.0, 2.0]), "b": np.array([0.5, np.nan])}
+    assert evaluate_expression("a - b", x, 2)[0] == 0.5
+    assert np.isnan(evaluate_expression("a - b", x, 2)[1])
+    assert evaluate_expression("3", x, 2).tolist() == [3.0, 3.0]
+    for bad, words in (("", "empty"), ("a > 1", "true/false"),
+                       ("c", "unknown variable")):
+        try:
+            evaluate_expression(bad, x, 2)
+        except SelectionError as exc:
+            assert words in str(exc), (bad, str(exc))
+        else:
+            raise AssertionError(f"{bad!r} should have been refused")
 
 
 def test_selection_refuses_what_it_should_not_run():
@@ -826,6 +858,44 @@ def test_job_fcl_sets_the_paths_and_their_prescales(tmp_dir):
     assert trig.FCL.exists() and "timingTest.fcl" in trig.FCL.read_text()
 
 
+def test_job_fcl_takes_a_base_overrides_and_leading_paths(tmp_dir):
+    base = Path(tmp_dir) / "base.fcl"
+    base.write_text('#include "mu2e-trig-config/test/timingTest.fcl"\n'
+                    'services.TimeTracker.dbOutput.overwrite : true\n')
+    text = trig.job_fcl_text(
+        [("apr_TrkDe_80m70p", 2)], base,
+        base_fcl="trigger/reduced_tracker/redigi_trigger_tuned.fcl",
+        overrides='#include "trigger/reduced_tracker/helix_tuning.fcl"\n'
+                  "physics.producers.X.minNHit : 7",
+        leading_paths=["TriggerablePath"])
+    assert text.startswith('#include "trigger/reduced_tracker/redigi_trigger_tuned.fcl"')
+    assert "timingTest" not in text and "TimeTracker.dbOutput.overwrite" in text
+    # overrides come after the base and before the paths, which always win
+    assert text.index("helix_tuning.fcl") < text.index("physics.trigger_paths")
+    assert 'physics.trigger_paths : [ "TriggerablePath", "apr_TrkDe_80m70p" ]' in text
+    assert "AprTrkDe80m70pPS.eventModeConfig" in text and "prescale: 2" in text
+    plain = trig.job_fcl_text([("apr_TrkDe_80m70p", 1)], base)
+    assert "fcl_overrides" not in plain and "TriggerablePath" not in plain
+
+
+def test_base_fcl_and_leading_paths_refuse_what_cannot_be_included():
+    assert trig.parse_base_fcl("") == ""
+    assert trig.parse_base_fcl(" a/b_c.fcl ") == "a/b_c.fcl"
+    for bad in ("/abs/x.fcl", "../x.fcl", 'x".fcl', "x.txt", "a b.fcl"):
+        try:
+            trig.parse_base_fcl(bad)
+        except trig.TriggerError:
+            continue
+        raise AssertionError(f"accepted {bad!r}")
+    assert trig.parse_leading_paths("A, B C") == ["A", "B", "C"]
+    try:
+        trig.parse_leading_paths("a;b")
+    except trig.TriggerError:
+        pass
+    else:
+        raise AssertionError("accepted a;b")
+
+
 def test_trig_report_parses_events_and_every_path():
     report = trig.parse_trig_report(SAMPLE_TRIGGER_STDOUT)
     assert (report.n_events, report.n_passed) == (200, 182)
@@ -920,6 +990,29 @@ def test_timing_leaves_out_the_data_fetch_and_the_warm_up_events(tmp_dir):
         assert "no timing database" in str(exc)
     else:
         raise AssertionError("a missing database should be reported")
+
+
+def test_ignored_modules_are_left_out_of_the_event_and_path_times(tmp_dir):
+    db = Path(tmp_dir) / "triggerTiming.db"
+    _write_timing_db(db)
+    base = trig.read_timing_db(db, skip_events=1)
+    timed = trig.read_timing_db(db, skip_events=1,
+                                ignore=trig.parse_ignore_modules("C, TypeB"))
+    # B (by type) and C (by label) removed: only A's 75% is left
+    assert np.allclose(timed.times, [0.0075, 0.015, 0.0225])
+    assert np.allclose(timed.ignored_times, base.times - timed.times)
+    assert "apr" not in timed.per_path or abs(timed.per_path["apr"]) < 1e-12
+    rows = {r["label"]: r for r in timed.module_table()}
+    assert rows["B"]["counted"] is False and rows["C"]["counted"] is False
+    assert rows["A"]["counted"] is True
+    assert not base.ignored_times.any()
+    assert trig.parse_ignore_modules("") == frozenset()
+    try:
+        trig.parse_ignore_modules("a;b")
+    except trig.TriggerError:
+        pass
+    else:
+        raise AssertionError("accepted a;b")
 
 
 def test_module_timing_counts_the_events_each_module_ran_on(tmp_dir):
@@ -1098,6 +1191,91 @@ def test_ntuple_efficiency_is_over_events_with_a_selected_track():
     assert metrics["efficiency"] == 1.0 and metrics["efficiency_err"] > 0.0
 
 
+def _ntuple_mc_arrays():
+    """_ntuple_arrays with MC truth: the e- track's particle crosses TT_Front
+    downstream at 105 MeV/c, the step stored after a later TT_Mid step and an
+    earlier upstream TT_Front one; the other two tracks have no true steps."""
+    import awkward as ak
+
+    def step(sid, pz, time, pt=0.0):
+        return {"sid": sid, "time": time,
+                "mom": {"fCoordinates": {"fX": 0.0, "fY": pt, "fZ": pz}}}
+
+    def sim(pdg, code, p):
+        return {"pdg": pdg, "startCode": code, "gen": 0, "time": 600.0,
+                "nhits": 30, "nactive": 28,
+                "mom": {"fCoordinates": {"fX": 0.0, "fY": 0.0, "fZ": p}}}
+
+    arrays = _ntuple_arrays()
+    arrays["trksegsmc"] = ak.Array([
+        [[step(1, 60.0, 905.0, 80.0), step(0, -60.0, 850.0, 80.0),
+          step(0, 63.0, 901.0, 84.0), step(0, 70.0, 990.0, 10.0)], []], [[]]])
+    arrays["trkmcsim"] = ak.Array([[[sim(11, 168, 104.9), sim(13, 0, 50.0)], []],
+                                   [[sim(-11, 179, 70.0)]]])
+    arrays[ntrig.NPOT_BRANCH] = ak.Array([3.0e7, 1.5e7])
+    return arrays
+
+
+def test_ntuple_mc_variables_take_the_earliest_downstream_front_crossing():
+    v = ntrig.track_variables(_ntuple_mc_arrays())
+    assert abs(v["mc_p_front"][0] - 105.0) < 1e-4 and v["mc_t_front"][0] == 901.0
+    assert abs(v["mc_cos_front"][0] - 63.0 / 105.0) < 1e-6
+    assert v["mc_p_mid"][0] == 100.0 and v["mc_has_front"].tolist() == [True, False, False]
+    assert np.isnan(v["mc_p_front"][1]) and np.isnan(v["mc_pdg"][1])  # no MC
+    assert v["mc_pdg"].tolist()[::2] == [11, -11] and v["mc_start_code"][2] == 179
+    assert abs(v["mc_p_start"][0] - 104.9) < 1e-4
+    assert v["mc_npot"].tolist() == [3.0e7, 3.0e7, 1.5e7]     # per event
+    assert set(v) - {"_event"} == set(ntrig.TRACK_VARIABLES) | set(ntrig.MC_VARIABLES)
+    for name in ntrig.MC_VARIABLES:
+        apply_selection(f"{name} == {name}", v, v["_event"].size)
+
+
+def test_ntuple_mc_variables_on_data_say_there_is_no_truth():
+    v = ntrig.track_variables(_ntuple_arrays())
+    ntrig.check_mc_names(v, "p_front > 80")                   # no MC asked for
+    try:
+        ntrig.check_mc_names(v, "p_front > 80", "mc_npot / 1e6")
+    except ntrig.NtupleError as exc:
+        assert "mc_npot" in str(exc) and "no " in str(exc)
+    else:
+        raise AssertionError("mc_npot on a file without MC should be refused")
+
+
+def test_binned_ntuple_edges_are_uniform_or_explicit():
+    assert bntrig.bin_edges(3, 80, 110, "").tolist() == [80, 90, 100, 110]
+    assert bntrig.bin_edges(3, 80, 110, "0, 1 5").tolist() == [0, 1, 5]
+    for args in ((3, 110, 80, ""), (2.5, 0, 1, ""), (3, 0, 1, "1, 1, 2"),
+                 (3, 0, 1, "5"), (3, 0, 1, "a, b")):
+        try:
+            bntrig.bin_edges(*args)
+        except ntrig.NtupleError:
+            pass
+        else:
+            raise AssertionError(f"{args} should have been refused")
+
+
+def test_binned_ntuple_enters_each_event_once_at_its_first_selected_track():
+    variables = {"_event": np.array([0, 0, 1, 2, 3]),
+                 "p": np.array([50.0, 95.0, 105.0, 101.0, 120.0]),
+                 "q": np.array([1.0, 1.0, 1.0, np.nan, 1.0])}
+    selected, value, n_tracks = bntrig.event_values(variables, 5, "p > 90", "p * q")
+    assert selected.tolist() == [True, True, True, True, False] and n_tracks == 4
+    assert value[:2].tolist() == [95.0, 105.0] and np.isnan(value[2])
+    triggers = {"a": np.array([True, False, True, True, True]),
+                "b": np.array([False, True, False, False, False])}
+    edges = np.array([90.0, 100.0, 104.0])
+    counts = bntrig.binned_counts(selected, value, triggers, edges)
+    assert counts["selected"].tolist() == [1, 0] and counts["n_overflow"] == 2
+    assert counts["n_undefined"] == 1 and counts["n_underflow"] == 0
+    assert counts["n_selected"] == 4 and counts["n_triggered"] == 4
+    both = bntrig.add_counts(counts, counts)
+    assert both["selected"].tolist() == [2, 0] and both["per_path"] == {"a": 6, "b": 2}
+    rows = bntrig.bin_rows(both, edges)
+    assert rows[0]["efficiency"] == 1.0 and rows[0]["paths"]["b"]["passed"] == 0
+    metrics = bntrig.binned_metrics(both, 8, 2)
+    assert tuple(metrics) == bntrig.METRICS and metrics["n_in_range"] == 2.0
+
+
 def test_ntuple_trigger_efficiency_on_a_real_file(tmp_dir):
     if not NTUPLE_FILE.exists():
         return
@@ -1174,48 +1352,19 @@ def test_selection_efficiency_on_a_real_file(tmp_dir):
     assert 0 < narrower.metadata["n_passed"] < 7178
 
 
-def _ntuple_mc_arrays():
-    """_ntuple_arrays plus truth. Event 0's good track (reconstructed at 104
-    MeV/c) was born at 105 MeV/c and crossed TT_Front upstream first, then
-    downstream at 104.5; its segment-less track has no truth. Event 1's
-    upstream-going track never crosses TT_Front downstream."""
-    import awkward as ak
-
-    def step(sid, pz, p):
-        return {"sid": sid, "mom": {"fCoordinates": {
-            "fX": 0.0, "fY": float(np.sqrt(p * p - pz * pz)), "fZ": pz}}}
-
-    def sim(p, pdg=11, code=168):
-        return {"pdg": pdg, "startCode": code,
-                "mom": {"fCoordinates": {"fX": 0.0, "fY": 0.0, "fZ": p}}}
-
-    arrays = dict(_ntuple_arrays())
-    arrays["trksegsmc"] = ak.Array([
-        [[step(0, -80.0, 104.8), step(0, 66.0, 104.5), step(1, 65.0, 104.4)], []],
-        [[step(1, -60.0, 92.0)]]])
-    arrays["trkmcsim"] = ak.Array([[[sim(105.0), sim(30.0, 13, 0)], []],
-                                   [[sim(93.0, -11, 166)]]])
-    return arrays
-
-
-def test_resolution_compares_the_downstream_true_front_with_the_reco_one():
-    arrays = _ntuple_mc_arrays()
-    reco = ntrig.track_variables(arrays)
-    mc = nres.mc_variables(arrays, reco)
-    assert abs(mc["mc_p_front"][0] - 104.5) < 1e-4          # not the upstream leg
-    assert abs(mc["resolution"][0] - (104.0 - 104.5)) < 1e-3
-    assert abs(mc["energy_loss"][0] - (105.0 - 104.5)) < 1e-4
-    assert mc["mc_pdg"].tolist()[0::2] == [11, -11]           # the track's own
-    assert mc["mc_startcode"][2] == 166 and mc["mc_p_birth"][2] == 93.0
-    for name in ("mc_p_front", "mc_p_birth", "resolution", "energy_loss"):
-        assert np.isnan(mc[name][1]), name                    # no truth at all
-    assert np.isnan(mc["mc_p_front"][2]) and np.isnan(mc["resolution"][2])
-    assert set(mc) == set(nres.MC_VARIABLES)
-    variables = {**reco, **mc}
-    for name in nres.MC_VARIABLES:                 # every advertised one is usable
+def test_resolution_and_energy_loss_come_from_the_shared_mc_variables():
+    # the e- track: reconstructed at 104, true 105 at TT_Front, created at 104.9
+    v = ntrig.track_variables(_ntuple_mc_arrays())
+    r = nres.response_variables(v)
+    assert abs(r["resolution"][0] - (104.0 - 105.0)) < 1e-3
+    assert abs(r["energy_loss"][0] - (104.9 - 105.0)) < 1e-4
+    assert np.isnan(r["resolution"][1:]).all() and np.isnan(r["energy_loss"][1:]).all()
+    assert set(r) == set(nres.RESPONSE_VARIABLES)
+    variables = {**v, **r}
+    for name in nres.RESPONSE_VARIABLES:           # every advertised one is usable
         nres.select_tracks(variables, f"{name} == {name}")
-    assert nres.select_tracks(variables, "mc_startcode == 168").tolist() == [
-        True, False, False]
+    assert nres.select_tracks(variables, "mc_start_code == 168 and resolution < 0"
+                              ).tolist() == [True, False, False]
 
 
 def test_resolution_sigma68_is_the_gaussian_sigma_and_ignores_the_tail():
@@ -1284,9 +1433,404 @@ def test_resolution_on_a_real_file(tmp_dir):
     ce = run_analysis(analysis="momentum_resolution_ntuple",
                       data_file=str(NTUPLE_FILE), output_dir=tmp_dir,
                       parameters={"selection": ntrig.DEFAULT_SELECTION
-                                  + " and mc_startcode == 168"})
+                                  + " and mc_start_code == 168"})
     assert ce.status == "success", ce.message
     assert ce.metadata["n_tracks_with_truth"] <= meta["n_tracks_with_truth"]
+def test_binned_ntuple_trigger_efficiency_on_a_real_file(tmp_dir):
+    if not NTUPLE_FILE.exists():
+        return
+    paths = "apr_TrkDe_80m70p, cpr_TrkDe_80m70p"
+    overall = run_analysis(analysis="trigger_efficiency_ntuple",
+                           data_file=str(NTUPLE_FILE), output_dir=tmp_dir,
+                           parameters={"trigger_paths": paths})
+    for variable, low, high in (("p_front", 80, 110), ("mc_npot / 1e6", 0, 50)):
+        result = run_analysis(analysis="trigger_efficiency_ntuple_binned",
+                              data_file=str(NTUPLE_FILE), output_dir=tmp_dir,
+                              parameters={"trigger_paths": paths, "variable": variable,
+                                          "low": low, "high": high})
+        assert result.status == "success", result.message
+        meta = result.metadata
+        for key in ("n_selected", "n_triggered", "efficiency"):   # same events
+            assert meta[key] == overall.metadata[key], key
+        assert sum(r["n_selected"] for r in meta["bins"]) == meta["n_in_range"]
+        assert (meta["n_in_range"] + meta["n_underflow"] + meta["n_overflow"]
+                + meta["n_undefined"]) == meta["n_selected"]
+        assert len(result.files) == 3 and all(Path(f).exists() for f in result.files)
+
+
+def _calo_arrays():
+    """Two events of caloclusters/caloclustersmc. Event 0: a CE cluster
+    (100 MeV reconstructed, 101 true, 98 of it from the CE, which first
+    deposited at 700 ns; reconstructed at 702) and a pileup one. Event 1: a
+    cluster with no truth at all."""
+    import awkward as ak
+    leaves = {
+        "caloclusters.energyDep_": [[100.0, 20.0], [15.0]],
+        "caloclusters.energyDepErr_": [[2.0, 1.0], [1.0]],
+        "caloclusters.time_": [[702.0, 900.0], [500.0]],
+        "caloclusters.timeErr_": [[0.3, 0.5], [0.5]],
+        "caloclusters.diskID_": [[0, 1], [0]],
+        "caloclusters.size_": [[5, 2], [1]],
+        "caloclusters.isSplit_": [[0, 0], [0]],
+        "caloclusters.cog_.fCoordinates.fX": [[300.0, 0.0], [400.0]],
+        "caloclusters.cog_.fCoordinates.fY": [[400.0, 500.0], [0.0]],
+        "caloclustersmc.nsim": [[2, 1], [0]],
+        "caloclustersmc.etot": [[101.0, 21.0], [0.0]],
+        "caloclustersmc.eprimary": [[98.0, 21.0], [0.0]],
+        "caloclustersmc.tprimary": [[700.0, 899.0], [0.0]],
+        "caloclustersmc.prel._rel": [[0, -1], [-1]],
+        "event": [7, 8], "run": [1, 1], "subrun": [0, 0],
+    }
+    return {name: ak.Array(values) for name, values in leaves.items()}
+
+
+def test_calo_cluster_variables_compare_with_the_truth_and_mark_what_is_missing():
+    v = ncalo.cluster_variables(_calo_arrays())
+    assert v["_event"].tolist() == [0, 0, 1] and v["nclusters"].tolist() == [2, 2, 1]
+    assert v["de"][0] == -1.0 and v["dt"][0] == 2.0 and v["r"][0] == 500.0
+    assert abs(v["de_frac"][0] + 1 / 101) < 1e-12 and abs(v["mc_purity"][0] - 98 / 101) < 1e-12
+    assert v["de"][1] == -1.0 and v["mc_rel"][1] == -1        # pileup: truth, no relation
+    for name in ("mc_etot", "mc_tprimary", "mc_rel", "de", "dt", "de_frac"):
+        assert np.isnan(v[name][2]), name                     # nsim 0: no truth
+    assert set(v) - {"_event"} == set(ncalo.CLUSTER_VARIABLES)
+    for name in ncalo.CLUSTER_VARIABLES:           # every advertised one is usable
+        ncalo.select_clusters(v, f"{name} == {name}")
+    assert ncalo.select_clusters(v, ncalo.DEFAULT_SELECTION).tolist() == [True, False, False]
+
+
+def test_calo_resolution_writes_its_outputs_and_refuses_bad_binning(tmp_dir):
+    import uproot
+    params = {p.name: p.default for p in ncalo.SPEC.parameters}
+    ncalo._check_binning(params)
+    for bad in ({"dt_max": -6.0}, {"de_bin_width": 1e-6}):
+        try:
+            ncalo._check_binning({**params, **bad})
+        except ncalo.CaloResolutionError as exc:
+            assert next(iter(bad)).split("_")[0] in str(exc)
+        else:
+            raise AssertionError(f"{bad} should have been refused")
+    de = np.array([-1.0, 0.0, 0.5, -30.0])                    # -30 off the axis
+    dt = np.array([1.8, 2.0, 2.2, 1.9])
+    metrics = ncalo.resolution_metrics(
+        {"n_events": 2, "n_clusters": 5, "n_clusters_selected": 4}, de, de / 100.0, dt)
+    assert tuple(metrics) == ncalo.METRICS and metrics["n_clusters_with_truth"] == 4
+    assert metrics["dt_median"] == 1.95 and abs(metrics["de_frac_median"] + 0.005) < 1e-12
+    hists = {name: ncalo.histogram(values, params[f"{name}_min"], params[f"{name}_max"],
+                                   params[f"{name}_bin_width"], name)
+             for name, values in (("de", de), ("dt", dt))}
+    assert hists["de"].values.sum() == 3 and hists["dt"].values.size == 150
+    files = ncalo._write_outputs(Path(tmp_dir), hists, metrics, ncalo.DEFAULT_SELECTION)
+    assert [Path(f).name for f in files] == ["calo_cluster_resolution.root",
+                                             "cluster_de.png", "cluster_dt.png"]
+    with uproot.open(files[0]) as f:
+        assert f["dt"].values().tolist() == hists["dt"].values.tolist()
+
+
+def test_calo_resolution_says_a_file_without_truth_needs_simulation(tmp_dir):
+    import uproot
+    path = Path(tmp_dir) / "data.root"
+    with uproot.recreate(path) as f:
+        f.mkdir("EventNtuple").mktree("ntuple", {"event": "int32"}).extend(
+            {"event": np.arange(3, dtype=np.int32)})
+    result = run_analysis(analysis="calo_cluster_resolution_ntuple",
+                          data_file=str(path), output_dir=tmp_dir)
+    assert result.status == "error" and "MC truth" in result.message, result.message
+
+
+def test_calo_resolution_on_a_real_file(tmp_dir):
+    if not NTUPLE_FILE.exists():
+        return
+    result = run_analysis(analysis="calo_cluster_resolution_ntuple",
+                          data_file=str(NTUPLE_FILE), output_dir=tmp_dir,
+                          parameters={"selection": "mc_rel == 0 and energy > 50"})
+    assert result.status == "success", result.message
+    meta = result.metadata
+    assert meta["n_events"] == 8212 and meta["n_clusters"] == 56159
+    assert meta["n_clusters_selected"] == meta["n_clusters_with_truth"] == 6491
+    assert 0.5 < meta["de_sigma68"] < 3.0 and abs(meta["de_median"]) < 1.0
+    assert 0.2 < meta["dt_sigma68"] < 1.5 and 1.0 < meta["dt_median"] < 3.0
+    assert len(result.files) == 3 and all(Path(f).exists() for f in result.files)
+
+
+def test_calo_clusters_read_without_truth_refuse_only_the_mc_names():
+    arrays = {k: v for k, v in _calo_arrays().items() if not k.startswith("caloclustersmc")}
+    v = ncalo.cluster_variables(arrays, with_truth=False)
+    assert not set(ncalo.TRUTH_VARIABLES) & set(v) and v["energy"].tolist() == [100, 20, 15]
+    ncalo.check_truth_names(v, "energy > 10", "time")
+    try:
+        ncalo.check_truth_names(v, "energy > 10", "dt")
+    except ntrig.NtupleError as exc:
+        assert "dt" in str(exc) and "caloclustersmc" in str(exc)
+    else:
+        raise AssertionError("dt on a file without truth should have been refused")
+
+
+# --- variable_comparison_ntuple ----------------------------------------------------
+
+def _comparison_sample(events, objects):
+    """A Sample from event numbers (run 1, subrun 0) and (event index, value)
+    objects, every object selected."""
+    keys = vcmp.event_keys(np.ones(len(events)), np.zeros(len(events)), events)
+    variables = {"_event": np.array([e for e, _ in objects], dtype=np.int64),
+                 "x": np.array([x for _, x in objects], dtype=np.float64)}
+    return vcmp.sample_from_objects(variables, keys, "", "x")
+
+
+def test_comparison_takes_each_events_first_selected_object():
+    variables = {"_event": np.array([0, 0, 2]), "x": np.array([5.0, 6.0, 7.0]),
+                 "q": np.array([0.0, 1.0, 1.0])}
+    sample = vcmp.sample_from_objects(variables, vcmp.event_keys([1] * 3, [0] * 3, [1, 2, 3]),
+                                      "q > 0", "x * 2")
+    assert sample.values.tolist() == [12.0, 14.0]
+    assert sample.selected.tolist() == [True, False, True]
+    assert sample.first[0] == 12.0 and np.isnan(sample.first[1])
+
+
+def test_comparison_matches_events_and_counts_what_changed():
+    # Events 1-5 in both. New: 1 same, 2 shifted, 3 gained, 5 gone; 6 only new.
+    new = _comparison_sample([1, 2, 3, 4, 6], [(0, 10.0), (1, 21.0), (2, 30.0),
+                                               (3, 40.0), (4, 60.0)])
+    ref = _comparison_sample([1, 2, 3, 4, 5], [(0, 10.0), (1, 20.0), (3, 40.0),
+                                               (4, 50.0)])
+    m = vcmp.match(new, ref, "auto")
+    assert m["matched"] and m["n_common_events"] == 4
+    assert m["n_only_new"] == 1 and m["n_only_ref"] == 1
+    metrics, diff = vcmp.matched_metrics(new, ref, m["i_new"], m["i_ref"])
+    assert metrics["n_events_matched"] == 4 and metrics["n_events_both_selected"] == 3
+    assert metrics["n_events_gained"] == 1 and metrics["n_events_lost"] == 0
+    assert metrics["n_events_changed"] == 1 and sorted(diff.tolist()) == [0.0, 0.0, 1.0]
+    dist = vcmp.distribution_metrics(new, ref)
+    assert dist["n_selected_new"] == 5 and dist["mean_shift"] == 32.2 - 30.0
+
+
+def test_comparison_matches_only_samples_that_share_most_events():
+    new = _comparison_sample([1, 2, 3, 4], [(i, 1.0) for i in range(4)])
+    ref = _comparison_sample([4, 5, 6, 7], [(i, 1.0) for i in range(4)])
+    assert not vcmp.match(new, ref, "auto")["matched"]       # 1 of 4 by chance
+    assert not vcmp.match(new, new, "no")["matched"]
+    assert vcmp.match(new, ref, "yes")["matched"]
+    other = _comparison_sample([9], [(0, 1.0)])
+    try:
+        vcmp.match(new, other, "yes")
+    except vcmp.ComparisonError as exc:
+        assert "not the same events" in str(exc)
+    else:
+        raise AssertionError("'yes' with no shared event should have been refused")
+
+
+def test_comparison_ranges_and_bins():
+    assert vcmp.parse_range("") is None and vcmp.parse_range("80, 110") == (80.0, 110.0)
+    for bad in ("80", "110, 80", "a, b"):
+        try:
+            vcmp.parse_range(bad)
+        except vcmp.ComparisonError:
+            pass
+        else:
+            raise AssertionError(f"range {bad!r} should have been refused")
+    assert vcmp.auto_range(np.full(10, 3.0)) == (2.5, 3.5)
+    assert vcmp.difference_range(np.zeros(5)) == (-1.0, 1.0)
+    assert vcmp.difference_range(np.array([0.0, 0.0, -0.2, 0.1])) [1] < 0.21
+
+
+def _comparison_file(path, events, values):
+    """An EventNtuple/ntuple with run/subrun/event and one value per event."""
+    import uproot
+    with uproot.recreate(path) as f:
+        f.mkdir("EventNtuple").mktree("ntuple", {"run": "int32", "subrun": "int32",
+                                                 "event": "int32", "x": "float64"}).extend(
+            {"run": np.ones(len(events), np.int32), "subrun": np.zeros(len(events), np.int32),
+             "event": np.asarray(events, np.int32), "x": np.asarray(values, np.float64)})
+
+
+def _read_x(path):
+    """A Level reader for _comparison_file: one object per event."""
+    import uproot
+    x = uproot.open(path)["EventNtuple/ntuple"]["x"].array(library="np")
+    return {"_event": np.arange(x.size), "x": x}, x.size
+
+
+def test_comparison_runs_end_to_end_and_writes_its_outputs(tmp_dir):
+    new, ref = Path(tmp_dir) / "new.root", Path(tmp_dir) / "ref.root"
+    _comparison_file(new, range(100), np.arange(100) * 0.1 + 0.05)
+    _comparison_file(ref, range(100), np.arange(100) * 0.1)
+    saved = vcmp.LEVELS["track"]
+    vcmp.LEVELS["track"] = vcmp.Level("track", {"x": "x"}, _read_x, lambda *a: None)
+    try:
+        result = run_analysis(analysis="variable_comparison_ntuple", data_file=str(new),
+                              reference_file=str(ref), output_dir=tmp_dir,
+                              parameters={"variable": "x", "n_bins": 20, "range": "0, 10"})
+        assert result.status == "success", result.message
+        meta = result.metadata
+        assert meta["n_events_matched"] == 100 and meta["n_events_changed"] == 100
+        assert abs(meta["diff_median"] - 0.05) < 1e-9 and meta["reference_files"] == [str(ref)]
+        assert "against 1 reference file(s)" in result.message
+        names = [Path(f).name for f in result.files]
+        assert names == ["variable_comparison.root", "variable_comparison.png",
+                         "variable_difference.png"], names
+        import uproot
+        with uproot.open(result.files[0]) as f:
+            assert f["new"].values().sum() == 100 and f["diff"].values().size == 21
+        result = run_analysis(analysis="variable_comparison_ntuple", data_file=str(new),
+                              reference_file=str(ref), output_dir=tmp_dir,
+                              parameters={"variable": "x", "match_events": "no"})
+        assert result.status == "success" and result.metadata["n_events_matched"] == 0
+        assert np.isnan(result.metadata["diff_median"]) and len(result.files) == 2
+        result = run_analysis(analysis="variable_comparison_ntuple", data_file=str(new),
+                              reference_file=str(ref), output_dir=tmp_dir,
+                              parameters={"variable": "x", "selection": "x > 1e9"})
+        assert result.status == "error" and "new sample" in result.message, result.message
+    finally:
+        vcmp.LEVELS["track"] = saved
+
+
+def test_reference_inputs_go_only_to_an_analysis_that_compares(tmp_dir):
+    result = run_analysis(analysis="variable_comparison_ntuple", data_file="/a.root",
+                          output_dir=tmp_dir, parameters={"variable": "p_front"})
+    assert result.status == "error" and "reference_file" in result.message
+    result = run_analysis(analysis="variable_comparison_ntuple", data_file="/a.root",
+                          reference_file="/b.root", reference_files=["/c.root"],
+                          output_dir=tmp_dir, parameters={"variable": "p_front"})
+    assert result.status == "error" and "exactly one" in result.message
+    result = run_analysis(analysis="calo_cluster_resolution_ntuple", data_file="/a.root",
+                          reference_file="/b.root", output_dir=tmp_dir)
+    assert result.status == "error" and "takes_reference" in result.message
+    catalogue = list_analyses().metadata["analyses"]
+    assert catalogue["variable_comparison_ntuple"]["takes_reference"] is True
+    assert "takes_reference" not in catalogue["calo_cluster_resolution_ntuple"]
+
+
+def test_comparison_of_a_real_file_with_itself_finds_no_change(tmp_dir):
+    if not NTUPLE_FILE.exists():
+        return
+    for level, variable in (("track", "p_front"), ("cluster", "energy")):
+        result = run_analysis(analysis="variable_comparison_ntuple",
+                              data_file=str(NTUPLE_FILE), reference_file=str(NTUPLE_FILE),
+                              output_dir=tmp_dir,
+                              parameters={"level": level, "variable": variable})
+        assert result.status == "success", result.message
+        meta = result.metadata
+        assert meta["n_events_matched"] == 8212 and meta["n_events_changed"] == 0
+        assert meta["n_events_gained"] == meta["n_events_lost"] == 0
+        assert meta["mean_shift"] == 0 and meta["ks_pvalue"] == 1.0
+
+
+# --- muon_stops ----------------------------------------------------------------
+
+def _stop_records(stops):
+    """StoppedParticlesDumper rows, as the job's leaf-list branch reads:
+    (x, y, z, time) per stop, all mu-."""
+    dtype = np.dtype([("x", "f4"), ("y", "f4"), ("z", "f4"), ("time", "f4"),
+                      ("tauNormalized", "f4"), ("pdg", "i4"), ("origin", "i4"),
+                      ("term", "i4")])
+    return np.array([(x, y, z, t, -1.0, 13, 56, 32) for x, y, z, t in stops], dtype=dtype)
+
+
+def _vd_records(steps):
+    """StepPointMCDumper (VDHit) rows: (VD id, pdg, pz, |p|) per step."""
+    dtype = np.dtype([(n, "f4") for n in ("x", "y", "z", "time", "px", "py", "pz",
+                                          "pmag", "ek", "charge")]
+                     + [("pdgId", "i4"), ("particleId", "u4"), ("volumeCopy", "u4")])
+    return np.array([(0, 0, 0, 0, 0, 0, pz, p, 0, -1, pdg, 1, vd)
+                     for vd, pdg, pz, p in steps], dtype=dtype)
+
+
+def test_muon_stops_fcl_points_both_dumpers_at_the_stop_filter():
+    text = mstops.job_fcl_text("PolyStopFilter")
+    assert text.startswith(mstops.FCL.read_text())          # the shipped fcl, then
+    assert text.rstrip().endswith(
+        'physics.analyzers.vdDumper.hitsInputTag : "PolyStopFilter:virtualdetector"')
+    assert 'stoppedMuonDumper.inputCollection : "PolyStopFilter"' in text
+    for bad in ("", "Target Stop", 'X"; physics.an: [] #'):
+        try:
+            mstops.job_fcl_text(bad)
+        except mstops.MuonStopsError:
+            pass
+        else:
+            raise AssertionError(f"{bad!r} should have been refused")
+
+
+def test_muon_stops_reads_the_generated_count_from_stdout():
+    assert mstops.parse_gen_count(SAMPLE_MUON_STOPS_STDOUT) == 12500
+    assert mstops.parse_gen_count("TrigReport Events total = 3") is None
+
+
+def test_muon_stops_profile_measures_radius_from_the_ds_axis():
+    # two stops 50 mm off the DS axis (x = -3904), one on it
+    stops = mstops.stop_variables(_stop_records([
+        (-3904.0 + 30.0, 40.0, 5000.0, 200.0), (-3904.0 - 50.0, 0.0, 5100.0, 300.0),
+        (-3904.0, 0.0, 5300.0, 700.0)]))
+    assert np.allclose(stops["r"], [50.0, 50.0, 0.0])
+    vd = mstops.vd_columns(_vd_records([
+        (9, 13, 20.0, 30.0),       # mu- entering ST_In: counted
+        (9, 13, -5.0, 10.0),       # the same muon scattered back out: not
+        (9, 11, 30.0, 40.0),       # an electron: not
+        (8, 13, 50.0, 60.0),       # Coll5_Out: not
+        (9, 13, 25.0, 34.0)]))
+    p = mstops.st_in_momenta(vd)
+    assert p.tolist() == [30.0, 34.0]
+    m = mstops.stop_metrics(stops, p, 1000)
+    assert tuple(m) == mstops.METRICS and m["n_stops"] == 3 and m["n_gen_events"] == 1000
+    assert abs(m["stop_z_mean"] - 15400 / 3) < 1e-3
+    assert m["stop_z_median"] == 5100.0 and abs(m["stop_r_mean"] - 100 / 3) < 1e-4
+    assert m["stop_time_median"] == 300.0 and m["n_st_in"] == 2
+    assert m["p_st_in_mean"] == 32.0 and m["p_st_in_rms"] == 2.0
+    h = mstops.histogram(stops["z"], 5.0, "z")             # edges on multiples of 5
+    assert h.xmin == 5000.0 and h.edges()[-1] == 5305.0 and h.values.sum() == 3
+
+
+def _fake_stops_job(stdout=SAMPLE_MUON_STOPS_STDOUT, returncode=0):
+    from tools.mu2e_job import JobOutcome
+    calls = []
+
+    def fake(*, fcl, input_paths, outdir, single, timeout_s, max_events=None, **_):
+        calls.append(Path(fcl).read_text())
+        root = outdir / "nts.owner.muonstops.test.root"
+        root.write_bytes(b"")                    # read_dumps is faked too
+        return JobOutcome(command="mu2e", returncode=returncode, timed_out=False,
+                          stdout=stdout, stderr="", log_path=outdir / "mu2e.log",
+                          input_paths=input_paths, input_flag="-s",
+                          environment="test", file_list_path=None,
+                          written_root_files=[str(root)])
+    return fake, calls
+
+
+def test_muon_stops_run_writes_its_profile_and_says_what_went_wrong(tmp_dir):
+    from tools.spec import RunContext
+    real_job, real_read = mstops.run_mu2e_job, mstops.read_dumps
+    stops = _stop_records([(-3874.0, 40.0, 5000.0 + 10 * i, 200.0 + i) for i in range(20)])
+    steps = _vd_records([(9, 13, 20.0, 25.0 + i) for i in range(20)])
+
+    def context(name, **params):
+        return RunContext(input_paths=[Path(tmp_dir) / "in.art"],
+                          outdir=Path(tmp_dir) / name, timeout_s=60,
+                          params={"stop_filter": "TargetStopFilter", **params})
+    try:
+        mstops.run_mu2e_job, calls = _fake_stops_job()
+        mstops.read_dumps = lambda path: (stops, steps)
+        outcome = mstops.run(context("ok"))
+        assert outcome.error is None, outcome.error
+        assert outcome.metrics["n_stops"] == 20 and outcome.metrics["n_gen_events"] == 12500
+        assert outcome.metrics["n_st_in"] == 20 and outcome.extra["stops_by_pdg"] == {13: 20}
+        names = [Path(f).name for f in outcome.files]
+        assert names[1:] == ["muon_stops_hists.root", "stop_z.png", "stop_r.png",
+                             "stop_time.png", "p_st_in.png", "stop_r_vs_z.png"], names
+        assert 'inputCollection : "TargetStopFilter"' in calls[0]  # the per-run fcl
+        import uproot
+        with uproot.open(outcome.files[1]) as f:
+            assert f["stop_r_vs_z"].values().sum() == 20 and f["p_st_in"].values().sum() == 20
+
+        mstops.read_dumps = lambda path: (stops[:0], steps[:0])
+        empty = mstops.run(context("empty"))
+        assert empty.error and "no stopped particle" in empty.error, empty.error
+
+        mstops.run_mu2e_job, _ = _fake_stops_job(stdout="no bookkeeping here")
+        assert "GenEventCount" in mstops.run(context("nogen")).error
+
+        mstops.run_mu2e_job, _ = _fake_stops_job(returncode=1)
+        failed = mstops.run(context("failed"))
+        assert "stop_filter" in failed.error and "PolyStopFilter" in failed.error
+    finally:
+        mstops.run_mu2e_job, mstops.read_dumps = real_job, real_read
 
 
 # --- stop_materials ----------------------------------------------------------
@@ -1959,6 +2503,11 @@ def test_every_art_analysis_parser_matches_its_declared_metrics():
         elif name == "trigger_rate":
             report = trig.parse_trig_report(sample)
             assert tuple(rate_metrics(report, 1.0, 0.5)) == spec.metrics
+        elif name == "muon_stops":
+            # the generated count from stdout, the rest from its ROOT file
+            stops = mstops.stop_variables(_stop_records([(-3874.0, 40.0, 5400.0, 300.0)]))
+            n_gen = mstops.parse_gen_count(sample)
+            assert tuple(mstops.stop_metrics(stops, np.array([30.0]), n_gen)) == spec.metrics
         elif name == "trigger_timing":
             # its numbers come from the timing database, not stdout
             assert tuple(timing_metrics(np.array([0.01, 0.02]))) == spec.metrics
@@ -2278,6 +2827,254 @@ def test_validate_input_paths_flags_only_bad_ones(tmp_dir):
     assert any("does not exist" in p and "x.art" in p for p in problems)
 
 
+# --- catalogued inputs: SAM definitions, metacat datasets, file names ------
+
+# Two files and the directories SAM records for them (2026-10-12): a
+# production nts file on tape, and a user dts file on scratch.
+SAM_TAPE_FILE = ("nts.mu2e.CeMLeadingLogMix1BB.MDC2025au_best_v1_1-001."
+                 "001430_00000000.root",
+                 "/pnfs/mu2e/tape/phy-nts/nts/mu2e/CeMLeadingLogMix1BB/"
+                 "MDC2025au_best_v1_1-001/root/a8/50")
+SAM_SCRATCH_FILE = ("dts.mmackenz.CeEndpoint.MDC2025ax.001430_00000000.art",
+                    "/pnfs/mu2e/scratch/datasets/usr-sim/dts/mmackenz/"
+                    "CeEndpoint/MDC2025ax/art/a4/0e")
+
+
+class FakeCatalogs:
+    """SAM, metacat and dCache from dictionaries; records what was asked."""
+
+    def __init__(self, sam_defs=None, metacat=None, locations=None,
+                 on_disk=(), locality=None, down=False):
+        self.sam_defs, self.metacat = sam_defs or {}, metacat or {}
+        self.locations = locations or {}
+        self.on_disk = {Path(p) for p in on_disk}
+        self.localities = locality or {}
+        self.down, self.asked = down, []
+
+    def _ask(self, what):
+        self.asked.append(what)
+        if self.down:
+            import urllib.error
+            raise urllib.error.URLError("connection refused")
+
+    def sam_definition_files(self, defname):
+        self._ask(("sam", defname))
+        return self.sam_defs.get(defname)
+
+    def metacat_dataset_files(self, did):
+        self._ask(("metacat", did))
+        return self.metacat.get(did)
+
+    def sam_locations(self, names):
+        self._ask(("locations", tuple(names)))
+        return {n: [Path(p) for p in self.locations[n]]
+                for n in names if n in self.locations}
+
+    def exists(self, path):
+        return Path(path) in self.on_disk or Path(path).exists()
+
+    def locality(self, path):
+        return self.localities.get(Path(path))
+
+
+def _expect_catalog_error(needles, **kwargs):
+    from tools.catalog import CatalogError, resolve_inputs
+    try:
+        resolve_inputs(**kwargs)
+    except CatalogError as exc:
+        for needle in needles:
+            assert needle in str(exc), (needle, str(exc))
+        return str(exc)
+    raise AssertionError(f"{needles}: no error")
+
+
+def test_standard_paths_follow_the_layout_sam_records():
+    from tools.catalog import standard_paths
+    for name, directory in (SAM_TAPE_FILE, SAM_SCRATCH_FILE):
+        assert Path(directory) / name in standard_paths(name), name
+    # disk first, tape last: the order copies are preferred in
+    paths = standard_paths(SAM_SCRATCH_FILE[0])
+    assert [str(p).split("/")[3] for p in paths] == ["persistent", "scratch", "tape"]
+    for name in ("my_ntuple.root", "xyz.mu2e.a.b.0.art", "ext.mu2e.a.b.0.art"):
+        assert standard_paths(name) == [], name
+
+
+def test_metacat_query_output_is_read_as_a_json_text_sequence():
+    from tools.catalog import _json_records
+    text = '\x1e{"name": "a"}\n\x1e{"name": "b"}\n'
+    assert [r["name"] for r in _json_records(text)] == ["a", "b"]
+    assert _json_records('[{"name": "c"}]') == [{"name": "c"}]
+
+
+def test_a_sam_definition_resolves_to_its_files_first_by_name():
+    from tools.catalog import resolve_inputs, standard_paths
+    names = [f"dig.mu2e.X.v1.001430_0000000{i}.art" for i in (2, 0, 1)]
+    disk = {n: standard_paths(n)[0] for n in names}
+    fake = FakeCatalogs(sam_defs={"dig.mu2e.X.v1.art": names},
+                        on_disk=disk.values())
+    resolved = resolve_inputs(dataset="dig.mu2e.X.v1.art", max_files=2,
+                              client=fake)
+    assert resolved.paths == [disk[n] for n in sorted(names)[:2]], resolved.paths
+    assert resolved.source == {"dataset": "dig.mu2e.X.v1.art", "catalog": "sam",
+                               "n_files_in_dataset": 3, "locations": {"disk": 2},
+                               "n_catalogued_files": 2}, resolved.source
+    # found as a SAM definition, so metacat is never asked
+    assert not any(kind == "metacat" for kind, _ in fake.asked), fake.asked
+
+
+def test_a_dataset_not_in_sam_is_looked_up_in_metacat():
+    from tools.catalog import resolve_inputs, standard_paths
+    name = SAM_SCRATCH_FILE[0]
+    scratch = standard_paths(name)[1]
+    # a bare name goes to its owner's namespace; SAM has no record of the
+    # file, so the standard layout finds it
+    fake = FakeCatalogs(metacat={"mmackenz:dts.mmackenz.CeEndpoint.MDC2025ax.art": [name]},
+                        on_disk=[scratch])
+    for dataset in ("dts.mmackenz.CeEndpoint.MDC2025ax.art",
+                    "mmackenz:dts.mmackenz.CeEndpoint.MDC2025ax.art"):
+        fake.asked.clear()
+        resolved = resolve_inputs(dataset=dataset, client=fake)
+        assert resolved.paths == [scratch], resolved.paths
+        assert resolved.source["catalog"] == "metacat"
+        assert resolved.source["locations"] == {"scratch": 1}
+        # a DID is a metacat name: SAM's definitions are not asked
+        asked_sam = ("sam", dataset) in fake.asked
+        assert asked_sam == (":" not in dataset), fake.asked
+
+
+def test_a_registered_file_name_is_located_and_a_disk_copy_wins():
+    from tools.catalog import resolve_inputs
+    name, tape_dir = SAM_TAPE_FILE
+    tape = Path(tape_dir) / name
+    persistent = Path(tape_dir.replace("/tape/", "/persistent/datasets/")) / name
+    fake = FakeCatalogs(locations={name: [tape, persistent]},
+                        on_disk=[tape, persistent])
+    absolute = "/some/where/else.art"
+    # bare, as a DID, and next to a path that is passed through untouched
+    resolved = resolve_inputs([name, f"mu2e:{name}", absolute], client=fake)
+    assert resolved.paths == [persistent, persistent, Path(absolute)], resolved.paths
+    assert resolved.source == {"locations": {"disk": 2}, "n_catalogued_files": 2}
+    # with only the tape copy, it is used, being staged
+    fake = FakeCatalogs(locations={name: [tape]}, on_disk=[tape],
+                        locality={tape: "ONLINE_AND_NEARLINE"})
+    assert resolve_inputs([name], client=fake).paths == [tape]
+    # paths alone never reach a catalog
+    fake = FakeCatalogs(down=True)
+    assert resolve_inputs([absolute], client=fake).paths == [Path(absolute)]
+    assert fake.asked == []
+
+
+def test_unstaged_tape_files_are_refused_with_the_command_that_stages_them():
+    from tools.catalog import standard_paths
+    names = [f"mcs.mu2e.X.v1.001430_0000000{i}.art" for i in range(2)]
+    tape = {n: standard_paths(n)[2] for n in names}
+    locality = {tape[names[0]]: "ONLINE", tape[names[1]]: "NEARLINE"}
+    fake = FakeCatalogs(sam_defs={"mcs.mu2e.X.v1.art": names},
+                        metacat={"mu2e:mcs.mu2e.Y.v1.art": names},
+                        on_disk=tape.values(), locality=locality)
+    _expect_catalog_error(
+        ["1 of 2", "not staged", "samweb prestage-dataset --defname=mcs.mu2e.X.v1.art"],
+        dataset="mcs.mu2e.X.v1.art", client=fake)
+    _expect_catalog_error(["mdh prestage-files mu2e:mcs.mu2e.Y.v1.art"],
+                          dataset="mu2e:mcs.mu2e.Y.v1.art", client=fake)
+    _expect_catalog_error([f"mdh prestage-files {names[1]}"],
+                          entries=names, client=fake)
+    # a locality dCache does not report is not held against the file
+    fake.localities = {}
+    from tools.catalog import resolve_inputs
+    assert len(resolve_inputs(entries=names, client=fake).paths) == 2
+
+
+def test_catalogued_input_errors_say_what_is_wrong():
+    from tools.catalog import MAX_DATASET_FILES, resolve_inputs, standard_paths
+    _expect_catalog_error(
+        ["no such dataset", "SAM definition nts.me.A.b.root",
+         "metacat dataset me:nts.me.A.b.root"],
+        dataset="nts.me.A.b.root", client=FakeCatalogs())
+    _expect_catalog_error(["has no files"], dataset="x.mu2e.e.art",
+                          client=FakeCatalogs(sam_defs={"x.mu2e.e.art": []}))
+    big = [f"sim.mu2e.B.v.{i:06d}_00000000.art" for i in range(MAX_DATASET_FILES + 1)]
+    fake = FakeCatalogs(sam_defs={"sim.mu2e.B.v.art": big})
+    _expect_catalog_error(["max_files", str(len(big))],
+                          dataset="sim.mu2e.B.v.art", client=fake)
+    first = standard_paths(big[0])[0]
+    fake.on_disk = {first}
+    assert resolve_inputs(dataset="sim.mu2e.B.v.art", max_files=1,
+                          client=fake).paths == [first]
+    name = "nts.mu2e.Nowhere.v1.001430_00000000.root"
+    _expect_catalog_error(["1 of 1", name, "no copy on disk", "/pnfs/mu2e/tape/"],
+                          entries=[name], client=FakeCatalogs())
+    _expect_catalog_error(["my_ntuple.root", "neither registered", "absolute path"],
+                          entries=["my_ntuple.root"], client=FakeCatalogs())
+    _expect_catalog_error(["cannot list dataset", "connection refused"],
+                          dataset="a.mu2e.b.art", client=FakeCatalogs(down=True))
+    _expect_catalog_error(["cannot look up", "SAM"],
+                          entries=[name], client=FakeCatalogs(down=True))
+
+
+def test_run_analysis_runs_over_a_dataset_it_resolved(tmp_dir):
+    from tools import catalog
+    names = [f"dig.mu2e.X.v1.001430_0000000{i}.art" for i in range(3)]
+    copies = {n: Path(tmp_dir) / n for n in names}
+    for path in copies.values():
+        path.touch()
+    fake_catalog = FakeCatalogs(sam_defs={"dig.mu2e.X.v1.art": names},
+                                locations={n: [p] for n, p in copies.items()})
+    fake_job, _ = _fake_edep_job(tmp_dir)
+    seen = []
+
+    def job(**kwargs):
+        seen.append((kwargs["input_paths"], kwargs["single"]))
+        return fake_job(**kwargs)
+
+    real_client, real_job = catalog.CLIENT, edep_mod.run_mu2e_job
+    catalog.CLIENT, edep_mod.run_mu2e_job = fake_catalog, job
+    try:
+        result = run_analysis(analysis="edep", dataset="dig.mu2e.X.v1.art",
+                              max_files=2, output_dir=str(Path(tmp_dir) / "out"))
+        one = run_analysis(analysis="edep", data_file=names[2],
+                           output_dir=str(Path(tmp_dir) / "one"))
+    finally:
+        catalog.CLIENT, edep_mod.run_mu2e_job = real_client, real_job
+    assert result.status == "success", result.message
+    # the job saw the resolved paths, and as a file list
+    assert seen[0] == ([copies[n] for n in names[:2]], False), seen
+    meta = result.metadata
+    assert meta["data_files"] == [str(copies[n]) for n in names[:2]]
+    assert meta["inputs_from"]["dataset"] == "dig.mu2e.X.v1.art"
+    assert meta["inputs_from"]["n_files_in_dataset"] == 3
+    # a registered name passed as data_file is still one -s file
+    assert one.status == "success", one.message
+    assert seen[1] == ([copies[names[2]]], True), seen
+
+
+def test_run_analysis_reports_dataset_misuse(tmp_dir):
+    from tools import catalog
+    names = ["nts.mu2e.S.v1.001430_00000000.root", "nts.mu2e.S.v1.001430_00000001.root"]
+    for name in names:
+        (Path(tmp_dir) / name).touch()
+    fake = FakeCatalogs(sam_defs={"nts.mu2e.S.v1.root": names},
+                        locations={n: [Path(tmp_dir) / n] for n in names})
+    real = catalog.CLIENT
+    catalog.CLIENT = fake
+    try:
+        cases = [
+            (dict(analysis="edep", dataset="d.art", data_file="/a.art"),
+             "not data_file and dataset"),
+            (dict(analysis="edep", data_files=["/a.art"], max_files=1),
+             "max_files applies only to a dataset"),
+            (dict(analysis="edep", dataset="no.such.def.art"), "no such dataset"),
+            (dict(analysis="approx_ce_sensitivity", dataset="nts.mu2e.S.v1.root",
+                  parameters={"sig_eff": 0.1}), "max_files=1"),
+        ]
+        for kwargs, needle in cases:
+            result = run_analysis(output_dir=tmp_dir, **kwargs)
+            assert result.status == "error", kwargs
+            assert needle in result.message, (needle, result.message)
+    finally:
+        catalog.CLIENT = real
+
+
 # --- run_analysis argument validation (no job, no computation) ---------------
 
 def test_relative_data_file_is_rejected(tmp_dir):
@@ -2315,7 +3112,7 @@ def test_both_inputs_at_once_are_rejected(tmp_dir):
     result = run_analysis(analysis="edep", data_file="/a.art",
                           data_files=["/b.art"], output_dir=tmp_dir)
     assert result.status == "error"
-    assert "not both" in result.message
+    assert "not data_file and data_files" in result.message
 
 
 def test_root_file_analysis_rejects_a_file_list(tmp_dir):

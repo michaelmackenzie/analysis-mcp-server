@@ -12,14 +12,13 @@ truth of the particle that made it gives two distributions:
 Their difference is fullsim_sensitivity's "response" (reconstructed at
 TT_Front minus true at birth), which folds both together.
 
-The truth comes from the track's own MC branches: `trksegsmc` (true steps at
-each surface, per track) and `trkmcsim` (the track's particle first, then its
-ancestors). As for the reconstructed `*_front` quantities, the TT_Front step
-is the first one with pz > 0, so a track that crosses TT_Front twice is
-compared on its downstream-going leg. Both distributions have long tails, so
-besides the mean and rms the metrics give the median and sigma68, half the
-width of the central 68% (the Gaussian sigma for a Gaussian, without a fit).
-The track variables and their meaning are trigger_efficiency_ntuple's.
+The truth is trigger_efficiency_ntuple's MC_VARIABLES (from `trkmcsim` and
+`trksegsmc`): `resolution` is p_front - mc_p_front and `energy_loss` is
+mc_p_start - mc_p_front, both at the downstream-going TT_Front crossing (the
+earliest true one with pz > 0, as the true steps are not stored in time
+order). Both distributions have long tails, so besides the mean and rms the
+metrics give the median and sigma68, half the width of the central 68% (the
+Gaussian sigma for a Gaussian, without a fit).
 """
 
 from __future__ import annotations
@@ -31,21 +30,15 @@ import numpy as np
 from ..selection import SelectionError, apply_selection
 from ..spec import AnalysisSpec, ParamSpec, RunContext, RunOutcome
 from ..spectrum import Spectrum
-from .trigger_efficiency_ntuple import (DEFAULT_SELECTION, SID_TT_FRONT,
-                                        TRACK_VARIABLES, NtupleError, _flat,
-                                        open_tree, read_track_arrays,
-                                        track_variables)
+from .trigger_efficiency_ntuple import (DEFAULT_SELECTION, MC_LEAVES,
+                                        MC_VARIABLES, TRACK_VARIABLES,
+                                        NtupleError, open_tree,
+                                        read_track_arrays, track_variables)
 
-MC_LEAVES = ("trksegsmc", "trkmcsim")
-
-MC_VARIABLES: dict[str, str] = {
-    "mc_p_front": "true momentum at TT_Front, downstream crossing (MeV/c)",
-    "mc_p_birth": "true momentum of the track's particle at birth (MeV/c)",
-    "mc_pdg": "PDG code of the track's particle",
-    "mc_startcode": "the particle's creation code (Offline ProcessCode, "
-                    "e.g. 168 = CeMinusLeadingLog, 166 = DIO)",
+# Added to the track and MC variables, for selections as well as the plots.
+RESPONSE_VARIABLES: dict[str, str] = {
     "resolution": "p_front - mc_p_front (MeV/c)",
-    "energy_loss": "mc_p_birth - mc_p_front (MeV/c)",
+    "energy_loss": "mc_p_start - mc_p_front (MeV/c)",
 }
 
 # The central fraction sigma68 spans: +-1 sigma of a Gaussian.
@@ -58,29 +51,15 @@ class ResolutionError(ValueError):
 
 # --- per-track truth ---------------------------------------------------------------
 
-def mc_variables(arrays, reco: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
-    """MC_VARIABLES, one entry per track, from the MC leaves and the track's
-    reconstructed variables. A track without truth gets NaN."""
-    import awkward as ak
-
-    steps = arrays["trksegsmc"]
-    mom = steps.mom.fCoordinates
-    p = np.sqrt(mom.fX ** 2 + mom.fY ** 2 + mom.fZ ** 2)
-    front = (steps.sid == SID_TT_FRONT) & (mom.fZ > 0)
-    out = {"mc_p_front": _flat(ak.firsts(p[front], axis=-1))}
-
-    particle = ak.firsts(arrays["trkmcsim"], axis=-1)     # events * tracks
-    birth = particle.mom.fCoordinates
-    out["mc_p_birth"] = _flat(np.sqrt(birth.fX ** 2 + birth.fY ** 2 + birth.fZ ** 2))
-    out["mc_pdg"] = _flat(particle.pdg)
-    out["mc_startcode"] = _flat(particle.startCode)
-    out["resolution"] = reco["p_front"] - out["mc_p_front"]
-    out["energy_loss"] = out["mc_p_birth"] - out["mc_p_front"]
-    return out
+def response_variables(variables: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+    """RESPONSE_VARIABLES from the track's reconstructed and MC variables.
+    A track without truth gets NaN."""
+    return {"resolution": variables["p_front"] - variables["mc_p_front"],
+            "energy_loss": variables["mc_p_start"] - variables["mc_p_front"]}
 
 
 def read_file(path: Path) -> tuple[dict[str, np.ndarray], int]:
-    """(reconstructed and MC variables per track, number of events)."""
+    """(reconstructed, MC and response variables per track, number of events)."""
     tree = open_tree(path)
     names = {key.rsplit("/", 1)[-1] for key in tree.keys()}
     absent = [leaf for leaf in MC_LEAVES if leaf not in names]
@@ -88,9 +67,8 @@ def read_file(path: Path) -> tuple[dict[str, np.ndarray], int]:
         raise NtupleError(
             f"{path.name}: no {', '.join(absent)} branch — this analysis needs "
             "MC truth, which only simulated EventNtuples carry")
-    arrays = read_track_arrays(tree, path, MC_LEAVES)
-    variables = track_variables(arrays)
-    variables.update(mc_variables(arrays, variables))
+    variables = track_variables(read_track_arrays(tree, path))
+    variables.update(response_variables(variables))
     return variables, tree.num_entries
 
 
@@ -161,7 +139,7 @@ def _write_outputs(outdir: Path, hists: dict[str, Spectrum], metrics: dict,
     labels = {
         "resolution": ("Reconstructed minus true momentum at TT_Front (MeV/c)",
                        "Momentum resolution"),
-        "energy_loss": ("True momentum at birth minus at TT_Front (MeV/c)",
+        "energy_loss": ("True momentum at creation minus at TT_Front (MeV/c)",
                         "Energy loss before the tracker"),
     }
     for name, h in hists.items():
@@ -280,12 +258,13 @@ _SELECTION_HELP = (
     "Track selection: every track passing it fills the distributions. "
     "Comparisons, arithmetic, and/or/not (or &&/||/!) and "
     "abs/sqrt/hypot/min/max/log/exp over the reconstructed variables "
-    + ", ".join(TRACK_VARIABLES) + "; and the MC truth ones "
-    + ", ".join(MC_VARIABLES) + ". *_front quantities are at the "
+    + ", ".join(TRACK_VARIABLES) + "; the MC truth ones "
+    + ", ".join(MC_VARIABLES) + "; and " + ", ".join(RESPONSE_VARIABLES)
+    + ". *_front quantities are at the "
     "downstream-going TT_Front crossing; a missing value is NaN and fails "
     "any cut on it. The default is a converged downstream e- fit with "
     "p > 80 MeV/c at the tracker front, >= 15 active hits and chisq/ndof < 5; "
-    "add e.g. 'and mc_startcode == 168' for true CE only. An empty string "
+    "add e.g. 'and mc_start_code == 168' for true CE only. An empty string "
     "takes every track."
 )
 
@@ -305,7 +284,7 @@ SPEC = AnalysisSpec(
     description=(
         "Momentum resolution (reconstructed minus true momentum at the "
         "tracker front) and energy loss before the tracker (true momentum at "
-        "birth minus at the tracker front) for the tracks passing a "
+        "creation minus at the tracker front) for the tracks passing a "
         "selection in simulated EventNtuple file(s): plots, histograms in a "
         "ROOT file, and their mean/rms/median/sigma68. No job is run."
     ),

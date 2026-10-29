@@ -115,6 +115,9 @@ class RunContext:
     # True when the caller passed data_files (a list) rather than data_file, so
     # a one-element list still goes through mu2e's -S file-list path.
     wants_file_list: bool = False
+    # The baseline sample, for an analysis that takes_reference: what
+    # input_paths (the new sample) is compared against. Empty otherwise.
+    reference_paths: list[Path] = field(default_factory=list)
 
     @property
     def input_path(self) -> Path:
@@ -160,6 +163,9 @@ class AnalysisSpec:
             take a list, as one mu2e -S job.
         default_inputs: Supplies the input when no data_file(s) are passed.
         default_inputs_hint: What those default inputs are, for agents.
+        takes_reference: Compares its input with a second, baseline sample,
+            which the caller must pass as reference_file(s) or
+            reference_dataset.
     """
 
     name: str
@@ -181,6 +187,7 @@ class AnalysisSpec:
     # default_inputs_hint.
     default_inputs: Callable[[], list[Path]] | None = None
     default_inputs_hint: str = ""
+    takes_reference: bool = False
 
     @property
     def takes_file_list(self) -> bool:
@@ -201,6 +208,8 @@ class AnalysisSpec:
             entry["produced_by"] = list(self.produced_by)
         if self.default_inputs is not None:
             entry["default_inputs"] = self.default_inputs_hint
+        if self.takes_reference:
+            entry["takes_reference"] = True
         if self.fcl is not None:
             env = current_env()
             entry["fcl"] = str(env.resolve_fcl(self.fcl))

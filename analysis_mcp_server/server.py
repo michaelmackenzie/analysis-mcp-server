@@ -52,9 +52,11 @@ def create_server(
         "the mu2e executable and get its numbers back. Call list_analyses to "
         "see what is available (energy deposition is one) and which metrics "
         "each reports, then run_analysis to run one. Each run is a real mu2e "
-        "job and can take a while: pass absolute paths to the input art "
-        "file(s), a directory the job may write into, and max_events for a "
-        "quick check before a full run."
+        "job and can take a while: pass the input as absolute paths, as file "
+        "names registered in SAM or metacat, or as a dataset (a SAM "
+        "definition or a metacat DID, with max_files to take a few), a "
+        "directory the job may write into, and max_events for a quick check "
+        "before a full run."
     )
 
     if _HOST_PORT_IN_RUN:

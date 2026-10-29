@@ -22,8 +22,8 @@ import json
 import urllib.parse
 import urllib.request
 
-SAM_API = "https://sammu2e.fnal.gov:8483/sam/mu2e/api"
-SAM_TIMEOUT_S = 30.0
+from ...catalog import SAM_API, TIMEOUT_S as SAM_TIMEOUT_S
+
 # nts -> mcs -> dig -> ...: the count is on the mcs file, one step up. Stop
 # well before a chain could loop.
 MAX_ANCESTRY = 6

@@ -13,8 +13,9 @@ deposition (`edep`), event counts (`count`), muon stopping rate
 (`muon_stop_rate`), approximate CE sensitivity (`approx_ce_sensitivity`),
 muon stops per material (`stop_materials`), and the online trigger's
 efficiency, rate and processing time (`trigger_efficiency`, `trigger_rate`,
-`trigger_timing`), and the trigger efficiency read from EventNtuples
-(`trigger_efficiency_ntuple`). Adding more is one small module each.
+`trigger_timing`), and the trigger efficiency read from EventNtuples,
+overall and as a function of a variable (`trigger_efficiency_ntuple`,
+`trigger_efficiency_ntuple_binned`). Adding more is one small module each.
 
 Built to the same pattern as
 [`spectra-mcp-server`](https://github.com/HEP-KE/spectra-mcp-server), so the
@@ -45,6 +46,8 @@ tools/
   spec.py             AnalysisSpec, ParamSpec, RunContext/RunOutcome, ArtifactResult
   mu2e_env.py         where Offline comes from: work area, Musing, or tarball
   mu2e_job.py         running mu2e: -s/-S inputs, logs, timeouts
+  catalog.py          SAM definitions, metacat datasets and registered file
+                      names -> /pnfs paths; tape staging check
   spectrum.py         bin contents on a uniform grid: rebin, regrid, smear
   selection.py        event selections: a safe cut expression over arrays
   registry.py         the catalogue: name -> AnalysisSpec
@@ -62,6 +65,8 @@ tools/
     trigger_timing.py          trigger processing time per event on pileup
     trigger_efficiency_ntuple.py  trigger efficiency from EventNtuple
                                trig_<path> branches, for a track selection
+    trigger_efficiency_ntuple_binned.py  the same, in bins of a track or
+                               MC variable (p_front, mc_p_front, mc_npot, ...)
     fullsim/                   full-simulation analyses of EventNtuple
       eventntuple.py           reading EventNtuple/ntuple; MC origin of a track
       cuts.py                  the CE-like track cuts (pyfitter cut-set 80)
@@ -91,7 +96,7 @@ layer needs to know about the difference between them:
 | tool | what it does |
 |---|---|
 | `list_analyses()` | catalogue: description, `input_kind`, metric names + units, parameters and their defaults, what the input must contain |
-| `run_analysis(analysis, output_dir, data_file=None, data_files=None, parameters=None, max_events=None, timeout_s=900)` | run one analysis, return its metrics |
+| `run_analysis(analysis, output_dir, data_file=None, data_files=None, dataset=None, max_files=None, reference_file=None, reference_files=None, reference_dataset=None, parameters=None, max_events=None, timeout_s=900)` | run one analysis, return its metrics |
 
 Both return the same `{status, files, message, metadata}` contract, so a
 workflow can chain several runs and collect `metadata` uniformly.
@@ -110,8 +115,12 @@ workflow can chain several runs and collect `metadata` uniformly.
 | `trigger_rate` | pileup digi art file(s); default: mu2e-trig-config's CI sample | trigger rate in Hz averaged over the cycle (duty factor from `batch_mode`) and on spill, overall and per path |
 | `trigger_timing` | pileup digi art file(s); default: mu2e-trig-config's CI sample | trigger processing time per event: mean, median, tail; per path and per module |
 | `trigger_efficiency_ntuple` | EventNtuple file(s) with `trig_<path>` branches | of events with a track passing a selection, the fraction any given path accepted, and per path |
+| `trigger_efficiency_ntuple_binned` | EventNtuple file(s) with `trig_<path>` branches | the same, in bins of a track variable or expression (reco or true momentum at the tracker front, beam intensity, ...), with a figure, CSV table and ROOT histograms |
 | `selection_efficiency_ntuple` | EventNtuple file(s) | fraction of events with a track passing a selection, of all ntuple events or of those passing a `denominator` cut |
 | `momentum_resolution_ntuple` | simulated EventNtuple file(s) (MC truth) | momentum resolution and energy loss before the tracker for tracks passing a selection: plots, histograms, mean/rms/median/sigma68 |
+| `calo_cluster_resolution_ntuple` | simulated EventNtuple file(s) (calo MC truth) | calorimeter cluster dE (reco minus true energy) and dT (reco time minus earliest true deposit) for clusters passing a selection: plots, histograms, mean/rms/median/sigma68 |
+| `variable_comparison_ntuple` | two sets of EventNtuple file(s): the input (new) and a `reference_file(s)` (baseline) | one track or cluster variable compared: overlaid distributions with ratio, shifts and a KS test, and, for the same events, how many changed, gained or lost and by how much |
+| `muon_stops` | `sim.*.TargetStops.*.art` (or PolyStops / IPAStops) | where (z, radius), when and with what momentum at ST_In the muons stopped: metrics, plots, ROOT histograms |
 
 `approx_ce_sensitivity` declares `produced_by = ["edep"]`, so chaining is
 discoverable: run `edep`, then pass the `nts.*.root` from its `files` to the
@@ -170,9 +179,38 @@ Pass **exactly one** of the following — or neither, for an analysis that
 `mu2e-trig-config/ci/data_files.txt`, found by following its `backing`
 links):
 
-- `data_file` — a single absolute art file path → `mu2e -s <file>`
-- `data_files` — a list of absolute art file paths → written one per line to
+- `data_file` — a single input file → `mu2e -s <file>`
+- `data_files` — a list of input files → written one per line to
   `filelist.txt` in `output_dir` → `mu2e -S <filelist.txt>`
+- `dataset` — a catalogued dataset, whose files run as with `data_files`:
+  a SAM definition name, or a metacat DID `<namespace>:<name>`. A bare name
+  that is not a SAM definition is looked up in metacat under its owner's
+  namespace (`nts.mmackenz.X...` → `mmackenz:`). `max_files=N` takes the
+  first N files by name; a dataset over 2000 files needs it.
+
+A file is given either as an absolute path or as the name of a file
+registered in SAM or metacat, bare or as a DID (`mu2e:<name>`). Names and
+datasets are resolved by `tools/catalog.py` to `/pnfs` paths before
+anything else happens:
+
+- Where a file is comes from SAM's location records, then from Mu2e's
+  standard dCache layout (mdh's: `<prefix>/<family>/<tier>/<owner>/<desc>/
+  <config>/<format>/<h0h1>/<h2h3>/<name>`, `h` the sha256 of the name), so a
+  file catalogued only in metacat is found too. The first copy that exists
+  wins, preferring persistent disk, then scratch, then tape.
+- A tape file that is not staged (dCache locality `NEARLINE`) would leave
+  the job waiting on tape, so the run is refused with the command that
+  stages it: `samweb prestage-dataset --defname=<def>` for a SAM
+  definition, `mdh prestage-files <names>` otherwise.
+- SAM and metacat are read over plain HTTPS, without a token or a client.
+  A 500-file definition resolves in about 20 s, most of it the locality
+  checks.
+
+```python
+run_analysis(analysis="count",
+             dataset="mmackenz:dts.mmackenz.CeEndpoint.MDC2025ax.art",
+             max_files=2, max_events=10, output_dir=".../count")
+```
 
 With `data_files` the whole set runs as **one** job, so the metrics cover all
 the inputs together, not one file each — call the tool once per file for
@@ -190,11 +228,22 @@ physics numbers. `edep` records the `max_events` it ran with next to each file
 it writes (`<file>.edep.json`, not listed in `files`), and
 `approx_ce_sensitivity` refuses such a file when given `stops_per_pot`.
 
+An analysis that `list_analyses` shows with `takes_reference: true` (so far
+`variable_comparison_ntuple`) compares its input with a second, baseline
+sample, which it then requires: pass exactly one of `reference_file`,
+`reference_files` or `reference_dataset`, given and resolved like
+`data_file`, `data_files` and `dataset` (`max_files` cuts either dataset).
+Any other analysis refuses them. The result's metadata lists them as
+`reference_files`.
+
 ### Results
 
-Every result carries `analysis`, `input_kind`, `data_files`, `n_input_files`,
-`log_path`, the resolved `parameters`, and — for the `-S` case —
-`file_list_path`. `output_dir` can be reused: a rerun overwrites the previous
+Every result carries `analysis`, `input_kind`, `data_files` (the resolved
+paths), `n_input_files`, `log_path`, the resolved `parameters`, and — for the
+`-S` case — `file_list_path`. Catalogued inputs add `inputs_from`: the
+`dataset`, which `catalog` listed it (`sam` or `metacat`) and its
+`n_files_in_dataset`, and how many files came from each dCache
+`locations`. `output_dir` can be reused: a rerun overwrites the previous
 run's ROOT output, log, file list and figures, and `files` reports what this
 run wrote whether or not the name was there before. On success the analysis' metrics are merged into `metadata`
 under the names `list_analyses` advertises. `files` lists what the run wrote:
@@ -350,6 +399,26 @@ that text with `physics.trigger_paths` and each path's prescale filter set.
 FHiCL can only `#include` through `FHICL_FILE_PATH`, not an absolute path,
 so the base is copied in rather than included.
 
+- **Testing a trigger change.** All three also take `fcl_overrides` (FHiCL
+  appended after the base, which may `#include` a tuning fcl found on
+  `FHICL_FILE_PATH`), `base_fcl` (an fcl to use instead of the timing test)
+  and `leading_paths` (paths put first in `physics.trigger_paths`, unprescaled
+  and not reported). Overrides go before the paths and prescales, which
+  always win. For example the reduced-tracker tuned trigger, re-digitizing
+  an existing digi file:
+
+  ```python
+  parameters={"trigger_paths": "apr_TrkDe_80m70p, cpr_TrkDe_80m70p",
+              "base_fcl": "trigger/reduced_tracker/redigi_trigger_tuned.fcl",
+              "leading_paths": "TriggerablePath"}
+  ```
+
+  or a single cut on the default menu:
+  `"fcl_overrides": "physics.producers.TrigCalHelixFinderDe.HelixFinderAlg.minNHit : 7"`.
+  The files named must be in the configured code. A custom base has no
+  Prefetch module, so `trigger_timing` then charges reading the data to the
+  first module. The `trigger_job.fcl` written to `output_dir` is the exact
+  job, and `metadata` echoes `base_fcl` and `fcl_overrides`.
 - **Prescales are applied in the job**, by each path's `PrescaleEvent` filter
   (`event % prescale == 0`), as online. The overall count therefore carries
   the real overlap between prescaled paths, and a prescaled-away path costs
@@ -382,6 +451,12 @@ so the base is copied in rather than included.
   carries the database and geometry initialization the running trigger
   does not pay, ~1 s against a few ms per event, and would double the mean
   of a few hundred events.
+  `ignore_modules` (labels or module types, comma or space separated) leaves
+  out work the real trigger would not do, such as `makeSD` re-making digis
+  from MC truth in a `base_fcl` re-digitization job: they are timed apart
+  like the fetch, listed in `metadata.modules` with `counted: false`, and
+  their mean time is `metadata.ignored_time_mean_ms`. Names that never ran
+  are in `metadata.ignored_modules_not_seen`, to catch typos.
   `metadata.modules` lists every module in the order it ran, with **N(seen)**
   (`n_seen`, the timed events it ran on after the filters and prescale
   upstream of it in its path, and `seen_fraction`), its time per run (mean,
@@ -442,6 +517,65 @@ leaves the variables need are read, about 2 s per file; `data_files`
 combines several files into one result, with per-file counts in
 `metadata.per_file`.
 
+In a simulated file the selection can also use the track's **MC truth**
+(`MC_VARIABLES`): its sim particle from `trkmcsim` (`mc_pdg`,
+`mc_start_code`, `mc_p_start`, ...), its true crossings from `trksegsmc`
+(`mc_p_front`, `mc_cos_front`, `mc_t_front`, `mc_p_mid`, ...; the MC
+TT_Front crossing is the *earliest* with pz > 0, as the true steps are not
+stored in time order), and the event's true beam intensity `mc_npot`
+(`evtinfomc.nprotons`, protons on target in the microbunch; read by its full
+path, since `evtinfo.nprotons` is a different, unfilled leaf). A file without
+those branches is read without them, and naming an `mc_*` variable on it is
+an error saying the file has no MC truth.
+
+## trigger_efficiency_ntuple_binned
+
+`trigger_efficiency_ntuple` as a curve: the selected events are also binned
+in `variable`, any track variable or an expression of them in the selection
+syntax, and the efficiency (any path, and each path) is reported per bin:
+
+```python
+run_analysis(analysis="trigger_efficiency_ntuple_binned",
+             data_file=".../nts.mu2e.CeMLeadingLogMix1BB.MDC2025au_best_v1_1-001.001430_00000000.root",
+             output_dir=".../eff_vs_npot",
+             parameters={"trigger_paths": "apr_TrkDe_80m70p, cpr_TrkDe_80m70p",
+                         "variable": "mc_npot / 1e6", "low": 0, "high": 80,
+                         "n_bins": 8})
+```
+
+- `variable` (default `p_front`): e.g. `mc_p_front`, `p_front - mc_p_front`,
+  `cos_front`, or the beam intensity `mc_npot / 1e6`. An event with several
+  passing tracks is entered once, at its **first** passing track's value.
+- Binning: `n_bins` uniform bins over `[low, high)` (default 15 over 80-110,
+  2 MeV/c), or explicit `bin_edges` (`"80, 95, 100, 103, 105, 110"`).
+- `trigger_paths` and `selection` are as in `trigger_efficiency_ntuple`, with
+  the same default. For a curve in a true quantity, loosen the cut on the
+  reconstructed one so it does not sculpt the curve. Events without any
+  track are never in the denominator, so a curve in `mc_p_front` is the
+  efficiency given a selected reconstructed track, not the full
+  reconstruction-plus-trigger efficiency.
+
+The overall metrics (`n_selected`, `n_triggered`, `efficiency`, ...) are the
+same as `trigger_efficiency_ntuple`'s at the same selection. Added to them:
+`n_bins`, `n_in_range`, `n_triggered_in_range`, `efficiency_in_range(_err)`,
+and the selected events outside the binning (`n_underflow`, `n_overflow`)
+or with no value (`n_undefined`, e.g. NaN `mc_p_front` for a track with no
+true downstream TT_Front crossing). `metadata.bins` has one row per bin:
+`low`, `high`, `n_selected`, `n_triggered`, `efficiency`, `efficiency_err`
+and `paths` (each path's `passed` and efficiency). Each run writes into
+`output_dir`, overwriting a previous run's:
+
+- `trigger_efficiency_binned.png`: the curve, any path and (for several
+  paths) each one, with the selection as title;
+- `trigger_efficiency_binned.csv`: the `metadata.bins` table;
+- `trigger_efficiency_binned.root`: TH1Ds `selected`, `triggered` and
+  `triggered_<path>` (sumw2 = counts), for a `TEfficiency` in ROOT.
+
+On the CeMLeadingLogMix1BB example file at the default selection, apr or cpr
+`TrkDe_80m70p` is 97-98% efficient up to 40M protons per microbunch and drops
+to about 88% at 50-70M (few events); in `p_front` it rises from about 62% at
+80-82 MeV/c to 97% above 98 MeV/c.
+
 ## selection_efficiency_ntuple
 
 A plain selection efficiency from EventNtuple file(s): the fraction of events
@@ -468,7 +602,10 @@ upstream. On the CeMLeadingLogMix1BB example file, the
 `trigger_efficiency_ntuple` default cut passes 7178 of 8212 events (87.4%).
 Of those, 6503 (90.6%) have a track at 100 < p_front < 110 MeV/c. Track
 counts are in `n_tracks_denominator` and `n_tracks_passed`, and `data_files`
-combines several files, with per-file counts in `metadata.per_file`.
+combines several files, with per-file counts in `metadata.per_file`. In a
+simulated file both cuts can also use the MC truth variables (`mc_*`), as
+in `trigger_efficiency_ntuple`; naming one on a file without truth is an
+error saying so.
 
 ## momentum_resolution_ntuple
 
@@ -477,10 +614,10 @@ simulated EventNtuple, for every track passing `selection`:
 
 - **resolution**: reconstructed minus true momentum at the tracker front
   (TT_Front), i.e. how well the fit measures the momentum it sees;
-- **energy loss**: true momentum at birth minus true momentum at TT_Front,
+- **energy loss**: true momentum at creation minus true momentum at TT_Front,
   i.e. what the particle lost before reaching the tracker.
 
-Their difference, reconstructed at TT_Front minus true at birth, is the
+Their difference, reconstructed at TT_Front minus true at creation, is the
 combined response `fullsim_sensitivity` folds the DIO spectrum with.
 
 ```python
@@ -488,17 +625,17 @@ run_analysis(analysis="momentum_resolution_ntuple",
              data_file=".../nts.mu2e.CeMLeadingLogMix1BB.MDC2025au_best_v1_1-001.001430_00000000.root",
              output_dir=".../resolution",
              parameters={"selection": "status == 1 and pdg == 11 and downstream "
-                                      "and p_front > 80 and mc_startcode == 168"})
+                                      "and p_front > 80 and mc_start_code == 168"})
 ```
 
-The truth comes from the track's own branches: `trksegsmc` (true steps at
-each surface) and the first entry of `trkmcsim` (the track's particle). As
-for the reconstructed `*_front` variables, the true TT_Front step is the
-first downstream-going one. On top of `trigger_efficiency_ntuple`'s track
-variables, the selection can use `mc_p_front`, `mc_p_birth`, `mc_pdg`,
-`mc_startcode`, `resolution` and `energy_loss`. Its default is that
-analysis's default cut. A file without `trksegsmc`/`trkmcsim` (e.g. data) is
-refused with a message saying the analysis needs simulation.
+The truth is `trigger_efficiency_ntuple`'s MC variables: the true momentum
+at creation (`mc_p_start`, the track's own particle in `trkmcsim`) and at the
+downstream-going TT_Front crossing (`mc_p_front`, from `trksegsmc`, the
+earliest such true step). The selection can use every track and MC variable
+plus `resolution` and `energy_loss`, e.g. `mc_start_code == 168` for true CE
+only. Its default is `trigger_efficiency_ntuple`'s default cut. A file
+without `trksegsmc`/`trkmcsim` (e.g. data) is refused with a message saying
+the analysis needs simulation.
 
 Both distributions have long tails, so besides the mean and rms the metrics
 give the median and `sigma68`, half the width of the central 68% (the sigma
@@ -511,6 +648,149 @@ CeMLeadingLogMix1BB example file, with the default selection, 7192 tracks
 in 7178 events give a resolution sigma68 of 0.22 MeV/c (median -0.005, rms
 1.5) and an energy loss with median 0.73 MeV/c (mean 1.39, 90% below
 2.5 MeV/c).
+
+## calo_cluster_resolution_ntuple
+
+The calorimeter's counterpart of `momentum_resolution_ntuple`: for every
+cluster passing `selection`, its MC truth (`caloclustersmc`, one entry per
+`caloclusters` entry) gives
+
+- **dE** = reconstructed cluster energy minus `etot`, the true energy every
+  particle deposited in the cluster's crystals;
+- **dT** = reconstructed cluster time minus `tprimary`, the earliest true
+  deposit of the cluster's leading particle (the one that deposited most).
+
+```python
+run_analysis(analysis="calo_cluster_resolution_ntuple",
+             data_file=".../nts.mu2e.CeMLeadingLogMix1BB.MDC2025au_best_v1_1-001.001430_00000000.root",
+             output_dir=".../calo_res",
+             parameters={"selection": "mc_rel == 0 and energy > 50"})
+```
+
+The selection is per cluster, over `CLUSTER_VARIABLES` (repeated in the
+parameter's description): the reconstructed `energy`, `time`, `disk`,
+`size`, centroid radius `r` (in the disk's frame), ..., the truth (`mc_etot`,
+`mc_eprimary`, `mc_tprimary`, `mc_nsim`, `mc_purity` = eprimary/etot), and
+`de`, `de_frac`, `dt` themselves. Two things about the truth are easy to get
+wrong:
+
+- The truth's "primary" is the cluster's leading contributor, not the
+  event's generated particle. `mc_rel` is how it is related to that
+  particle (MCRelationship: -1 none, 0 same, 1 daughter, 2 mother,
+  3 sibling), so the default `mc_rel == 0` keeps the clusters the generated
+  particle made itself: the CE in a CE sample. Pileup clusters are -1.
+- `tavg` is not used. Newer EventNtuple versions fill it with `tprimary`;
+  older files carry something else, tens of ns away (on the example file it
+  differs from `tprimary` for two thirds of the clusters).
+
+A cluster without truth (`mc_nsim == 0`) has NaN MC values and never enters
+the distributions. A file without `caloclustersmc` is refused, saying the
+analysis needs simulation. The metrics are the mean, rms, median and
+`sigma68` of dE and dT, and the median and sigma68 of `de_frac` (dE over the
+true energy). The `de_*`/`dt_*` range and bin-width parameters set only
+`calo_cluster_resolution.root` (TH1D `de`, `dt`) and the plots
+(`figures/cluster_de.png`, `figures/cluster_dt.png`).
+
+On the CeMLeadingLogMix1BB example file, the 6491 CE clusters above 50 MeV
+(of 56159 clusters in 8212 events) give dE median -0.47 MeV, sigma68
+1.35 MeV (1.6% of the true energy), and dT median +1.91 ns, sigma68
+0.56 ns: the reconstructed time sits about 2 ns after the earliest true
+deposit.
+
+## variable_comparison_ntuple
+
+Compares one variable between two sets of EventNtuple files: the input
+(`data_file(s)`, "new") and a baseline (`reference_file(s)`, "ref"), e.g.
+the same events before and after a code change, or two configurations of a
+sample.
+
+```python
+run_analysis(analysis="variable_comparison_ntuple",
+             data_file=".../nts.mu2e.CeMLeadingLogMix1BB.MDC2025au_best_v1_1-001.001430_00000000.root",
+             reference_file=".../nts.mu2e.CeMLeadingLogMix1BB.MDC2025au_best_v1_1.001430_00000000.root",
+             output_dir=".../compare",
+             parameters={"variable": "p_front",
+                         "selection": "status == 1 and pdg == 11 and downstream and p_front > 80"})
+```
+
+`level` says what the variable belongs to: `track` (the names of
+`trigger_efficiency_ntuple`, `mc_*` included) or `cluster` (those of
+`calo_cluster_resolution_ntuple`; the truth ones need `caloclustersmc`, the
+rest work on data). `variable` is a name or an expression of them, and
+`selection` (empty by default: every object) picks the objects. Two
+comparisons come out:
+
+- **Distributions**, always: every selected object's value, overlaid with
+  their ratio (`figures/variable_comparison.png`), scaled per event by
+  default (`normalize`: `events`, `area` or `none`) so a change in how
+  many objects pass shows. The metrics give each sample's count, mean, rms,
+  median and sigma68, the mean shift (with its error as for independent
+  samples) and median shift, and the two-sample KS statistic and p-value.
+- **Matched events**, when the samples share events: each event's first
+  selected object (the ntuple's order) in one sample against the other's.
+  `n_events_gained` / `n_events_lost` count the matched events that have a
+  selected object in only the new / only the reference sample,
+  `n_events_changed` those whose value moved (by more than 1e-6
+  relatively), and `diff_*` summarize new - ref over the events with a value
+  in both (`figures/variable_difference.png`). "First" is the same object
+  in both only when the objects come out in the same order, as they do for
+  a reprocessing of the same events. With `match_events="auto"` events are
+  matched when at least half of the smaller sample's (run, subrun, event)
+  ids are in both, since independent samples can share a few by chance;
+  `yes` insists, `no` skips it. Unmatched, the matched metrics are NaN
+  (`n_events_matched` is 0).
+
+`range` (`'low, high'`; by default the 0.5-99.5% quantiles of both samples)
+and `n_bins` set the histograms, not the metrics. `variable_comparison.root`
+holds the unscaled TH1Ds `new`, `ref` and, when matched, `diff`.
+
+On the CeMLeadingLogMix1BB file 001430_00000000, the `MDC2025au_best_v1_1-001`
+ntuple against the `MDC2025au_best_v1_1` one matches all 8212 events and finds
+nothing changed, in tracks or clusters: the re-run reproduces the original.
+Against the same CE sample without pileup (`CeMLeadingLogOnSpill.
+MDC2025au_best_v1_5`, not the same events), cluster `energy` shows the
+pileup clusters (below ~50 MeV, nearly all from the mixing) and the CE peak
+near 90 MeV in both. Files from older EventNtuple versions (MDC2020) lack
+branches the track and cluster readers need, and are refused saying which.
+
+## muon_stops
+
+The stop profile of a MuBeam-stage stop file: where the muons stopped (z
+along the DS, radius from its axis), when, and what momentum they had where
+they crossed ST_In, the virtual detector just upstream of the stopping
+target.
+
+```python
+run_analysis(analysis="muon_stops",
+             data_file=".../sim.mmackenz.TargetStops.Run1Bak_local0813111400.001800_00000000.art",
+             output_dir=".../stops")
+```
+
+One mu2e job (`fcl/muon_stops.fcl`) runs two Offline modules on the stop
+filter's collections. `StoppedParticlesDumper` writes each stop's position,
+time and codes, as Offline's `TargetStopsDumper.fcl` and Production's
+`Tests/TGTstops.fcl` do. `StepPointMCDumper` writes the stopped muons'
+virtual-detector steps. `stop_filter` (default `TargetStopFilter`) points
+both at another stream's collections: `PolyStopFilter` for PolyStops,
+`IPAStopFilter` for IPAStops. The radius is from the DS axis, at
+x = -3904 mm (`mu2e.solenoidOffset`). The ST_In momentum is that of every
+downstream-going muon crossing of ST_In in the file. The dumpers write no
+event number, so a crossing is not paired with its stop; in a stop file the
+crossings are the stopped muons', and `n_st_in` is there to compare with
+`n_stops`.
+
+Outputs: the metrics (mean/rms/median of z and radius, mean/median time,
+mean/median/rms of the ST_In momentum, with the stop and generated-event
+counts), `muon_stops_hists.root` (TH1Ds `stop_z`, `stop_r`, `stop_time`,
+`p_st_in` and the TH2D `stop_r_vs_z`) and the same as plots in `figures/`.
+For a stopping *rate*, use `muon_stop_rate` on the same file: it divides out
+the stream's prescale.
+
+On the Run1Bak TargetStops example file, 735 stops from 12500 generated
+events sit on the foils of its extended target, between z = 5000 and
+6750 mm (mean 5415 mm), at a mean radius of 67 mm and a median time of
+238 ns. Every stop has one ST_In crossing, with a median momentum of
+32.8 MeV/c (5-49 MeV/c).
 
 ## approx_ce_sensitivity
 
@@ -770,7 +1050,8 @@ goes to `mu2e`, art resolves it on `FHICL_FILE_PATH`, `fcl_exists` comes back
 python3 tests/test_tools.py
 ```
 
-133 tests, none of which start a mu2e job. (The `ana` env has no pytest, so
+167 tests, none of which start a mu2e job or reach SAM or metacat (the
+catalog tests use a fake). (The `ana` env has no pytest, so
 these are bare asserts.)
 
 ## Run the server
