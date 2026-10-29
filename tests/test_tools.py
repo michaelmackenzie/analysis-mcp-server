@@ -1384,7 +1384,8 @@ def test_resolution_writes_histograms_and_refuses_bad_binning(tmp_dir):
     params = {name: p.default for name, p in
               ((p.name, p) for p in nres.SPEC.parameters)}
     nres._check_binning(params)
-    for bad in ({"resolution_max": -5.0}, {"energy_loss_bin_width": 1e-6}):
+    for bad in ({"resolution_max": -5.0}, {"energy_loss_bin_width": 1e-6},
+                {"resolution_bin_width": 100.0}):
         try:
             nres._check_binning({**params, **bad})
         except nres.ResolutionError as exc:
@@ -1502,7 +1503,7 @@ def test_calo_resolution_writes_its_outputs_and_refuses_bad_binning(tmp_dir):
     import uproot
     params = {p.name: p.default for p in ncalo.SPEC.parameters}
     ncalo._check_binning(params)
-    for bad in ({"dt_max": -6.0}, {"de_bin_width": 1e-6}):
+    for bad in ({"dt_max": -6.0}, {"de_bin_width": 1e-6}, {"de_bin_width": 1000.0}):
         try:
             ncalo._check_binning({**params, **bad})
         except ncalo.CaloResolutionError as exc:
@@ -1584,6 +1585,28 @@ def test_comparison_takes_each_events_first_selected_object():
     assert sample.values.tolist() == [12.0, 14.0]
     assert sample.selected.tolist() == [True, False, True]
     assert sample.first[0] == 12.0 and np.isnan(sample.first[1])
+
+
+def test_comparison_compares_a_true_false_variable_as_0_1():
+    variables = {"_event": np.array([0, 1, 2]), "has_front": np.array([True, False, True])}
+    keys = vcmp.event_keys([1] * 3, [0] * 3, [1, 2, 3])
+    sample = vcmp.sample_from_objects(variables, keys, "", "has_front")
+    assert sample.values.tolist() == [1.0, 0.0, 1.0]
+    # A cut is still not a quantity.
+    try:
+        vcmp.sample_from_objects(variables, keys, "", "has_front and has_front")
+    except vcmp.SelectionError:
+        pass
+    else:
+        raise AssertionError("a condition was accepted as a quantity")
+
+
+def test_comparison_ratio_shows_bins_only_the_reference_has():
+    shown, ratio, error = vcmp.ratio_points(np.array([4.0, 0.0, 3.0]),
+                                            np.array([4.0, 5.0, 0.0]), 1.0, 1.0)
+    assert shown.tolist() == [True, True, False]
+    assert ratio[:2].tolist() == [1.0, 0.0]
+    assert np.isclose(error[0], np.sqrt(1 / 4 + 1 / 4)) and error[1] == 0.0
 
 
 def test_comparison_matches_events_and_counts_what_changed():

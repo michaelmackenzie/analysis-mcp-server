@@ -716,12 +716,14 @@ run_analysis(analysis="variable_comparison_ntuple",
 `level` says what the variable belongs to: `track` (the names of
 `trigger_efficiency_ntuple`, `mc_*` included) or `cluster` (those of
 `calo_cluster_resolution_ntuple`; the truth ones need `caloclustersmc`, the
-rest work on data). `variable` is a name or an expression of them, and
+rest work on data). `variable` is a name or an expression of them (a
+true/false name such as `has_front` compares as 0/1), and
 `selection` (empty by default: every object) picks the objects. Two
 comparisons come out:
 
 - **Distributions**, always: every selected object's value, overlaid with
-  their ratio (`figures/variable_comparison.png`), scaled per event by
+  their ratio (`figures/variable_comparison.png`; a bin only the reference
+  fills shows as ratio 0), scaled per event by
   default (`normalize`: `events`, `area` or `none`) so a change in how
   many objects pass shows. The metrics give each sample's count, mean, rms,
   median and sigma68, the mean shift (with its error as for independent
@@ -1050,7 +1052,7 @@ goes to `mu2e`, art resolves it on `FHICL_FILE_PATH`, `fcl_exists` comes back
 python3 tests/test_tools.py
 ```
 
-167 tests, none of which start a mu2e job or reach SAM or metacat (the
+169 tests, none of which start a mu2e job or reach SAM or metacat (the
 catalog tests use a fake). (The `ana` env has no pytest, so
 these are bare asserts.)
 

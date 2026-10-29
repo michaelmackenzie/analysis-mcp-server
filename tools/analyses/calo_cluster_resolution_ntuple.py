@@ -254,6 +254,12 @@ def _check_binning(params: dict) -> None:
         if (high - low) / width > 100_000:
             raise CaloResolutionError(f"{name}_bin_width {width:g} gives over "
                                       f"100000 bins between {low:g} and {high:g}")
+        # histogram() rounds the bin count, so a width over twice the range
+        # would give no bins at all.
+        if round((high - low) / width) < 1:
+            raise CaloResolutionError(f"{name}_bin_width {width:g} gives no bins "
+                                      f"between {low:g} and {high:g}: make it at "
+                                      f"most {high - low:g}")
 
 
 def run(context: RunContext) -> RunOutcome:

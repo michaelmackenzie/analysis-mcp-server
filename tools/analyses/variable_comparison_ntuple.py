@@ -128,7 +128,13 @@ def sample_from_objects(variables: dict[str, np.ndarray], keys: np.ndarray,
     objects = {k: v for k, v in variables.items() if not k.startswith("_")}
     n_objects = variables["_event"].size
     passing = apply_selection(selection, objects, n_objects)
-    values = evaluate_expression(variable, objects, n_objects)
+    # A true/false variable (has_front, downstream, ...) compares as 0/1. Only
+    # a bare name is converted: an expression like `p > 100` is a cut, and
+    # evaluate_expression still refuses it as a quantity.
+    if objects.get(variable.strip(), np.empty(0)).dtype == bool:
+        values = objects[variable.strip()].astype(np.float64)
+    else:
+        values = evaluate_expression(variable, objects, n_objects)
     index = np.flatnonzero(passing)
     # Objects are in event order, so the first of each event's is its first.
     events, first = np.unique(variables["_event"][index], return_index=True)
@@ -303,6 +309,23 @@ def _label(paths: list[Path]) -> str:
     return paths[0].name + (f" (+{len(paths) - 1} more)" if len(paths) > 1 else "")
 
 
+def ratio_points(h_new: np.ndarray, h_ref: np.ndarray, scale_new: float,
+                 scale_ref: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """The ratio panel: which bins to show, new/ref and its error.
+
+    Every bin with reference entries is shown, so a population the new sample
+    lost shows as ratio 0 rather than vanishing. The error is
+    ratio * sqrt(1/n_new + 1/n_ref), written so it does not divide by n_new
+    (an empty new bin gets the new side's sqrt(0) = 0, as in the top panel).
+    """
+    shown = h_ref > 0
+    with np.errstate(all="ignore"):
+        per_ref = scale_new / (h_ref * scale_ref)
+        ratio = h_new * per_ref
+        error = per_ref * np.sqrt(h_new + h_new ** 2 / h_ref)
+    return shown, ratio, error
+
+
 def plot_comparison(path: Path, edges: np.ndarray, h_new: np.ndarray,
                     h_ref: np.ndarray, scale_new: float, scale_ref: float,
                     metrics: dict, labels: tuple[str, str], variable: str,
@@ -332,10 +355,7 @@ def plot_comparison(path: Path, edges: np.ndarray, h_new: np.ndarray,
     top.text(0.02, 0.97, stats, transform=top.transAxes, va="top", ha="left",
              family="monospace", fontsize=8)
 
-    with np.errstate(all="ignore"):
-        ratio = (h_new * scale_new) / (h_ref * scale_ref)
-        error = ratio * np.sqrt(1 / h_new + 1 / h_ref)
-    shown = (h_new > 0) & (h_ref > 0)
+    shown, ratio, error = ratio_points(h_new, h_ref, scale_new, scale_ref)
     bottom.errorbar(centers[shown], ratio[shown], yerr=error[shown], fmt="o",
                     markersize=3, color=NEW_COLOR, capsize=0)
     bottom.axhline(1.0, color=REF_COLOR, lw=1)
