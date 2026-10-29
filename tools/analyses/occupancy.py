@@ -331,7 +331,7 @@ def tree_metrics(names: tuple[str, ...], tree: dict[str, np.ndarray]
             metrics[f"{name}_busiest_plane_mean"] = max(per_plane, default=-1.0)
             extra.setdefault("per_plane_mean", {})[name] = per_plane
             extra.setdefault("busiest_plane", {})[name] = (
-                int(np.argmax(per_plane)) if per_plane else -1)
+                int(np.argmax(per_plane)) if any(v >= 0 for v in per_plane) else -1)
         if name in DISK_ARRAYS:
             disks = tree.get(DISK_ARRAYS[name])
             for disk in range(NDISKS):
