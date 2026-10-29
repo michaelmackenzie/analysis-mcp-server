@@ -17,6 +17,7 @@ _ANALYSIS_MODULES = ("edep", "count", "muon_stop_rate", "approx_ce_sensitivity",
                      "stop_materials", "trigger_efficiency", "trigger_rate",
                      "trigger_timing", "trigger_efficiency_ntuple",
                      "trigger_efficiency_ntuple_binned",
+                     "occupancy_digi", "occupancy_reco", "occupancy_ntuple",
                      "fullsim.sensitivity")
 
 
