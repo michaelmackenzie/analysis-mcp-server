@@ -178,12 +178,15 @@ def summary(values: np.ndarray) -> dict[str, float]:
 
 
 def distribution_metrics(new: Sample, ref: Sample) -> dict[str, float]:
-    """The two samples' selected-object distributions, side by side."""
+    """The two samples' selected-object distributions, side by side. With
+    no values on one side (a reprocessing that lost or first found every
+    object), its statistics, the shifts and the KS test are NaN."""
     from scipy.stats import ks_2samp
 
     a, b = new.finite, ref.finite
     sa, sb = summary(a), summary(b)
-    ks = ks_2samp(a, b)
+    both = a.size > 0 and b.size > 0
+    ks = ks_2samp(a, b) if both else None
     return {
         "n_events_new": float(new.n_events), "n_events_ref": float(ref.n_events),
         "n_selected_new": float(a.size), "n_selected_ref": float(b.size),
@@ -192,12 +195,14 @@ def distribution_metrics(new: Sample, ref: Sample) -> dict[str, float]:
         "mean_new": sa["mean"], "mean_ref": sb["mean"],
         "mean_shift": sa["mean"] - sb["mean"],
         # As for independent samples: for matched ones, diff_mean is sharper.
-        "mean_shift_err": float(np.sqrt(a.var() / a.size + b.var() / b.size)),
+        "mean_shift_err": (float(np.sqrt(a.var() / a.size + b.var() / b.size))
+                           if both else float("nan")),
         "rms_new": sa["rms"], "rms_ref": sb["rms"],
         "median_new": sa["median"], "median_ref": sb["median"],
         "median_shift": sa["median"] - sb["median"],
         "sigma68_new": sa["sigma68"], "sigma68_ref": sb["sigma68"],
-        "ks_statistic": float(ks.statistic), "ks_pvalue": float(ks.pvalue),
+        "ks_statistic": float(ks.statistic) if ks else float("nan"),
+        "ks_pvalue": float(ks.pvalue) if ks else float("nan"),
     }
 
 
@@ -417,9 +422,10 @@ def write_root(path: Path, hists: dict[str, tuple[np.ndarray, np.ndarray]],
 # --- the analysis ------------------------------------------------------------------
 
 def _scale(normalize: str, n_events: int, n_values: int) -> float:
-    if normalize == "events":
+    # An empty side's histogram is all zero whatever its scale: 1 keeps it so.
+    if normalize == "events" and n_events:
         return 1.0 / n_events
-    if normalize == "area":
+    if normalize == "area" and n_values:
         return 1.0 / n_values
     return 1.0
 
@@ -451,12 +457,15 @@ def run(context: RunContext) -> RunOutcome:
             except (NtupleError, SelectionError, ComparisonError) as exc:
                 raise ComparisonError(f"{side} sample: {exc}") from None
         new, ref = samples["new"], samples["reference"]
-        for side, sample in samples.items():
-            if sample.finite.size == 0:
-                raise ComparisonError(
-                    f"no {level.noun} of {sample.n_objects} in the {side} sample "
-                    f"({sample.n_events} events) passes the selection with a "
-                    f"value of {variable!r}, so there is nothing to compare")
+        # One empty side is a result (every object lost, or the first ones
+        # gained); only with both empty is there nothing to compare.
+        if new.finite.size == 0 and ref.finite.size == 0:
+            raise ComparisonError(
+                f"no {level.noun} in either sample passes the selection with a "
+                f"value of {variable!r} (new sample: {new.n_objects} "
+                f"{level.noun}s in {new.n_events} events; reference sample: "
+                f"{ref.n_objects} in {ref.n_events}), so there is nothing to "
+                "compare")
         matching = match(new, ref, params["match_events"])
         both = np.concatenate([new.finite, ref.finite])
         edges = edges_for(*(fixed_range or auto_range(both)), params["n_bins"])

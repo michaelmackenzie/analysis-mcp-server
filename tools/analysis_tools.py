@@ -73,12 +73,15 @@ def run_analysis(
     data_files: Annotated[list[str] | None, Field(min_length=1)] = None,
     dataset: Annotated[str | None, Field(min_length=1)] = None,
     max_files: Annotated[int | None, Field(ge=1)] = None,
-    reference_file: Annotated[str | None, Field(min_length=1)] = None,
-    reference_files: Annotated[list[str] | None, Field(min_length=1)] = None,
-    reference_dataset: Annotated[str | None, Field(min_length=1)] = None,
     parameters: dict[str, Any] | None = None,
     max_events: Annotated[int | None, Field(ge=1)] = None,
     timeout_s: Annotated[int, Field(ge=1, le=7200)] = 900,
+    # Keyword-only and last, so a call passing parameters, max_events or
+    # timeout_s by position binds them as it did before these were added.
+    *,
+    reference_file: Annotated[str | None, Field(min_length=1)] = None,
+    reference_files: Annotated[list[str] | None, Field(min_length=1)] = None,
+    reference_dataset: Annotated[str | None, Field(min_length=1)] = None,
 ) -> ArtifactResult:
     """Run one analysis over its input file(s) and return its metrics.
 
@@ -126,12 +129,6 @@ def run_analysis(
         max_files: With dataset or reference_dataset only: use the first
             this many files of each, by name. Needed for a dataset over 2000
             files; useful for a quick check.
-        reference_file: For an analysis with `takes_reference` (see
-            list_analyses) only, and required there: the baseline the input
-            is compared with, e.g. the ntuple before a code change when
-            data_file is the one after. Given as for data_file.
-        reference_files: Several baseline files, as for data_files.
-        reference_dataset: A catalogued baseline dataset, as for dataset.
         parameters: Analysis-specific physics knobs, e.g.
             {"sig_eff": 2.5e-4} for approx_ce_sensitivity. list_analyses reports
             each analysis' parameters, defaults, and which are required.
@@ -142,6 +139,12 @@ def run_analysis(
             "per gen event" metric is meaningless when this is set.
         timeout_s: Kill the job if it runs longer than this many seconds.
             Raise it when passing many files.
+        reference_file: For an analysis with `takes_reference` (see
+            list_analyses) only, and required there: the baseline the input
+            is compared with, e.g. the ntuple before a code change when
+            data_file is the one after. Given as for data_file.
+        reference_files: Several baseline files, as for data_files.
+        reference_dataset: A catalogued baseline dataset, as for dataset.
     """
     spec = ANALYSES[analysis]
 

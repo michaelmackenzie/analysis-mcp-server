@@ -24,17 +24,6 @@ from .trigger_efficiency_ntuple import (MC_VARIABLES, TRACK_VARIABLES, NtupleErr
                                         check_mc_names, read_file)
 
 
-def _selected_events(selection: str, variables: dict[str, np.ndarray],
-                     n_events: int) -> tuple[np.ndarray, int]:
-    """(per-event mask: a track passes `selection`, tracks passing)."""
-    tracks = apply_selection(selection, {k: v for k, v in variables.items()
-                                         if not k.startswith("_")},
-                             variables["_event"].size)
-    events = np.zeros(n_events, dtype=bool)
-    events[variables["_event"][tracks]] = True
-    return events, int(tracks.sum())
-
-
 def efficiency_counts(variables: dict[str, np.ndarray], n_events: int,
                       selection: str, denominator: str = "") -> dict[str, int]:
     """Events (and tracks) passing the denominator, and the selection on top."""

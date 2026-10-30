@@ -1550,6 +1550,23 @@ def test_ntuple_mc_variables_on_data_say_there_is_no_truth():
         raise AssertionError("mc_npot on a file without MC should be refused")
 
 
+def test_th1_stores_the_binned_mean_and_rms(tmp_dir):
+    import uproot
+    edges = np.array([0.0, 1.0, 2.0, 4.0])
+    counts = np.array([1.0, 2.0, 1.0])
+    path = Path(tmp_dir) / "h.root"
+    with uproot.recreate(path) as f:
+        f["h"] = bntrig._th1(counts, edges, "h", "x")
+    with uproot.open(path) as f:
+        h = f["h"]
+        sumw, sumwx, sumwx2 = (h.member(m) for m in ("fTsumw", "fTsumwx", "fTsumwx2"))
+    centers = np.array([0.5, 1.5, 3.0])
+    mean = (counts * centers).sum() / counts.sum()
+    assert np.isclose(sumwx / sumw, mean)
+    assert np.isclose(sumwx2 / sumw - mean ** 2,
+                      (counts * (centers - mean) ** 2).sum() / counts.sum())
+
+
 def test_binned_ntuple_edges_are_uniform_or_explicit():
     assert bntrig.bin_edges(3, 80, 110, "").tolist() == [80, 90, 100, 110]
     assert bntrig.bin_edges(3, 80, 110, "0, 1 5").tolist() == [0, 1, 5]
@@ -1639,6 +1656,33 @@ def test_selection_efficiency_refuses_a_bad_cut_and_needs_a_selection(tmp_dir):
     assert result.status == "error", result.message
     assert "missing required parameter(s)" in result.message, result.message
     assert result.message.endswith(": selection"), result.message
+
+
+def test_selection_efficiency_checks_each_cut_on_its_own():
+    # Combined with the denominator, a bare quantity would coerce to a bool;
+    # on its own it is refused, so it is refused here too.
+    v = ntrig.track_variables(_ntuple_arrays())
+    for selection, denominator in (("p_front", "nactive >= 25"),
+                                   ("pdg == 11", "p_front")):
+        try:
+            nsel.efficiency_counts(v, 3, selection, denominator=denominator)
+        except SelectionError:
+            pass
+        else:
+            raise AssertionError(f"{selection!r} / {denominator!r} was accepted")
+
+
+def test_run_analysis_keeps_its_positional_arguments(tmp_dir):
+    # parameters is the seventh positional argument, as before reference
+    # inputs; they are keyword-only.
+    result = run_analysis("selection_efficiency_ntuple", tmp_dir, "/a.root",
+                          None, None, None, {})
+    assert result.status == "error", result.message
+    assert "missing required parameter(s)" in result.message, result.message
+    import inspect
+    kinds = {name: p.kind for name, p in inspect.signature(run_analysis).parameters.items()}
+    assert all(kinds[name] == inspect.Parameter.KEYWORD_ONLY for name in
+               ("reference_file", "reference_files", "reference_dataset"))
 
 
 def test_selection_efficiency_on_a_real_file(tmp_dir):
@@ -2007,10 +2051,25 @@ def test_comparison_runs_end_to_end_and_writes_its_outputs(tmp_dir):
                               parameters={"variable": "x", "match_events": "no"})
         assert result.status == "success" and result.metadata["n_events_matched"] == 0
         assert np.isnan(result.metadata["diff_median"]) and len(result.files) == 2
+        import uproot
+        with uproot.open(result.files[0]) as f:
+            h = f["new"]
+            mean = h.member("fTsumwx") / h.member("fTsumw")
+            assert abs(mean - result.metadata["mean_new"]) < 0.1, mean
+        # The reference loses every object (new 9.95 only passes): still compared.
+        result = run_analysis(analysis="variable_comparison_ntuple", data_file=str(new),
+                              reference_file=str(ref), output_dir=tmp_dir,
+                              parameters={"variable": "x", "selection": "x > 9.92",
+                                          "normalize": "area"})
+        assert result.status == "success", result.message
+        meta = result.metadata
+        assert meta["n_selected_new"] == 1 and meta["n_selected_ref"] == 0
+        assert np.isnan(meta["mean_ref"]) and np.isnan(meta["ks_pvalue"])
+        assert meta["n_events_gained"] == 1 and meta["n_events_lost"] == 0
         result = run_analysis(analysis="variable_comparison_ntuple", data_file=str(new),
                               reference_file=str(ref), output_dir=tmp_dir,
                               parameters={"variable": "x", "selection": "x > 1e9"})
-        assert result.status == "error" and "new sample" in result.message, result.message
+        assert result.status == "error" and "either sample" in result.message, result.message
     finally:
         vcmp.LEVELS["track"] = saved
 

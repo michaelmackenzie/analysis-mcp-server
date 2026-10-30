@@ -787,9 +787,15 @@ comparisons come out:
   `yes` insists, `no` skips it. Unmatched, the matched metrics are NaN
   (`n_events_matched` is 0).
 
+One sample with nothing selected is still compared, since a reprocessing
+can lose every object, or find the first ones: its statistics, the shifts
+and the KS test are NaN, and the matched events count as gained or lost.
+Only with nothing selected in either sample is it an error.
+
 `range` (`'low, high'`; by default the 0.5-99.5% quantiles of both samples)
 and `n_bins` set the histograms, not the metrics. `variable_comparison.root`
-holds the unscaled TH1Ds `new`, `ref` and, when matched, `diff`.
+holds the unscaled TH1Ds `new`, `ref` and, when matched, `diff`; their
+stored mean and RMS are the binned ones.
 
 On the CeMLeadingLogMix1BB file 001430_00000000, the `MDC2025au_best_v1_1-001`
 ntuple against the `MDC2025au_best_v1_1` one matches all 8212 events and finds
@@ -1179,7 +1185,7 @@ goes to `mu2e`, art resolves it on `FHICL_FILE_PATH`, `fcl_exists` comes back
 python3 tests/test_tools.py
 ```
 
-198 tests, none of which start a mu2e job or reach SAM or metacat (the
+201 tests, none of which start a mu2e job or reach SAM or metacat (the
 catalog tests use a fake). (The `ana` env has no pytest, so
 these are bare asserts.)
 
