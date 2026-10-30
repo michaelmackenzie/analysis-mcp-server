@@ -22,10 +22,21 @@ locality, which NFS exposes per file for free.
 Both catalogs' read APIs are plain HTTPS without authentication, so this
 needs neither samweb nor metacat-client; only the network. Nothing here
 knows about physics.
+
+The servers' certificates are checked against the Python's default CA store
+when it has one. A relocated conda environment (the CVMFS `ana` 2.7.0 one)
+can point OpenSSL at the directory it was built in, which does not exist:
+outside `pyenv`, which exports SSL_CERT_FILE, it then trusts nothing and every
+lookup fails verification. So an empty default store falls back to the
+environment's own bundle, certifi's, or the system's (`CA_BUNDLES`).
 """
 
+import functools
 import hashlib
 import json
+import os
+import ssl
+import sys
 from collections import Counter
 import urllib.error
 import urllib.parse
@@ -63,6 +74,14 @@ FILE_FAMILIES = {
 }
 # dCache localities a file can be read in without waiting for tape.
 ONLINE = {"ONLINE", "ONLINE_AND_NEARLINE"}
+# CA bundles to trust when the default store is empty, in order: the Python
+# environment's own, certifi's (added in ca_bundles when importable), and
+# the system's (AlmaLinux, Debian).
+CA_BUNDLES = (
+    Path(sys.prefix) / "ssl" / "cacert.pem",
+    Path("/etc/pki/tls/certs/ca-bundle.crt"),
+    Path("/etc/ssl/certs/ca-certificates.crt"),
+)
 
 
 class CatalogError(ValueError):
@@ -108,9 +127,47 @@ def on_tape(path: Path) -> bool:
     return str(path).startswith(DCACHE_PREFIXES["tape"] + "/")
 
 
+def ca_bundles() -> list[Path]:
+    """The fallback CA bundles, certifi's second when it is installed."""
+    bundles = list(CA_BUNDLES)
+    try:
+        import certifi
+        bundles.insert(1, Path(certifi.where()))
+    except ImportError:
+        pass
+    return bundles
+
+
+@functools.cache
+def ssl_context() -> ssl.SSLContext:
+    """The context the catalogs are read with: the default store, or the
+    first existing fallback bundle when that store holds no CA at all. An
+    SSL_CERT_FILE or SSL_CERT_DIR the caller set is the default store, so it
+    is never second-guessed."""
+    context = ssl.create_default_context()
+    if (context.cert_store_stats()["x509_ca"] == 0
+            and not os.environ.get("SSL_CERT_FILE")
+            and not os.environ.get("SSL_CERT_DIR")):
+        bundle = next((b for b in ca_bundles() if b.is_file()), None)
+        if bundle is not None:
+            context.load_verify_locations(cafile=str(bundle))
+    return context
+
+
+def network_problem(exc: Exception) -> str:
+    """`exc` as said to the caller, with what to do about a certificate this
+    Python could not verify."""
+    reason = getattr(exc, "reason", exc)
+    if isinstance(reason, ssl.SSLCertVerificationError):
+        return (f"{exc}; this Python found no CA certificate to trust the server "
+                "with: set SSL_CERT_FILE to a CA bundle (e.g. "
+                "/etc/pki/tls/certs/ca-bundle.crt) where the server is started")
+    return str(exc)
+
+
 def _fetch(url: str, data: bytes | None = None) -> str:
     with urllib.request.urlopen(urllib.request.Request(url, data=data),
-                                timeout=TIMEOUT_S) as response:
+                                timeout=TIMEOUT_S, context=ssl_context()) as response:
         return response.read().decode()
 
 
@@ -219,7 +276,7 @@ def dataset_file_names(dataset: str, client: Catalogs) -> tuple[list[str], str]:
                 return names, "metacat"
     except (urllib.error.URLError, OSError, ValueError) as exc:
         raise CatalogError(
-            f"cannot list dataset {dataset} ({exc}); SAM and metacat are read "
+            f"cannot list dataset {dataset} ({network_problem(exc)}); SAM and metacat are read "
             "over HTTPS, so check this node can reach them") from None
     raise CatalogError(f"no such dataset: tried {' and '.join(tried)}")
 
@@ -233,7 +290,7 @@ def locate_files(names: list[str], client: Catalogs) -> tuple[list[Path], list[s
         recorded = client.sam_locations(sorted(set(bare)))
     except (urllib.error.URLError, OSError, ValueError) as exc:
         raise CatalogError(
-            f"cannot look up where the input files are in SAM ({exc})") from None
+            f"cannot look up where the input files are in SAM ({network_problem(exc)})") from None
     paths, problems = [], []
     for entry, name in zip(names, bare):
         candidates = sorted(recorded.get(name, []), key=location_rank)

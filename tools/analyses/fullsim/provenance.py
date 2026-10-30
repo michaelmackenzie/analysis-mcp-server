@@ -22,7 +22,7 @@ import json
 import urllib.parse
 import urllib.request
 
-from ...catalog import SAM_API, TIMEOUT_S as SAM_TIMEOUT_S
+from ...catalog import SAM_API, ssl_context, TIMEOUT_S as SAM_TIMEOUT_S
 
 # nts -> mcs -> dig -> ...: the count is on the mcs file, one step up. Stop
 # well before a chain could loop.
@@ -42,7 +42,8 @@ class ProvenanceError(RuntimeError):
 def sam_metadata(name: str) -> dict:
     """One file's SAM metadata, as SAM's JSON."""
     url = f"{SAM_API}/files/name/{urllib.parse.quote(name)}/metadata?format=json"
-    with urllib.request.urlopen(url, timeout=SAM_TIMEOUT_S) as response:
+    with urllib.request.urlopen(url, timeout=SAM_TIMEOUT_S,
+                                context=ssl_context()) as response:
         return json.load(response)
 
 
@@ -105,7 +106,8 @@ def dataset_files(dataset: str) -> list[str]:
         "format": "json",
     })
     with urllib.request.urlopen(f"{SAM_API}/files/list?{query}",
-                                timeout=SAM_TIMEOUT_S) as response:
+                                timeout=SAM_TIMEOUT_S,
+                                context=ssl_context()) as response:
         return json.load(response)
 
 
@@ -117,7 +119,8 @@ def files_metadata(names: list[str]) -> list[dict]:
             [("file_name", name) for name in names[start:start + METADATA_CHUNK]])
         request = urllib.request.Request(f"{SAM_API}/files/metadata",
                                          data=form.encode())
-        with urllib.request.urlopen(request, timeout=SAM_TIMEOUT_S) as response:
+        with urllib.request.urlopen(request, timeout=SAM_TIMEOUT_S,
+                                    context=ssl_context()) as response:
             metadata.extend(json.load(response))
     return metadata
 

@@ -59,7 +59,8 @@ tools/
     edep.py                    energy deposition: fcl + summary parser
     count.py                   events, gen events, optional prescale + the
                                parsing/job muon_stop_rate builds on
-    muon_stop_rate.py          stopping rate: count.py + POT scaling
+    muon_stop_rate.py          stopping rate: count.py + the mu-/mu+ split
+                               + POT scaling
     approx_ce_sensitivity.py   CE sensitivity from the EdepAna tree
     stop_materials.py          stops per material from <module>/stopmat
     trigger.py                 the trigger job (paths + prescales) and its
@@ -215,6 +216,15 @@ anything else happens:
 - SAM and metacat are read over plain HTTPS, without a token or a client.
   A 500-file definition resolves in about 20 s, most of it the locality
   checks.
+- The servers' certificates are checked against Python's default CA store.
+  Where that store is empty, the catalogs trust the first CA bundle that
+  exists: the Python environment's own (`<prefix>/ssl/cacert.pem`),
+  certifi's, then the system's. This matters for the CVMFS `ana` 2.7.0
+  Python started directly rather than through `pyenv` (which exports
+  `SSL_CERT_FILE`): it was relocated from the directory it was built in, so
+  its OpenSSL looks for CAs where none exist, and without the fallback every
+  lookup fails with `CERTIFICATE_VERIFY_FAILED`. An `SSL_CERT_FILE` or
+  `SSL_CERT_DIR` you set is used as it is.
 
 ```python
 run_analysis(analysis="count",
@@ -319,10 +329,20 @@ file's rate short by exactly the prescale, with nothing in the output to show
 for it. Either way `metadata.prescale_filters` lists every block the job
 printed, so an unset run is also how you discover what there was to name.
 
-`muon_stop_rate` is `count` with the target-stop filter and one more factor.
-It shares `count.py`'s parsing, input check and job run — `count.py` is the
-only place that knows how to read `print_counts.fcl` — and adds what is about
-muon stops rather than about counting. It reports:
+`muon_stop_rate` is `count` with the target-stop filter, the mu-/mu+ split
+and one more factor. It shares `count.py`'s parsing, input check and job run —
+`count.py` is the only place that knows how to read `print_counts.fcl`'s lines
+— and adds what is about muon stops rather than about counting. Its job is
+`fcl/stop_counts.fcl`: `print_counts.fcl` plus the two `ParticleCodeFilter`s of
+Production's `MuonStopSelector.fcl`, run as trigger paths (`selectMuminus`: a
+mu- captured at rest; `selectMuplus`: a mu+), whose passed counts it reads
+from art's TrigReport. A stop file holds both charges (about 1% mu+ in
+MDC2025), and only the mu- stops feed a conversion, DIO or RMC
+normalization — Production splits them into `MuminusStopsCat` and
+`MuplusStopsCat` before any primary is made — so use the `muminus_*` rates
+for those. The selectors read the stream's SimParticles, named after its
+prescale filter (`TargetStopPrescaleFilter` -> `TargetStopFilter`), through a
+per-run `stop_counts_job.fcl`. It reports:
 
 | metric | unit | from the job's print |
 |---|---|---|
@@ -331,6 +351,12 @@ muon stops rather than about counting. It reports:
 | `prescale` | | `with prescale fraction <P>`, for the `prescale_filter` |
 | `stops_per_gen_event` | stops / generated event | `n_events / (n_gen_events * prescale)` |
 | `stops_per_pot` | stops / POT | the above times the required `upstream_eff` parameter |
+| `n_muminus`, `n_muplus` | | the events path `selectMuminus` / `selectMuplus` passed (TrigReport) |
+| `muminus_stops_per_gen_event`, `muplus_stops_per_gen_event` | stops / generated event | `n_muminus / (n_gen_events * prescale)`, and for mu+ |
+| `muminus_stops_per_pot`, `muplus_stops_per_pot` | stops / POT | the above times `upstream_eff` |
+
+`stops_per_gen_event` and `stops_per_pot` count every stop, mu+ included, as
+before the split was added.
 
 It takes two parameters:
 

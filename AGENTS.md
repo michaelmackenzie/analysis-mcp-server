@@ -104,6 +104,9 @@ python3 -m analysis_mcp_server --transport stdio [--work-area DIR | --musing 'Si
   built on it. They share `tools/analyses/occupancy.py` (per-run fcl, summary
   table, tree). A skipped collection's metrics are -1, never absent, so every
   listed metric is always reported; keep that when adding collections.
+- **A stop file holds mu+ stops too** (about 1% in MDC2025). A rate for a
+  mu- capture process (conversion, DIO, RMC) is `muon_stop_rate`'s
+  `muminus_*`, not `stops_per_*`, which keep counting every stop.
 - **Never use `tpr_` or `mpr_` paths** in defaults, tests or examples: they
   are in the trigger menu but not meant for the real trigger. Use `apr_`,
   `cpr_` and `calo_` paths.
