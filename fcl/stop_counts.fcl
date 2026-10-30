@@ -1,0 +1,67 @@
+# Print prescale and event rate information for a stopped-muon file, with the
+# mu- and mu+ stops counted apart.
+#
+# print_counts.fcl plus the two selectors of Production's MuonStopSelector.fcl
+# (which splits target stops into MuminusStopsCat and MuplusStopsCat), run as
+# trigger paths so art's TrigReport prints how many events each passed. A
+# stop file holds both charges; only the mu- stops (captured at rest) feed the
+# conversion and DIO normalization. muon_stop_rate sets the SimParticle
+# collection from the stream's prescale filter (TargetStopFilter by default).
+
+#include "Offline/fcl/minimalMessageService.fcl"
+#include "Offline/fcl/standardServices.fcl"
+
+process_name : Print
+
+services : {
+  message : @local::default_message
+  GlobalConstantsService  : { inputFile      : "Offline/GlobalConstantsService/data/globalConstants_01.txt" }
+  TFileService : { # required for gen count reader
+    fileName : "/dev/null"
+  }
+  scheduler : { wantSummary : true } # the TrigReport the path counts come from
+}
+
+physics :{
+  filters : {
+    muminusSelector : {
+      module_type   : ParticleCodeFilter
+      SimParticles  : TargetStopFilter
+      ParticleCodes : [ [ 13, "uninitialized", "muMinusCaptureAtRest" ] ] # mu-, *, captured at rest
+      PrintLevel    : 0
+    }
+    muplusSelector : {
+      module_type   : ParticleCodeFilter
+      SimParticles  : TargetStopFilter
+      ParticleCodes : [ [ -13, "uninitialized", "uninitialized" ] ] # mu+, *, *
+      PrintLevel    : 0
+    }
+  }
+  analyzers: {
+    printModule : {
+      module_type : PrintModule
+      PrescaleFilterFractionPrinter : {
+	verbose : 1
+      }
+      verbose : 0
+    }
+    genCountReader : {
+      module_type: GenEventCountReader
+    }
+    eventCount : {
+      module_type : RunSubrunEvent
+      printSam    : false
+      printRun    : false
+      printSubrun : false
+      printEvent  : false
+    }
+  }
+
+  selectMuminus : [ muminusSelector ]
+  selectMuplus  : [ muplusSelector ]
+  trigger_paths : [ selectMuminus, selectMuplus ]
+  ana       : [ printModule, genCountReader, eventCount ]
+  end_paths : [ ana ]
+}
+
+services.message.destinations.statistics.stats : @local::mf_null
