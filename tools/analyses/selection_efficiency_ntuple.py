@@ -38,20 +38,21 @@ def _selected_events(selection: str, variables: dict[str, np.ndarray],
 def efficiency_counts(variables: dict[str, np.ndarray], n_events: int,
                       selection: str, denominator: str = "") -> dict[str, int]:
     """Events (and tracks) passing the denominator, and the selection on top."""
+    objects = {k: v for k, v in variables.items() if not k.startswith("_")}
+    event_of_track = variables["_event"]
+    passing = apply_selection(selection, objects, event_of_track.size)
     if denominator.strip():
-        base, n_tracks_base = _selected_events(denominator, variables, n_events)
-        combined = f"({denominator}) and ({selection})"
+        base = apply_selection(denominator, objects, event_of_track.size)
+        n_denominator = int(np.unique(event_of_track[base]).size)
+        passing = passing & base
     else:
-        # every event, including ones with no track at all
-        base = np.ones(n_events, dtype=bool)
-        n_tracks_base = int(variables["_event"].size)
-        combined = selection
-    passed, n_tracks_passed = _selected_events(combined, variables, n_events)
+        base = np.ones(event_of_track.size, dtype=bool)
+        n_denominator = n_events
     return {"n_events": n_events,
-            "n_denominator": int(base.sum()),
-            "n_passed": int(passed.sum()),
-            "n_tracks_denominator": n_tracks_base,
-            "n_tracks_passed": n_tracks_passed}
+            "n_denominator": n_denominator,
+            "n_passed": int(np.unique(event_of_track[passing]).size),
+            "n_tracks_denominator": int(base.sum()),
+            "n_tracks_passed": int(passing.sum())}
 
 
 METRICS = ("n_events", "n_denominator", "n_passed", "efficiency",
