@@ -44,6 +44,7 @@ from tools.analyses import occupancy_ntuple as occ_ntuple
 from tools.analyses import occupancy_reco as occ_reco
 from tools.analyses.trigger_rate import duty_factor, rate_metrics
 from tools.analyses.trigger_timing import timing_metrics
+from tools.analyses import total_edep_per_pot as dose
 from tools.mu2e_env import EnvError, Mu2eEnv, configure, current
 from tools.mu2e_job import (build_input_args, root_snapshot,
                             validate_input_paths, written_root_files)
@@ -2730,6 +2731,76 @@ def test_occupancy_ntuple_on_a_real_file(tmp_dir):
     assert meta["calohits_sel_mean"] == meta["calohits_mean"]     # full window
 
 
+# --- total_edep_per_pot (reads no files) -------------------------------------
+
+DOSE_PARAMS = {"ebeam_edep_per_gen_event_mev": 6.89476e-06,
+               "mubeam_edep_per_gen_event_mev": 1.334e-07,
+               "mustop_edep_per_gen_event_mev": 2.84332e-04,
+               "stops_per_pot": 1.1514376428e-03}
+
+
+def test_total_edep_per_pot_normalizes_each_source_and_adds_them():
+    params = dict(DOSE_PARAMS, pot_per_ebeam_event=dose.POT_PER_EBEAM_EVENT,
+                  mubeam_events_per_pot=dose.MUBEAM_EVENTS_PER_POT)
+    m = dose.per_pot(params)
+    ebeam = 6.89476e-06 / 11.536718606512062
+    mubeam = 1.334e-07 * 0.01278168
+    mustop = 2.84332e-04 * 1.1514376428e-03
+    assert abs(m["ebeam_edep_per_pot_mev"] - ebeam) < 1e-18
+    assert abs(m["mubeam_edep_per_pot_mev"] - mubeam) < 1e-18
+    assert abs(m["mustop_edep_per_pot_mev"] - mustop) < 1e-18
+    assert abs(m["total_edep_per_pot_mev"] - (ebeam + mubeam + mustop)) < 1e-18
+    assert abs(sum(m[f"{s}_fraction"] for s in dose.SOURCES) - 1.0) < 1e-12
+    assert tuple(m) == dose.SPEC.metrics
+
+
+def test_total_edep_per_pot_with_nothing_deposited_has_zero_shares():
+    params = {k: 0.0 for k in DOSE_PARAMS}
+    params.update(pot_per_ebeam_event=1.0, mubeam_events_per_pot=1.0)
+    m = dose.per_pot(params)
+    assert m["total_edep_per_pot_mev"] == 0.0
+    assert all(m[f"{s}_fraction"] == 0.0 for s in dose.SOURCES)
+
+
+def test_a_parameters_analysis_runs_without_input_files(tmp_dir):
+    result = run_analysis(analysis="total_edep_per_pot", output_dir=tmp_dir,
+                          parameters=DOSE_PARAMS)
+    assert result.status == "success", result.message
+    assert result.metadata["n_input_files"] == 0
+    assert result.metadata["input_kind"] == "parameters"
+    assert result.metadata["total_edep_per_pot_mev"] > 0
+    assert "MeV/POT" in result.message
+
+
+def test_a_parameters_analysis_refuses_input_files(tmp_dir):
+    path = Path(tmp_dir) / "x.root"
+    path.write_text("")
+    for extra in ({"data_file": str(path)}, {"data_files": [str(path)]},
+                  {"max_events": 10}):
+        result = run_analysis(analysis="total_edep_per_pot",
+                              output_dir=tmp_dir, parameters=DOSE_PARAMS,
+                              **extra)
+        assert result.status == "error", extra
+        assert "reads no input files" in result.message, result.message
+
+
+def test_a_parameters_analysis_needs_its_required_parameters(tmp_dir):
+    params = dict(DOSE_PARAMS)
+    del params["stops_per_pot"]
+    result = run_analysis(analysis="total_edep_per_pot", output_dir=tmp_dir,
+                          parameters=params)
+    assert result.status == "error"
+    assert "stops_per_pot" in result.message, result.message
+
+
+def test_list_analyses_describes_the_parameters_kind():
+    entry = list_analyses().metadata["analyses"]["total_edep_per_pot"]
+    assert entry["input_kind"] == "parameters"
+    assert entry["takes_data_files"] is False
+    assert entry["parameters"]["pot_per_ebeam_event"]["default"] == \
+        dose.POT_PER_EBEAM_EVENT
+
+
 # --- the registry (loops over every analysis) --------------------------------
 
 def test_registry_includes_every_analysis():
@@ -2743,7 +2814,8 @@ def test_every_spec_is_self_consistent():
         assert spec.description.strip(), f"{name}: needs a description"
         assert spec.metrics, f"{name}: needs at least one metric"
         assert callable(spec.run) and callable(spec.summarize)
-        assert spec.input_kind in ("art_files", "root_file"), spec.input_kind
+        assert spec.input_kind in ("art_files", "root_file", "parameters"), \
+            spec.input_kind
         for metric in (spec.units or {}):
             assert metric in spec.metrics, f"{name}: unit for unknown '{metric}'"
         for param in spec.parameters:
@@ -2755,7 +2827,7 @@ def test_every_spec_is_self_consistent():
             assert current().missing_fcl(spec.fcl) is None, \
                 f"{name}: {current().missing_fcl(spec.fcl)}"
         else:
-            assert spec.fcl is None, f"{name}: root_file analysis should have no fcl"
+            assert spec.fcl is None, f"{name}: {spec.input_kind} analysis should have no fcl"
             # its input comes from another analysis here, or from elsewhere
             # (a production job's ntuple) — either way, say which
             assert spec.produced_by or spec.input_hint.strip(), \

@@ -39,6 +39,8 @@ def list_analyses() -> ArtifactResult:
                    `produced_by`) or by a production job (see
                    `input_hint`) — pass data_file, or data_files where
                    `takes_data_files` is true
+      "parameters" no file at all — pass only `parameters`, usually
+                   earlier analyses' metrics (see `produced_by`)
 
     Chaining: an analysis whose `produced_by` names another should be given a
     ROOT file from that one's `files` output.
@@ -146,10 +148,14 @@ def run_analysis(
         return fail(f"pass one of data_file (one input file), data_files (a "
                     f"list of input files) or dataset, not {' and '.join(given)}.",
                     **given)
-    if max_files is not None and dataset is None:
+    if spec.input_kind == "parameters":
+        if given or max_events is not None:
+            return fail("reads no input files; pass only parameters. "
+                        f"{spec.input_hint}", **given)
+    elif max_files is not None and dataset is None:
         return fail("max_files applies only to a dataset; pick the files "
                     "yourself with data_files.")
-    if not given:
+    if not given and spec.input_kind != "parameters":
         if spec.default_inputs is None:
             return fail("pass exactly one of data_file (one input file), "
                         "data_files (a list of input files) or dataset.")
@@ -175,13 +181,17 @@ def run_analysis(
 
     # Catalogued names and datasets become paths here, so everything after
     # sees paths alone, as if the caller had passed them.
-    try:
-        resolved = resolve_inputs(
-            [data_file] if data_file is not None else data_files,
-            dataset=dataset, max_files=max_files)
-    except CatalogError as exc:
-        return fail(str(exc), **given)
-    paths = resolved.paths
+    if spec.input_kind == "parameters":
+        resolved = None
+        paths = []
+    else:
+        try:
+            resolved = resolve_inputs(
+                [data_file] if data_file is not None else data_files,
+                dataset=dataset, max_files=max_files)
+        except CatalogError as exc:
+            return fail(str(exc), **given)
+        paths = resolved.paths
     if len(paths) > 1 and not spec.takes_file_list:
         return fail(f"takes a single ROOT file, but dataset {dataset} has "
                     f"{len(paths)}: pass max_files=1, or one file as data_file. "
@@ -214,7 +224,8 @@ def run_analysis(
         "input_kind": spec.input_kind,
         "data_files": [str(p) for p in paths],
         "n_input_files": len(paths),
-        **({"inputs_from": resolved.source} if resolved.source else {}),
+        **({"inputs_from": resolved.source}
+           if resolved is not None and resolved.source else {}),
         **({"parameters": params} if params else {}),
         **({"max_events": max_events} if max_events is not None else {}),
         **({"fcl": str(spec.fcl), "environment": env.describe()}
@@ -235,7 +246,8 @@ def run_analysis(
     return ArtifactResult(
         status="success",
         files=outcome.files,
-        message=f"{analysis} over {len(paths)} input file(s): "
-                f"{spec.summarize(outcome.metrics)}",
+        message=(f"{analysis}: " if spec.input_kind == "parameters"
+                 else f"{analysis} over {len(paths)} input file(s): ")
+                + spec.summarize(outcome.metrics),
         metadata={**metadata, **outcome.metrics},
     )
