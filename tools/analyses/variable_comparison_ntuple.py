@@ -21,7 +21,8 @@ Two comparisons are made:
   reprocessing of the same events. With `match_events="auto"`, events are
   matched when at least MATCH_FRACTION of the smaller sample has a
   counterpart; independent samples can repeat run/subrun/event numbers by
-  chance, but not wholesale.
+  chance, but not wholesale. A sample that repeats an id itself is never
+  matched, as its events cannot be paired one to one.
 
 Metrics that do not apply (the matched ones, with nothing matched) are NaN.
 """
@@ -217,16 +218,27 @@ def match(new: Sample, ref: Sample, mode: str) -> dict:
             "n_only_ref": int(unique_ref.size - common.size),
             "n_duplicate_ids_new": int(new.n_events - unique_new.size),
             "n_duplicate_ids_ref": int(ref.n_events - unique_ref.size)}
+    duplicated = info["n_duplicate_ids_new"] or info["n_duplicate_ids_ref"]
     if mode == "no":
         matched = False
     elif mode == "yes":
+        if duplicated:
+            raise ComparisonError(
+                f"match_events is 'yes', but {info['n_duplicate_ids_new']} event "
+                f"id(s) in the new sample and {info['n_duplicate_ids_ref']} in "
+                "the reference repeat a (run, subrun, event), so events cannot "
+                "be paired unambiguously: use match_events='no' to compare the "
+                "distributions only")
         if common.size == 0:
             raise ComparisonError(
                 "match_events is 'yes', but no (run, subrun, event) is in both "
                 "samples: they are not the same events")
         matched = True
     else:
-        matched = smaller > 0 and common.size >= MATCH_FRACTION * smaller
+        # intersect1d pairs only the first of repeated ids, so the rest would
+        # silently drop out or be paired with the wrong event.
+        matched = (not duplicated and smaller > 0
+                   and common.size >= MATCH_FRACTION * smaller)
     info["matched"] = matched
     if not matched:
         i_new = i_ref = np.array([], dtype=np.int64)
@@ -594,7 +606,9 @@ SPEC = AnalysisSpec(
                 "does when at least half of the smaller sample's events "
                 "(run, subrun, event) are in both, as for the same events "
                 "reprocessed; 'yes' insists and fails if none are shared; "
-                "'no' compares only the distributions."
+                "'no' compares only the distributions. A sample that repeats "
+                "an event id cannot be paired: 'auto' does not match it and "
+                "'yes' fails."
             ),
         ),
         ParamSpec(

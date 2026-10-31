@@ -115,8 +115,10 @@ def resolution_metrics(counts: dict[str, int], resolution: np.ndarray,
 
 def histogram(values: np.ndarray, low: float, high: float, width: float,
               name: str) -> Spectrum:
+    """From `low` to `high` exactly, in the whole number of bins nearest to
+    `width`: the effective width (Spectrum.width) labels the plots."""
     nbins = int(round((high - low) / width))
-    return Spectrum.from_values(values, nbins, low, low + nbins * width, name=name)
+    return Spectrum.from_values(values, nbins, low, high, name=name)
 
 
 def _write_outputs(outdir: Path, hists: dict[str, Spectrum], metrics: dict,

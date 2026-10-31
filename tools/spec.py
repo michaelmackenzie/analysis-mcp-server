@@ -15,6 +15,7 @@ means writing a module in `analyses/` with a SPEC and listing it in
 registry.py.
 """
 
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Literal
@@ -94,6 +95,10 @@ class ParamSpec:
             number = float(value)
         except (TypeError, ValueError):
             raise ValueError(f"parameter '{self.name}' must be a number, got {value!r}")
+        # float() takes "nan" and "inf", which no range check would catch.
+        if not math.isfinite(number):
+            raise ValueError(f"parameter '{self.name}' must be a finite number, "
+                             f"got {value!r}")
         if self.minimum is not None and number < self.minimum:
             raise ValueError(f"parameter '{self.name}'={number:g} is below the "
                              f"minimum {self.minimum:g}")
