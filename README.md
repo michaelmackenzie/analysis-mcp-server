@@ -106,7 +106,7 @@ layer needs to know about the difference between them:
 | tool | what it does |
 |---|---|
 | `list_analyses()` | catalogue: description, `input_kind`, metric names + units, parameters and their defaults, what the input must contain |
-| `run_analysis(analysis, output_dir, data_file=None, data_files=None, dataset=None, max_files=None, parameters=None, max_events=None, timeout_s=900)` | run one analysis, return its metrics |
+| `run_analysis(analysis, output_dir, data_file=None, data_files=None, dataset=None, max_files=None, reference_file=None, reference_files=None, reference_dataset=None, parameters=None, max_events=None, timeout_s=900)` | run one analysis, return its metrics |
 
 Both return the same `{status, files, message, metadata}` contract, so a
 workflow can chain several runs and collect `metadata` uniformly.
@@ -126,6 +126,11 @@ workflow can chain several runs and collect `metadata` uniformly.
 | `trigger_timing` | pileup digi art file(s); default: mu2e-trig-config's CI sample | trigger processing time per event: mean, median, tail; per path and per module |
 | `trigger_efficiency_ntuple` | EventNtuple file(s) with `trig_<path>` branches | of events with a track passing a selection, the fraction any given path accepted, and per path |
 | `trigger_efficiency_ntuple_binned` | EventNtuple file(s) with `trig_<path>` branches | the same, in bins of a track variable or expression (reco or true momentum at the tracker front, beam intensity, ...), with a figure, CSV table and ROOT histograms |
+| `selection_efficiency_ntuple` | EventNtuple file(s) | fraction of events with a track passing a selection, of all ntuple events or of those passing a `denominator` cut |
+| `momentum_resolution_ntuple` | simulated EventNtuple file(s) (MC truth) | momentum resolution and energy loss before the tracker for tracks passing a selection: plots, histograms, mean/rms/median/sigma68 |
+| `calo_cluster_resolution_ntuple` | simulated EventNtuple file(s) (calo MC truth) | calorimeter cluster dE (reco minus true energy) and dT (reco time minus earliest true deposit) for clusters passing a selection: plots, histograms, mean/rms/median/sigma68 |
+| `variable_comparison_ntuple` | two sets of EventNtuple file(s): the input (new) and a `reference_file(s)` (baseline) | one track or cluster variable compared: overlaid distributions with ratio, shifts and a KS test, and, for the same events, how many changed, gained or lost and by how much |
+| `muon_stops` | `sim.*.TargetStops.*.art` (or PolyStops / IPAStops) | where (z, radius), when and with what momentum at ST_In the muons stopped: metrics, plots, ROOT histograms |
 | `total_edep_per_pot` | none: parameters only (earlier `edep` and `muon_stop_rate` metrics) | the early electron-beam flash, early muon-beam flash and muon-stop pileup depositions per POT, their total and each one's share |
 
 `approx_ce_sensitivity` declares `produced_by = ["edep"]`, so chaining is
@@ -145,9 +150,9 @@ run_analysis(analysis="approx_ce_sensitivity",
 ```
 
 `list_analyses` reports each parameter's description, default, range, and
-whether it is required; unknown, missing, or out-of-range values come back as
-a plain error naming the offender. A parameter is a number unless its `kind`
-is `"text"`, which is for the ones that name something in the job's output —
+whether it is required; unknown, missing, non-finite, or out-of-range values
+come back as a plain error naming the offender. A parameter is a number unless
+its `kind` is `"text"`, which is for the ones that name something in the job's output —
 like `muon_stop_rate`'s `prescale_filter` — or, as with `selection`, are an
 expression.
 
@@ -252,6 +257,14 @@ meaningless when `max_events` is set** — use it to confirm a job runs, not for
 physics numbers. `edep` records the `max_events` it ran with next to each file
 it writes (`<file>.edep.json`, not listed in `files`), and
 `approx_ce_sensitivity` refuses such a file when given `stops_per_pot`.
+
+An analysis that `list_analyses` shows with `takes_reference: true` (so far
+`variable_comparison_ntuple`) compares its input with a second, baseline
+sample, which it then requires: pass exactly one of `reference_file`,
+`reference_files` or `reference_dataset`, given and resolved like
+`data_file`, `data_files` and `dataset` (`max_files` cuts either dataset).
+Any other analysis refuses them. The result's metadata lists them as
+`reference_files`.
 
 ### Results
 
@@ -639,6 +652,234 @@ On the CeMLeadingLogMix1BB example file at the default selection, apr or cpr
 to about 88% at 50-70M (few events); in `p_front` it rises from about 62% at
 80-82 MeV/c to 97% above 98 MeV/c.
 
+## selection_efficiency_ntuple
+
+A plain selection efficiency from EventNtuple file(s): the fraction of events
+with a track passing `selection`, using the same track variables as
+`trigger_efficiency_ntuple` (`TRACK_VARIABLES`), so a cut means the same thing
+in both:
+
+```python
+run_analysis(analysis="selection_efficiency_ntuple",
+             data_file=".../nts.mu2e.CeMLeadingLogMix1BB.MDC2025au_best_v1_1-001.001430_00000000.root",
+             output_dir=".../sel_eff",
+             parameters={"selection": "100 < p_front < 110",
+                         "denominator": "status == 1 and pdg == 11 and downstream "
+                                        "and p_front > 80 and nactive >= 15 "
+                                        "and chisq / ndof < 5"})
+```
+
+`selection` is required. `denominator` defaults to `""`, which is every event
+in the ntuple, including events with no track. An event passes when **one and
+the same track** passes both cuts, so the passing events are always a subset
+of the denominator events. The denominator counts ntuple entries, not
+generated events: a production ntuple may already have dropped events
+upstream. On the CeMLeadingLogMix1BB example file, the
+`trigger_efficiency_ntuple` default cut passes 7178 of 8212 events (87.4%).
+Of those, 6503 (90.6%) have a track at 100 < p_front < 110 MeV/c. Track
+counts are in `n_tracks_denominator` and `n_tracks_passed`, and `data_files`
+combines several files, with per-file counts in `metadata.per_file`. In a
+simulated file both cuts can also use the MC truth variables (`mc_*`), as
+in `trigger_efficiency_ntuple`; naming one on a file without truth is an
+error saying so.
+
+## momentum_resolution_ntuple
+
+The two parts of the tracker's momentum response, from the MC truth in a
+simulated EventNtuple, for every track passing `selection`:
+
+- **resolution**: reconstructed minus true momentum at the tracker front
+  (TT_Front), i.e. how well the fit measures the momentum it sees;
+- **energy loss**: true momentum at creation minus true momentum at TT_Front,
+  i.e. what the particle lost before reaching the tracker.
+
+Their difference, reconstructed at TT_Front minus true at creation, is the
+combined response `fullsim_sensitivity` folds the DIO spectrum with.
+
+```python
+run_analysis(analysis="momentum_resolution_ntuple",
+             data_file=".../nts.mu2e.CeMLeadingLogMix1BB.MDC2025au_best_v1_1-001.001430_00000000.root",
+             output_dir=".../resolution",
+             parameters={"selection": "status == 1 and pdg == 11 and downstream "
+                                      "and p_front > 80 and mc_start_code == 168"})
+```
+
+The truth is `trigger_efficiency_ntuple`'s MC variables: the true momentum
+at creation (`mc_p_start`, the track's own particle in `trkmcsim`) and at the
+downstream-going TT_Front crossing (`mc_p_front`, from `trksegsmc`, the
+earliest such true step). The selection can use every track and MC variable
+plus `resolution` and `energy_loss`, e.g. `mc_start_code == 168` for true CE
+only. Its default is `trigger_efficiency_ntuple`'s default cut. A file
+without `trksegsmc`/`trkmcsim` (e.g. data) is refused with a message saying
+the analysis needs simulation.
+
+Both distributions have long tails, so besides the mean and rms the metrics
+give the median and `sigma68`, half the width of the central 68% (the sigma
+of a Gaussian, without a fit), and `energy_loss_p90`. The metrics use every
+track; the `*_min`/`*_max`/`*_bin_width` parameters set only the histograms
+(`momentum_resolution.root`, TH1D `resolution` and `energy_loss`) and the
+plots (`figures/resolution.png`, `figures/energy_loss.png`); the histograms
+span `*_min` to `*_max` exactly, in the whole number of bins nearest
+`*_bin_width` (the axis label gives the width used). How many tracks
+fall outside them is in `metadata.outside_histogram_range`. On the
+CeMLeadingLogMix1BB example file, with the default selection, 7192 tracks
+in 7178 events give a resolution sigma68 of 0.22 MeV/c (median -0.005, rms
+1.5) and an energy loss with median 0.73 MeV/c (mean 1.39, 90% below
+2.5 MeV/c).
+
+## calo_cluster_resolution_ntuple
+
+The calorimeter's counterpart of `momentum_resolution_ntuple`: for every
+cluster passing `selection`, its MC truth (`caloclustersmc`, one entry per
+`caloclusters` entry) gives
+
+- **dE** = reconstructed cluster energy minus `etot`, the true energy every
+  particle deposited in the cluster's crystals;
+- **dT** = reconstructed cluster time minus `tprimary`, the earliest true
+  deposit of the cluster's leading particle (the one that deposited most).
+
+```python
+run_analysis(analysis="calo_cluster_resolution_ntuple",
+             data_file=".../nts.mu2e.CeMLeadingLogMix1BB.MDC2025au_best_v1_1-001.001430_00000000.root",
+             output_dir=".../calo_res",
+             parameters={"selection": "mc_rel == 0 and energy > 50"})
+```
+
+The selection is per cluster, over `CLUSTER_VARIABLES` (repeated in the
+parameter's description): the reconstructed `energy`, `time`, `disk`,
+`size`, centroid radius `r` (in the disk's frame), ..., the truth (`mc_etot`,
+`mc_eprimary`, `mc_tprimary`, `mc_nsim`, `mc_purity` = eprimary/etot), and
+`de`, `de_frac`, `dt` themselves. Two things about the truth are easy to get
+wrong:
+
+- The truth's "primary" is the cluster's leading contributor, not the
+  event's generated particle. `mc_rel` is how it is related to that
+  particle (MCRelationship: -1 none, 0 same, 1 daughter, 2 mother,
+  3 sibling), so the default `mc_rel == 0` keeps the clusters the generated
+  particle made itself: the CE in a CE sample. Pileup clusters are -1.
+- `tavg` is not used. Newer EventNtuple versions fill it with `tprimary`;
+  older files carry something else, tens of ns away (on the example file it
+  differs from `tprimary` for two thirds of the clusters).
+
+A cluster without truth (`mc_nsim == 0`) has NaN MC values and never enters
+the distributions. A file without `caloclustersmc` is refused, saying the
+analysis needs simulation. The metrics are the mean, rms, median and
+`sigma68` of dE and dT, and the median and sigma68 of `de_frac` (dE over the
+true energy). The `de_*`/`dt_*` range and bin-width parameters set only
+`calo_cluster_resolution.root` (TH1D `de`, `dt`) and the plots
+(`figures/cluster_de.png`, `figures/cluster_dt.png`).
+
+On the CeMLeadingLogMix1BB example file, the 6491 CE clusters above 50 MeV
+(of 56159 clusters in 8212 events) give dE median -0.47 MeV, sigma68
+1.35 MeV (1.6% of the true energy), and dT median +1.91 ns, sigma68
+0.56 ns: the reconstructed time sits about 2 ns after the earliest true
+deposit.
+
+## variable_comparison_ntuple
+
+Compares one variable between two sets of EventNtuple files: the input
+(`data_file(s)`, "new") and a baseline (`reference_file(s)`, "ref"), e.g.
+the same events before and after a code change, or two configurations of a
+sample.
+
+```python
+run_analysis(analysis="variable_comparison_ntuple",
+             data_file=".../nts.mu2e.CeMLeadingLogMix1BB.MDC2025au_best_v1_1-001.001430_00000000.root",
+             reference_file=".../nts.mu2e.CeMLeadingLogMix1BB.MDC2025au_best_v1_1.001430_00000000.root",
+             output_dir=".../compare",
+             parameters={"variable": "p_front",
+                         "selection": "status == 1 and pdg == 11 and downstream and p_front > 80"})
+```
+
+`level` says what the variable belongs to: `track` (the names of
+`trigger_efficiency_ntuple`, `mc_*` included) or `cluster` (those of
+`calo_cluster_resolution_ntuple`; the truth ones need `caloclustersmc`, the
+rest work on data). `variable` is a name or an expression of them (a
+true/false name such as `has_front` compares as 0/1), and
+`selection` (empty by default: every object) picks the objects. Two
+comparisons come out:
+
+- **Distributions**, always: every selected object's value, overlaid with
+  their ratio (`figures/variable_comparison.png`; a bin only the reference
+  fills shows as ratio 0), scaled per event by
+  default (`normalize`: `events`, `area` or `none`) so a change in how
+  many objects pass shows. The metrics give each sample's count, mean, rms,
+  median and sigma68, the mean shift (with its error as for independent
+  samples) and median shift, and the two-sample KS statistic and p-value.
+- **Matched events**, when the samples share events: each event's first
+  selected object (the ntuple's order) in one sample against the other's.
+  `n_events_gained` / `n_events_lost` count the matched events that have a
+  selected object in only the new / only the reference sample,
+  `n_events_changed` those whose value moved (by more than 1e-6
+  relatively), and `diff_*` summarize new - ref over the events with a value
+  in both (`figures/variable_difference.png`). "First" is the same object
+  in both only when the objects come out in the same order, as they do for
+  a reprocessing of the same events. With `match_events="auto"` events are
+  matched when at least half of the smaller sample's (run, subrun, event)
+  ids are in both, since independent samples can share a few by chance;
+  `yes` insists, `no` skips it. A sample that repeats a (run, subrun,
+  event), e.g. from files combined twice, cannot be paired: `auto` does
+  not match it and `yes` is refused. Unmatched, the matched metrics are NaN
+  (`n_events_matched` is 0).
+
+One sample with nothing selected is still compared, since a reprocessing
+can lose every object, or find the first ones: its statistics, the shifts
+and the KS test are NaN, and the matched events count as gained or lost.
+Only with nothing selected in either sample is it an error.
+
+`range` (`'low, high'`; by default the 0.5-99.5% quantiles of both samples)
+and `n_bins` set the histograms, not the metrics. `variable_comparison.root`
+holds the unscaled TH1Ds `new`, `ref` and, when matched, `diff`; their
+stored mean and RMS are the binned ones.
+
+On the CeMLeadingLogMix1BB file 001430_00000000, the `MDC2025au_best_v1_1-001`
+ntuple against the `MDC2025au_best_v1_1` one matches all 8212 events and finds
+nothing changed, in tracks or clusters: the re-run reproduces the original.
+Against the same CE sample without pileup (`CeMLeadingLogOnSpill.
+MDC2025au_best_v1_5`, not the same events), cluster `energy` shows the
+pileup clusters (below ~50 MeV, nearly all from the mixing) and the CE peak
+near 90 MeV in both. Files from older EventNtuple versions (MDC2020) lack
+branches the track and cluster readers need, and are refused saying which.
+
+## muon_stops
+
+The stop profile of a MuBeam-stage stop file: where the muons stopped (z
+along the DS, radius from its axis), when, and what momentum they had where
+they crossed ST_In, the virtual detector just upstream of the stopping
+target.
+
+```python
+run_analysis(analysis="muon_stops",
+             data_file=".../sim.mmackenz.TargetStops.Run1Bak_local0813111400.001800_00000000.art",
+             output_dir=".../stops")
+```
+
+One mu2e job (`fcl/muon_stops.fcl`) runs two Offline modules on the stop
+filter's collections. `StoppedParticlesDumper` writes each stop's position,
+time and codes, as Offline's `TargetStopsDumper.fcl` and Production's
+`Tests/TGTstops.fcl` do. `StepPointMCDumper` writes the stopped muons'
+virtual-detector steps. `stop_filter` (default `TargetStopFilter`) points
+both at another stream's collections: `PolyStopFilter` for PolyStops,
+`IPAStopFilter` for IPAStops. The radius is from the DS axis, at
+x = -3904 mm (`mu2e.solenoidOffset`). The ST_In momentum is that of every
+downstream-going muon crossing of ST_In in the file. The dumpers write no
+event number, so a crossing is not paired with its stop; in a stop file the
+crossings are the stopped muons', and `n_st_in` is there to compare with
+`n_stops`.
+
+Outputs: the metrics (mean/rms/median of z and radius, mean/median time,
+mean/median/rms of the ST_In momentum, with the stop and generated-event
+counts), `muon_stops_hists.root` (TH1Ds `stop_z`, `stop_r`, `stop_time`,
+`p_st_in` and the TH2D `stop_r_vs_z`) and the same as plots in `figures/`.
+For a stopping *rate*, use `muon_stop_rate` on the same file: it divides out
+the stream's prescale.
+
+On the Run1Bak TargetStops example file, 735 stops from 12500 generated
+events sit on the foils of its extended target, between z = 5000 and
+6750 mm (mean 5415 mm), at a mean radius of 67 mm and a median time of
+238 ns. Every stop has one ST_In crossing, with a median momentum of
+32.8 MeV/c (5-49 MeV/c).
+
 ## approx_ce_sensitivity
 
 A Python conversion of `Mu2eOptAna/scripts/rough_run1a_sensitivity.C`. Signal
@@ -999,7 +1240,7 @@ goes to `mu2e`, art resolves it on `FHICL_FILE_PATH`, `fcl_exists` comes back
 python3 tests/test_tools.py
 ```
 
-171 tests, none of which start a mu2e job or reach SAM or metacat (the
+216 tests, none of which start a mu2e job or reach SAM or metacat (the
 catalog tests use a fake). (The `ana` env has no pytest, so
 these are bare asserts.)
 

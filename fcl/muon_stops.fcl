@@ -1,0 +1,40 @@
+# Stopped muons and their virtual-detector crossings, from a stop file of the
+# MuBeam stage (sim.*.TargetStops.*.art). Offline's TargetStopsDumper.fcl
+# (StoppedParticlesDumper on the stop filter's SimParticles: where and when
+# each one stopped), plus StepPointMCDumper on the same filter's
+# virtual-detector steps (the momentum where the stopped muons crossed each
+# VD, e.g. ST_In). muon_stops.py points both at another filter's collections
+# for a PolyStops or IPAStops file.
+
+#include "Offline/fcl/minimalMessageService.fcl"
+#include "Offline/fcl/standardServices.fcl"
+
+process_name : MuonStops
+
+source : { module_type : RootInput }
+
+services : @local::Services.Core
+services.message : @local::default_message
+services.TFileService.fileName : "nts.owner.muonstops.version.sequencer.root"
+
+physics : {
+  analyzers : {
+    genCountLogger : { module_type : GenEventCountReader }
+
+    stoppedMuonDumper : {
+      module_type           : StoppedParticlesDumper
+      dumpSimParticleLeaves : true
+      inputCollection       : "TargetStopFilter"
+      writeProperTime       : false
+      writeParticleCodes    : true
+    }
+
+    vdDumper : {
+      module_type  : StepPointMCDumper
+      hitsInputTag : "TargetStopFilter:virtualdetector"
+      writeVDHit   : true
+    }
+  }
+  an : [ genCountLogger, stoppedMuonDumper, vdDumper ]
+  end_paths : [ an ]
+}

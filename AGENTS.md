@@ -117,6 +117,11 @@ python3 -m analysis_mcp_server --transport stdio [--work-area DIR | --musing 'Si
   paths. All network and dCache access goes through `catalog.Catalogs`;
   tests swap `catalog.CLIENT` for a fake and never reach SAM or metacat.
   An unstaged tape file is refused, not read: reading it blocks on tape.
+- **Reference inputs.** An `AnalysisSpec` with `takes_reference` requires
+  a baseline (`reference_file(s)` / `reference_dataset` in `run_analysis`,
+  resolved like `data_file(s)`), which the runner gets as
+  `context.reference_paths`; every other analysis refuses one. Add another
+  comparison that way rather than with a new tool argument.
 - **Default inputs.** An `AnalysisSpec` with `default_inputs` runs without
   `data_file(s)`; the trigger rate and timing default to
   `mu2e-trig-config/ci/data_files.txt`, found with `Mu2eEnv.find_code_file`

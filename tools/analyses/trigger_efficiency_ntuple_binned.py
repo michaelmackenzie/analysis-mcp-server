@@ -195,15 +195,20 @@ def write_root(path: Path, counts: dict, edges: np.ndarray, variable: str) -> No
 
 def _th1(hist, edges, title, variable):
     """A TH1D with sumw2 = counts (unweighted), titled for the variable.
-    Under/overflow are left empty: those events are in the metrics."""
+    Under/overflow are left empty: those events are in the metrics. The
+    moments are from the bin centres, as ROOT's would be for a rebuilt
+    histogram, so its GetMean/GetRMS are the binned ones, not zero."""
     import uproot
 
     counts = np.asarray(hist, dtype=np.float64)
+    edges = np.asarray(edges, dtype=np.float64)
+    centers = (edges[:-1] + edges[1:]) / 2
     data = np.concatenate([[0.0], counts, [0.0]])
     return uproot.writing.identify.to_TH1x(
         fName=None, fTitle=f"{title};{variable};events",
         data=data, fEntries=float(counts.sum()), fTsumw=float(counts.sum()),
-        fTsumw2=float(counts.sum()), fTsumwx=0.0, fTsumwx2=0.0,
+        fTsumw2=float(counts.sum()), fTsumwx=float((counts * centers).sum()),
+        fTsumwx2=float((counts * centers ** 2).sum()),
         fSumw2=data.copy(),
         fXaxis=uproot.writing.identify.to_TAxis(
             fName="xaxis", fTitle=variable, fNbins=edges.size - 1,

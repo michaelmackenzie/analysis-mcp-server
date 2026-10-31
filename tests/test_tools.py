@@ -38,6 +38,11 @@ from tools.analyses import trigger as trig
 from tools.analyses.trigger_efficiency import efficiency_metrics
 from tools.analyses import trigger_efficiency_ntuple as ntrig
 from tools.analyses import trigger_efficiency_ntuple_binned as bntrig
+from tools.analyses import selection_efficiency_ntuple as nsel
+from tools.analyses import momentum_resolution_ntuple as nres
+from tools.analyses import muon_stops as mstops
+from tools.analyses import calo_cluster_resolution_ntuple as ncalo
+from tools.analyses import variable_comparison_ntuple as vcmp
 from tools.analyses import occupancy as occ
 from tools.analyses import occupancy_digi as occ_digi
 from tools.analyses import occupancy_ntuple as occ_ntuple
@@ -207,12 +212,25 @@ Art has completed and will exit with status 0.
 
 # One stdout sample per art_files analysis, so the registry test can exercise
 # each parser. Add an entry when adding such an analysis.
+# The end of a muon_stops job (fcl/muon_stops.fcl on a TargetStops file):
+# GenEventCountReader's totals. The stops themselves are in its ROOT file.
+SAMPLE_MUON_STOPS_STDOUT = """\
+%MSG-i GenEventCount:  GenEventCountReader:genCountLogger@EndSubRun  27-Oct-2026 09:06:50 CDT run: 1800 subRun: 0
+GenEventCount: 12500 events in run: 1800 subRun: 0
+%MSG
+%MSG-i GenEventCountSummary:  GenEventCountReader:genCountLogger@EndJob  27-Oct-2026 09:06:50 CDT ModuleEndJob
+GenEventCount total: 12500 events in 1 SubRuns
+%MSG
+TrigReport Events total = 735 passed = 735 failed = 0
+"""
+
 SAMPLE_STDOUT = {"edep": SAMPLE_EDEP_STDOUT,
                  "count": SAMPLE_COUNTS_STDOUT,
                  "muon_stop_rate": SAMPLE_STOP_COUNTS_STDOUT,
                  "trigger_efficiency": SAMPLE_TRIGGER_STDOUT,
                  "trigger_rate": SAMPLE_TRIGGER_STDOUT,
                  "trigger_timing": SAMPLE_TRIGGER_STDOUT,
+                 "muon_stops": SAMPLE_MUON_STOPS_STDOUT,
                  "occupancy_digi": SAMPLE_OCCUPANCY_DIGI_STDOUT,
                  "occupancy_reco": SAMPLE_OCCUPANCY_RECO_STDOUT}
 
@@ -1671,6 +1689,23 @@ def test_ntuple_mc_variables_on_data_say_there_is_no_truth():
         raise AssertionError("mc_npot on a file without MC should be refused")
 
 
+def test_th1_stores_the_binned_mean_and_rms(tmp_dir):
+    import uproot
+    edges = np.array([0.0, 1.0, 2.0, 4.0])
+    counts = np.array([1.0, 2.0, 1.0])
+    path = Path(tmp_dir) / "h.root"
+    with uproot.recreate(path) as f:
+        f["h"] = bntrig._th1(counts, edges, "h", "x")
+    with uproot.open(path) as f:
+        h = f["h"]
+        sumw, sumwx, sumwx2 = (h.member(m) for m in ("fTsumw", "fTsumwx", "fTsumwx2"))
+    centers = np.array([0.5, 1.5, 3.0])
+    mean = (counts * centers).sum() / counts.sum()
+    assert np.isclose(sumwx / sumw, mean)
+    assert np.isclose(sumwx2 / sumw - mean ** 2,
+                      (counts * (centers - mean) ** 2).sum() / counts.sum())
+
+
 def test_binned_ntuple_edges_are_uniform_or_explicit():
     assert bntrig.bin_edges(3, 80, 110, "").tolist() == [80, 90, 100, 110]
     assert bntrig.bin_edges(3, 80, 110, "0, 1 5").tolist() == [0, 1, 5]
@@ -1725,6 +1760,178 @@ def test_ntuple_trigger_efficiency_on_a_real_file(tmp_dir):
     assert missing.status == "error" and "It has: " in missing.message
 
 
+def test_selection_efficiency_counts_every_ntuple_event_by_default():
+    v = ntrig.track_variables(_ntuple_arrays())
+    # a third event with no track at all still counts in the denominator
+    counts = nsel.efficiency_counts(v, 3, ntrig.DEFAULT_SELECTION)
+    assert counts["n_denominator"] == 3 and counts["n_tracks_denominator"] == 3
+    assert counts["n_passed"] == 1 and counts["n_tracks_passed"] == 1
+    metrics = nsel.efficiency_metrics(counts)
+    assert abs(metrics["efficiency"] - 1 / 3) < 1e-12 and metrics["efficiency_err"] > 0
+    assert tuple(metrics) == nsel.METRICS
+
+
+def test_selection_efficiency_needs_one_track_to_pass_both_cuts():
+    v = ntrig.track_variables(_ntuple_arrays())
+    counts = nsel.efficiency_counts(v, 3, "pdg == 11", denominator="nactive >= 25")
+    assert counts["n_denominator"] == 2 and counts["n_passed"] == 1
+    # event 0's short track passes the denominator and its good track the
+    # selection: not the same track, so the event does not pass
+    split = nsel.efficiency_counts(v, 3, "p_front > 100", denominator="nactive < 10")
+    assert split["n_denominator"] == 1 and split["n_passed"] == 0
+
+
+def test_selection_efficiency_refuses_a_bad_cut_and_needs_a_selection(tmp_dir):
+    v = ntrig.track_variables(_ntuple_arrays())
+    try:
+        nsel.efficiency_counts(v, 2, "p_front > 100", denominator="no_such_var > 1")
+    except SelectionError as exc:
+        assert "no_such_var" in str(exc)
+    else:
+        raise AssertionError("an unknown variable should have been refused")
+    result = run_analysis(analysis="selection_efficiency_ntuple",
+                          data_file="/a.root", output_dir=tmp_dir)
+    # not just "selection" in the message: the analysis name contains it too
+    assert result.status == "error", result.message
+    assert "missing required parameter(s)" in result.message, result.message
+    assert result.message.endswith(": selection"), result.message
+
+
+def test_selection_efficiency_checks_each_cut_on_its_own():
+    # Combined with the denominator, a bare quantity would coerce to a bool;
+    # on its own it is refused, so it is refused here too.
+    v = ntrig.track_variables(_ntuple_arrays())
+    for selection, denominator in (("p_front", "nactive >= 25"),
+                                   ("pdg == 11", "p_front")):
+        try:
+            nsel.efficiency_counts(v, 3, selection, denominator=denominator)
+        except SelectionError:
+            pass
+        else:
+            raise AssertionError(f"{selection!r} / {denominator!r} was accepted")
+
+
+def test_run_analysis_keeps_its_positional_arguments(tmp_dir):
+    # parameters is the seventh positional argument, as before reference
+    # inputs; they are keyword-only.
+    result = run_analysis("selection_efficiency_ntuple", tmp_dir, "/a.root",
+                          None, None, None, {})
+    assert result.status == "error", result.message
+    assert "missing required parameter(s)" in result.message, result.message
+    import inspect
+    kinds = {name: p.kind for name, p in inspect.signature(run_analysis).parameters.items()}
+    assert all(kinds[name] == inspect.Parameter.KEYWORD_ONLY for name in
+               ("reference_file", "reference_files", "reference_dataset"))
+
+
+def test_selection_efficiency_on_a_real_file(tmp_dir):
+    if not NTUPLE_FILE.exists():
+        return
+    result = run_analysis(analysis="selection_efficiency_ntuple",
+                          data_file=str(NTUPLE_FILE), output_dir=tmp_dir,
+                          parameters={"selection": ntrig.DEFAULT_SELECTION})
+    assert result.status == "success", result.message
+    meta = result.metadata
+    # the same events trigger_efficiency_ntuple selects (README: 7178 of 8212)
+    assert meta["n_events"] == 8212 and meta["n_denominator"] == 8212
+    assert meta["n_passed"] == 7178
+    narrower = run_analysis(analysis="selection_efficiency_ntuple",
+                            data_file=str(NTUPLE_FILE), output_dir=tmp_dir,
+                            parameters={"selection": "100 < p_front < 110",
+                                        "denominator": ntrig.DEFAULT_SELECTION})
+    assert narrower.status == "success", narrower.message
+    assert narrower.metadata["n_denominator"] == 7178
+    assert 0 < narrower.metadata["n_passed"] < 7178
+
+
+def test_resolution_and_energy_loss_come_from_the_shared_mc_variables():
+    # the e- track: reconstructed at 104, true 105 at TT_Front, created at 104.9
+    v = ntrig.track_variables(_ntuple_mc_arrays())
+    r = nres.response_variables(v)
+    assert abs(r["resolution"][0] - (104.0 - 105.0)) < 1e-3
+    assert abs(r["energy_loss"][0] - (104.9 - 105.0)) < 1e-4
+    assert np.isnan(r["resolution"][1:]).all() and np.isnan(r["energy_loss"][1:]).all()
+    assert set(r) == set(nres.RESPONSE_VARIABLES)
+    variables = {**v, **r}
+    for name in nres.RESPONSE_VARIABLES:           # every advertised one is usable
+        nres.select_tracks(variables, f"{name} == {name}")
+    assert nres.select_tracks(variables, "mc_start_code == 168 and resolution < 0"
+                              ).tolist() == [True, False, False]
+
+
+def test_resolution_sigma68_is_the_gaussian_sigma_and_ignores_the_tail():
+    rng = np.random.default_rng(1)
+    core = rng.normal(0.0, 0.2, 100_000)
+    s = nres.summary(core, "x")
+    assert abs(s["x_sigma68"] - 0.2) < 0.004 and abs(s["x_median"]) < 0.004
+    assert abs(s["x_rms"] - 0.2) < 0.004
+    # a 2% tail far out moves the rms a lot and sigma68 hardly at all
+    tailed = np.concatenate([core, np.full(2_000, -20.0), [np.nan]])
+    t = nres.summary(tailed, "x")
+    assert t["x_rms"] > 2.0 and abs(t["x_sigma68"] - 0.2) < 0.01
+
+
+def test_resolution_writes_histograms_and_refuses_bad_binning(tmp_dir):
+    import uproot
+    params = {name: p.default for name, p in
+              ((p.name, p) for p in nres.SPEC.parameters)}
+    nres._check_binning(params)
+    for bad in ({"resolution_max": -5.0}, {"energy_loss_bin_width": 1e-6},
+                {"resolution_bin_width": 100.0}):
+        try:
+            nres._check_binning({**params, **bad})
+        except nres.ResolutionError as exc:
+            assert next(iter(bad)) in str(exc) or "resolution_max" in str(exc)
+        else:
+            raise AssertionError(f"{bad} should have been refused")
+    res = np.array([-0.1, 0.0, 0.02, 9.0])                    # 9.0 off the axis
+    eloss = np.array([0.5, 0.7, 1.5, 2.0])
+    metrics = nres.resolution_metrics(
+        {"n_events": 3, "n_events_selected": 3, "n_tracks_selected": 4}, res, eloss)
+    assert tuple(metrics) == nres.METRICS and metrics["n_tracks_with_truth"] == 4
+    hists = {"resolution": nres.histogram(res, -5.0, 3.0, 0.05, "resolution"),
+             "energy_loss": nres.histogram(eloss, 0.0, 10.0, 0.1, "energy_loss")}
+    assert hists["resolution"].values.size == 160 and hists["resolution"].values.sum() == 3
+    # A width that does not divide the range keeps the requested endpoints.
+    uneven = nres.histogram(res, -5.0, 3.0, 3.0, "resolution")
+    assert uneven.nbins == 3 and uneven.edges()[-1] == 3.0
+    files = nres._write_outputs(Path(tmp_dir), hists, metrics, "")
+    assert [Path(f).name for f in files] == ["momentum_resolution.root",
+                                             "resolution.png", "energy_loss.png"]
+    with uproot.open(files[0]) as f:
+        assert f["energy_loss"].values().tolist() == hists["energy_loss"].values.tolist()
+
+
+def test_resolution_says_a_file_without_truth_needs_simulation(tmp_dir):
+    import uproot
+    path = Path(tmp_dir) / "data.root"
+    with uproot.recreate(path) as f:
+        f.mkdir("EventNtuple").mktree("ntuple", {"event": "int32"}).extend(
+            {"event": np.arange(3, dtype=np.int32)})
+    result = run_analysis(analysis="momentum_resolution_ntuple",
+                          data_file=str(path), output_dir=tmp_dir)
+    assert result.status == "error" and "MC truth" in result.message, result.message
+
+
+def test_resolution_on_a_real_file(tmp_dir):
+    if not NTUPLE_FILE.exists():
+        return
+    result = run_analysis(analysis="momentum_resolution_ntuple",
+                          data_file=str(NTUPLE_FILE), output_dir=tmp_dir)
+    assert result.status == "success", result.message
+    meta = result.metadata
+    # the default selection is trigger_efficiency_ntuple's: the same 7178 events
+    assert meta["n_events_selected"] == 7178
+    assert meta["n_tracks_with_truth"] <= meta["n_tracks_selected"]
+    assert 0.1 < meta["resolution_sigma68"] < 0.5 and abs(meta["resolution_median"]) < 0.1
+    assert 0.0 < meta["energy_loss_median"] < meta["energy_loss_mean"]  # a long tail
+    assert all(Path(f).exists() for f in result.files) and len(result.files) == 3
+    ce = run_analysis(analysis="momentum_resolution_ntuple",
+                      data_file=str(NTUPLE_FILE), output_dir=tmp_dir,
+                      parameters={"selection": ntrig.DEFAULT_SELECTION
+                                  + " and mc_start_code == 168"})
+    assert ce.status == "success", ce.message
+    assert ce.metadata["n_tracks_with_truth"] <= meta["n_tracks_with_truth"]
 def test_binned_ntuple_trigger_efficiency_on_a_real_file(tmp_dir):
     if not NTUPLE_FILE.exists():
         return
@@ -1745,6 +1952,433 @@ def test_binned_ntuple_trigger_efficiency_on_a_real_file(tmp_dir):
         assert (meta["n_in_range"] + meta["n_underflow"] + meta["n_overflow"]
                 + meta["n_undefined"]) == meta["n_selected"]
         assert len(result.files) == 3 and all(Path(f).exists() for f in result.files)
+
+
+def _calo_arrays():
+    """Two events of caloclusters/caloclustersmc. Event 0: a CE cluster
+    (100 MeV reconstructed, 101 true, 98 of it from the CE, which first
+    deposited at 700 ns; reconstructed at 702) and a pileup one. Event 1: a
+    cluster with no truth at all."""
+    import awkward as ak
+    leaves = {
+        "caloclusters.energyDep_": [[100.0, 20.0], [15.0]],
+        "caloclusters.energyDepErr_": [[2.0, 1.0], [1.0]],
+        "caloclusters.time_": [[702.0, 900.0], [500.0]],
+        "caloclusters.timeErr_": [[0.3, 0.5], [0.5]],
+        "caloclusters.diskID_": [[0, 1], [0]],
+        "caloclusters.size_": [[5, 2], [1]],
+        "caloclusters.isSplit_": [[0, 0], [0]],
+        "caloclusters.cog_.fCoordinates.fX": [[300.0, 0.0], [400.0]],
+        "caloclusters.cog_.fCoordinates.fY": [[400.0, 500.0], [0.0]],
+        "caloclustersmc.nsim": [[2, 1], [0]],
+        "caloclustersmc.etot": [[101.0, 21.0], [0.0]],
+        "caloclustersmc.eprimary": [[98.0, 21.0], [0.0]],
+        "caloclustersmc.tprimary": [[700.0, 899.0], [0.0]],
+        "caloclustersmc.prel._rel": [[0, -1], [-1]],
+        "event": [7, 8], "run": [1, 1], "subrun": [0, 0],
+    }
+    return {name: ak.Array(values) for name, values in leaves.items()}
+
+
+def test_calo_cluster_variables_compare_with_the_truth_and_mark_what_is_missing():
+    v = ncalo.cluster_variables(_calo_arrays())
+    assert v["_event"].tolist() == [0, 0, 1] and v["nclusters"].tolist() == [2, 2, 1]
+    assert v["de"][0] == -1.0 and v["dt"][0] == 2.0 and v["r"][0] == 500.0
+    assert abs(v["de_frac"][0] + 1 / 101) < 1e-12 and abs(v["mc_purity"][0] - 98 / 101) < 1e-12
+    assert v["de"][1] == -1.0 and v["mc_rel"][1] == -1        # pileup: truth, no relation
+    for name in ("mc_etot", "mc_tprimary", "mc_rel", "de", "dt", "de_frac"):
+        assert np.isnan(v[name][2]), name                     # nsim 0: no truth
+    assert set(v) - {"_event"} == set(ncalo.CLUSTER_VARIABLES)
+    for name in ncalo.CLUSTER_VARIABLES:           # every advertised one is usable
+        ncalo.select_clusters(v, f"{name} == {name}")
+    assert ncalo.select_clusters(v, ncalo.DEFAULT_SELECTION).tolist() == [True, False, False]
+
+
+def test_calo_resolution_writes_its_outputs_and_refuses_bad_binning(tmp_dir):
+    import uproot
+    params = {p.name: p.default for p in ncalo.SPEC.parameters}
+    ncalo._check_binning(params)
+    for bad in ({"dt_max": -6.0}, {"de_bin_width": 1e-6}, {"de_bin_width": 1000.0}):
+        try:
+            ncalo._check_binning({**params, **bad})
+        except ncalo.CaloResolutionError as exc:
+            assert next(iter(bad)).split("_")[0] in str(exc)
+        else:
+            raise AssertionError(f"{bad} should have been refused")
+    de = np.array([-1.0, 0.0, 0.5, -30.0])                    # -30 off the axis
+    dt = np.array([1.8, 2.0, 2.2, 1.9])
+    metrics = ncalo.resolution_metrics(
+        {"n_events": 2, "n_clusters": 5, "n_clusters_selected": 4}, de, de / 100.0, dt)
+    assert tuple(metrics) == ncalo.METRICS and metrics["n_clusters_with_truth"] == 4
+    assert metrics["dt_median"] == 1.95 and abs(metrics["de_frac_median"] + 0.005) < 1e-12
+    hists = {name: ncalo.histogram(values, params[f"{name}_min"], params[f"{name}_max"],
+                                   params[f"{name}_bin_width"], name)
+             for name, values in (("de", de), ("dt", dt))}
+    assert hists["de"].values.sum() == 3 and hists["dt"].values.size == 150
+    files = ncalo._write_outputs(Path(tmp_dir), hists, metrics, ncalo.DEFAULT_SELECTION)
+    assert [Path(f).name for f in files] == ["calo_cluster_resolution.root",
+                                             "cluster_de.png", "cluster_dt.png"]
+    with uproot.open(files[0]) as f:
+        assert f["dt"].values().tolist() == hists["dt"].values.tolist()
+
+
+def test_calo_resolution_says_a_file_without_truth_needs_simulation(tmp_dir):
+    import uproot
+    path = Path(tmp_dir) / "data.root"
+    with uproot.recreate(path) as f:
+        f.mkdir("EventNtuple").mktree("ntuple", {"event": "int32"}).extend(
+            {"event": np.arange(3, dtype=np.int32)})
+    result = run_analysis(analysis="calo_cluster_resolution_ntuple",
+                          data_file=str(path), output_dir=tmp_dir)
+    assert result.status == "error" and "MC truth" in result.message, result.message
+
+
+def test_calo_resolution_on_a_real_file(tmp_dir):
+    if not NTUPLE_FILE.exists():
+        return
+    result = run_analysis(analysis="calo_cluster_resolution_ntuple",
+                          data_file=str(NTUPLE_FILE), output_dir=tmp_dir,
+                          parameters={"selection": "mc_rel == 0 and energy > 50"})
+    assert result.status == "success", result.message
+    meta = result.metadata
+    assert meta["n_events"] == 8212 and meta["n_clusters"] == 56159
+    assert meta["n_clusters_selected"] == meta["n_clusters_with_truth"] == 6491
+    assert 0.5 < meta["de_sigma68"] < 3.0 and abs(meta["de_median"]) < 1.0
+    assert 0.2 < meta["dt_sigma68"] < 1.5 and 1.0 < meta["dt_median"] < 3.0
+    assert len(result.files) == 3 and all(Path(f).exists() for f in result.files)
+
+
+def test_calo_clusters_read_without_truth_refuse_only_the_mc_names():
+    arrays = {k: v for k, v in _calo_arrays().items() if not k.startswith("caloclustersmc")}
+    v = ncalo.cluster_variables(arrays, with_truth=False)
+    assert not set(ncalo.TRUTH_VARIABLES) & set(v) and v["energy"].tolist() == [100, 20, 15]
+    ncalo.check_truth_names(v, "energy > 10", "time")
+    try:
+        ncalo.check_truth_names(v, "energy > 10", "dt")
+    except ntrig.NtupleError as exc:
+        assert "dt" in str(exc) and "caloclustersmc" in str(exc)
+    else:
+        raise AssertionError("dt on a file without truth should have been refused")
+
+
+# --- variable_comparison_ntuple ----------------------------------------------------
+
+def _comparison_sample(events, objects):
+    """A Sample from event numbers (run 1, subrun 0) and (event index, value)
+    objects, every object selected."""
+    keys = vcmp.event_keys(np.ones(len(events)), np.zeros(len(events)), events)
+    variables = {"_event": np.array([e for e, _ in objects], dtype=np.int64),
+                 "x": np.array([x for _, x in objects], dtype=np.float64)}
+    return vcmp.sample_from_objects(variables, keys, "", "x")
+
+
+def test_comparison_takes_each_events_first_selected_object():
+    variables = {"_event": np.array([0, 0, 2]), "x": np.array([5.0, 6.0, 7.0]),
+                 "q": np.array([0.0, 1.0, 1.0])}
+    sample = vcmp.sample_from_objects(variables, vcmp.event_keys([1] * 3, [0] * 3, [1, 2, 3]),
+                                      "q > 0", "x * 2")
+    assert sample.values.tolist() == [12.0, 14.0]
+    assert sample.selected.tolist() == [True, False, True]
+    assert sample.first[0] == 12.0 and np.isnan(sample.first[1])
+
+
+def test_comparison_compares_a_true_false_variable_as_0_1():
+    variables = {"_event": np.array([0, 1, 2]), "has_front": np.array([True, False, True])}
+    keys = vcmp.event_keys([1] * 3, [0] * 3, [1, 2, 3])
+    sample = vcmp.sample_from_objects(variables, keys, "", "has_front")
+    assert sample.values.tolist() == [1.0, 0.0, 1.0]
+    # A cut is still not a quantity.
+    try:
+        vcmp.sample_from_objects(variables, keys, "", "has_front and has_front")
+    except vcmp.SelectionError:
+        pass
+    else:
+        raise AssertionError("a condition was accepted as a quantity")
+
+
+def test_comparison_ratio_shows_bins_only_the_reference_has():
+    shown, ratio, error = vcmp.ratio_points(np.array([4.0, 0.0, 3.0]),
+                                            np.array([4.0, 5.0, 0.0]), 1.0, 1.0)
+    assert shown.tolist() == [True, True, False]
+    assert ratio[:2].tolist() == [1.0, 0.0]
+    assert np.isclose(error[0], np.sqrt(1 / 4 + 1 / 4)) and error[1] == 0.0
+
+
+def test_comparison_matches_events_and_counts_what_changed():
+    # Events 1-5 in both. New: 1 same, 2 shifted, 3 gained, 5 gone; 6 only new.
+    new = _comparison_sample([1, 2, 3, 4, 6], [(0, 10.0), (1, 21.0), (2, 30.0),
+                                               (3, 40.0), (4, 60.0)])
+    ref = _comparison_sample([1, 2, 3, 4, 5], [(0, 10.0), (1, 20.0), (3, 40.0),
+                                               (4, 50.0)])
+    m = vcmp.match(new, ref, "auto")
+    assert m["matched"] and m["n_common_events"] == 4
+    assert m["n_only_new"] == 1 and m["n_only_ref"] == 1
+    metrics, diff = vcmp.matched_metrics(new, ref, m["i_new"], m["i_ref"])
+    assert metrics["n_events_matched"] == 4 and metrics["n_events_both_selected"] == 3
+    assert metrics["n_events_gained"] == 1 and metrics["n_events_lost"] == 0
+    assert metrics["n_events_changed"] == 1 and sorted(diff.tolist()) == [0.0, 0.0, 1.0]
+    dist = vcmp.distribution_metrics(new, ref)
+    assert dist["n_selected_new"] == 5 and dist["mean_shift"] == 32.2 - 30.0
+
+
+def test_comparison_matches_only_samples_that_share_most_events():
+    new = _comparison_sample([1, 2, 3, 4], [(i, 1.0) for i in range(4)])
+    ref = _comparison_sample([4, 5, 6, 7], [(i, 1.0) for i in range(4)])
+    assert not vcmp.match(new, ref, "auto")["matched"]       # 1 of 4 by chance
+    assert not vcmp.match(new, new, "no")["matched"]
+    assert vcmp.match(new, ref, "yes")["matched"]
+    other = _comparison_sample([9], [(0, 1.0)])
+    try:
+        vcmp.match(new, other, "yes")
+    except vcmp.ComparisonError as exc:
+        assert "not the same events" in str(exc)
+    else:
+        raise AssertionError("'yes' with no shared event should have been refused")
+
+
+def test_comparison_does_not_match_repeated_event_ids():
+    # Event 2 twice in the new sample: intersect1d would pair only one of them.
+    new = _comparison_sample([1, 2, 2, 3], [(i, 1.0) for i in range(4)])
+    ref = _comparison_sample([1, 2, 3], [(i, 1.0) for i in range(3)])
+    m = vcmp.match(new, ref, "auto")
+    assert not m["matched"] and m["n_duplicate_ids_new"] == 1
+    assert m["i_new"].size == 0
+    try:
+        vcmp.match(new, ref, "yes")
+    except vcmp.ComparisonError as exc:
+        assert "match_events='no'" in str(exc)
+    else:
+        raise AssertionError("'yes' with repeated event ids should have been refused")
+
+
+def test_comparison_ranges_and_bins():
+    assert vcmp.parse_range("") is None and vcmp.parse_range("80, 110") == (80.0, 110.0)
+    for bad in ("80", "110, 80", "a, b"):
+        try:
+            vcmp.parse_range(bad)
+        except vcmp.ComparisonError:
+            pass
+        else:
+            raise AssertionError(f"range {bad!r} should have been refused")
+    assert vcmp.auto_range(np.full(10, 3.0)) == (2.5, 3.5)
+    assert vcmp.difference_range(np.zeros(5)) == (-1.0, 1.0)
+    assert vcmp.difference_range(np.array([0.0, 0.0, -0.2, 0.1])) [1] < 0.21
+
+
+def _comparison_file(path, events, values):
+    """An EventNtuple/ntuple with run/subrun/event and one value per event."""
+    import uproot
+    with uproot.recreate(path) as f:
+        f.mkdir("EventNtuple").mktree("ntuple", {"run": "int32", "subrun": "int32",
+                                                 "event": "int32", "x": "float64"}).extend(
+            {"run": np.ones(len(events), np.int32), "subrun": np.zeros(len(events), np.int32),
+             "event": np.asarray(events, np.int32), "x": np.asarray(values, np.float64)})
+
+
+def _read_x(path):
+    """A Level reader for _comparison_file: one object per event."""
+    import uproot
+    x = uproot.open(path)["EventNtuple/ntuple"]["x"].array(library="np")
+    return {"_event": np.arange(x.size), "x": x}, x.size
+
+
+def test_comparison_runs_end_to_end_and_writes_its_outputs(tmp_dir):
+    new, ref = Path(tmp_dir) / "new.root", Path(tmp_dir) / "ref.root"
+    _comparison_file(new, range(100), np.arange(100) * 0.1 + 0.05)
+    _comparison_file(ref, range(100), np.arange(100) * 0.1)
+    saved = vcmp.LEVELS["track"]
+    vcmp.LEVELS["track"] = vcmp.Level("track", {"x": "x"}, _read_x, lambda *a: None)
+    try:
+        result = run_analysis(analysis="variable_comparison_ntuple", data_file=str(new),
+                              reference_file=str(ref), output_dir=tmp_dir,
+                              parameters={"variable": "x", "n_bins": 20, "range": "0, 10"})
+        assert result.status == "success", result.message
+        meta = result.metadata
+        assert meta["n_events_matched"] == 100 and meta["n_events_changed"] == 100
+        assert abs(meta["diff_median"] - 0.05) < 1e-9 and meta["reference_files"] == [str(ref)]
+        assert "against 1 reference file(s)" in result.message
+        names = [Path(f).name for f in result.files]
+        assert names == ["variable_comparison.root", "variable_comparison.png",
+                         "variable_difference.png"], names
+        import uproot
+        with uproot.open(result.files[0]) as f:
+            assert f["new"].values().sum() == 100 and f["diff"].values().size == 21
+        result = run_analysis(analysis="variable_comparison_ntuple", data_file=str(new),
+                              reference_file=str(ref), output_dir=tmp_dir,
+                              parameters={"variable": "x", "match_events": "no"})
+        assert result.status == "success" and result.metadata["n_events_matched"] == 0
+        assert np.isnan(result.metadata["diff_median"]) and len(result.files) == 2
+        import uproot
+        with uproot.open(result.files[0]) as f:
+            h = f["new"]
+            mean = h.member("fTsumwx") / h.member("fTsumw")
+            assert abs(mean - result.metadata["mean_new"]) < 0.1, mean
+        # The reference loses every object (new 9.95 only passes): still compared.
+        result = run_analysis(analysis="variable_comparison_ntuple", data_file=str(new),
+                              reference_file=str(ref), output_dir=tmp_dir,
+                              parameters={"variable": "x", "selection": "x > 9.92",
+                                          "normalize": "area"})
+        assert result.status == "success", result.message
+        meta = result.metadata
+        assert meta["n_selected_new"] == 1 and meta["n_selected_ref"] == 0
+        assert np.isnan(meta["mean_ref"]) and np.isnan(meta["ks_pvalue"])
+        assert meta["n_events_gained"] == 1 and meta["n_events_lost"] == 0
+        result = run_analysis(analysis="variable_comparison_ntuple", data_file=str(new),
+                              reference_file=str(ref), output_dir=tmp_dir,
+                              parameters={"variable": "x", "selection": "x > 1e9"})
+        assert result.status == "error" and "either sample" in result.message, result.message
+    finally:
+        vcmp.LEVELS["track"] = saved
+
+
+def test_reference_inputs_go_only_to_an_analysis_that_compares(tmp_dir):
+    result = run_analysis(analysis="variable_comparison_ntuple", data_file="/a.root",
+                          output_dir=tmp_dir, parameters={"variable": "p_front"})
+    assert result.status == "error" and "reference_file" in result.message
+    result = run_analysis(analysis="variable_comparison_ntuple", data_file="/a.root",
+                          reference_file="/b.root", reference_files=["/c.root"],
+                          output_dir=tmp_dir, parameters={"variable": "p_front"})
+    assert result.status == "error" and "exactly one" in result.message
+    result = run_analysis(analysis="calo_cluster_resolution_ntuple", data_file="/a.root",
+                          reference_file="/b.root", output_dir=tmp_dir)
+    assert result.status == "error" and "takes_reference" in result.message
+    catalogue = list_analyses().metadata["analyses"]
+    assert catalogue["variable_comparison_ntuple"]["takes_reference"] is True
+    assert "takes_reference" not in catalogue["calo_cluster_resolution_ntuple"]
+
+
+def test_comparison_of_a_real_file_with_itself_finds_no_change(tmp_dir):
+    if not NTUPLE_FILE.exists():
+        return
+    for level, variable in (("track", "p_front"), ("cluster", "energy")):
+        result = run_analysis(analysis="variable_comparison_ntuple",
+                              data_file=str(NTUPLE_FILE), reference_file=str(NTUPLE_FILE),
+                              output_dir=tmp_dir,
+                              parameters={"level": level, "variable": variable})
+        assert result.status == "success", result.message
+        meta = result.metadata
+        assert meta["n_events_matched"] == 8212 and meta["n_events_changed"] == 0
+        assert meta["n_events_gained"] == meta["n_events_lost"] == 0
+        assert meta["mean_shift"] == 0 and meta["ks_pvalue"] == 1.0
+
+
+# --- muon_stops ----------------------------------------------------------------
+
+def _stop_records(stops):
+    """StoppedParticlesDumper rows, as the job's leaf-list branch reads:
+    (x, y, z, time) per stop, all mu-."""
+    dtype = np.dtype([("x", "f4"), ("y", "f4"), ("z", "f4"), ("time", "f4"),
+                      ("tauNormalized", "f4"), ("pdg", "i4"), ("origin", "i4"),
+                      ("term", "i4")])
+    return np.array([(x, y, z, t, -1.0, 13, 56, 32) for x, y, z, t in stops], dtype=dtype)
+
+
+def _vd_records(steps):
+    """StepPointMCDumper (VDHit) rows: (VD id, pdg, pz, |p|) per step."""
+    dtype = np.dtype([(n, "f4") for n in ("x", "y", "z", "time", "px", "py", "pz",
+                                          "pmag", "ek", "charge")]
+                     + [("pdgId", "i4"), ("particleId", "u4"), ("volumeCopy", "u4")])
+    return np.array([(0, 0, 0, 0, 0, 0, pz, p, 0, -1, pdg, 1, vd)
+                     for vd, pdg, pz, p in steps], dtype=dtype)
+
+
+def test_muon_stops_fcl_points_both_dumpers_at_the_stop_filter():
+    text = mstops.job_fcl_text("PolyStopFilter")
+    assert text.startswith(mstops.FCL.read_text())          # the shipped fcl, then
+    assert text.rstrip().endswith(
+        'physics.analyzers.vdDumper.hitsInputTag : "PolyStopFilter:virtualdetector"')
+    assert 'stoppedMuonDumper.inputCollection : "PolyStopFilter"' in text
+    for bad in ("", "Target Stop", 'X"; physics.an: [] #'):
+        try:
+            mstops.job_fcl_text(bad)
+        except mstops.MuonStopsError:
+            pass
+        else:
+            raise AssertionError(f"{bad!r} should have been refused")
+
+
+def test_muon_stops_reads_the_generated_count_from_stdout():
+    assert mstops.parse_gen_count(SAMPLE_MUON_STOPS_STDOUT) == 12500
+    assert mstops.parse_gen_count("TrigReport Events total = 3") is None
+
+
+def test_muon_stops_profile_measures_radius_from_the_ds_axis():
+    # two stops 50 mm off the DS axis (x = -3904), one on it
+    stops = mstops.stop_variables(_stop_records([
+        (-3904.0 + 30.0, 40.0, 5000.0, 200.0), (-3904.0 - 50.0, 0.0, 5100.0, 300.0),
+        (-3904.0, 0.0, 5300.0, 700.0)]))
+    assert np.allclose(stops["r"], [50.0, 50.0, 0.0])
+    vd = mstops.vd_columns(_vd_records([
+        (9, 13, 20.0, 30.0),       # mu- entering ST_In: counted
+        (9, 13, -5.0, 10.0),       # the same muon scattered back out: not
+        (9, 11, 30.0, 40.0),       # an electron: not
+        (8, 13, 50.0, 60.0),       # Coll5_Out: not
+        (9, 13, 25.0, 34.0)]))
+    p = mstops.st_in_momenta(vd)
+    assert p.tolist() == [30.0, 34.0]
+    m = mstops.stop_metrics(stops, p, 1000)
+    assert tuple(m) == mstops.METRICS and m["n_stops"] == 3 and m["n_gen_events"] == 1000
+    assert abs(m["stop_z_mean"] - 15400 / 3) < 1e-3
+    assert m["stop_z_median"] == 5100.0 and abs(m["stop_r_mean"] - 100 / 3) < 1e-4
+    assert m["stop_time_median"] == 300.0 and m["n_st_in"] == 2
+    assert m["p_st_in_mean"] == 32.0 and m["p_st_in_rms"] == 2.0
+    h = mstops.histogram(stops["z"], 5.0, "z")             # edges on multiples of 5
+    assert h.xmin == 5000.0 and h.edges()[-1] == 5305.0 and h.values.sum() == 3
+
+
+def _fake_stops_job(stdout=SAMPLE_MUON_STOPS_STDOUT, returncode=0):
+    from tools.mu2e_job import JobOutcome
+    calls = []
+
+    def fake(*, fcl, input_paths, outdir, single, timeout_s, max_events=None, **_):
+        calls.append(Path(fcl).read_text())
+        root = outdir / "nts.owner.muonstops.test.root"
+        root.write_bytes(b"")                    # read_dumps is faked too
+        return JobOutcome(command="mu2e", returncode=returncode, timed_out=False,
+                          stdout=stdout, stderr="", log_path=outdir / "mu2e.log",
+                          input_paths=input_paths, input_flag="-s",
+                          environment="test", file_list_path=None,
+                          written_root_files=[str(root)])
+    return fake, calls
+
+
+def test_muon_stops_run_writes_its_profile_and_says_what_went_wrong(tmp_dir):
+    from tools.spec import RunContext
+    real_job, real_read = mstops.run_mu2e_job, mstops.read_dumps
+    stops = _stop_records([(-3874.0, 40.0, 5000.0 + 10 * i, 200.0 + i) for i in range(20)])
+    steps = _vd_records([(9, 13, 20.0, 25.0 + i) for i in range(20)])
+
+    def context(name, **params):
+        return RunContext(input_paths=[Path(tmp_dir) / "in.art"],
+                          outdir=Path(tmp_dir) / name, timeout_s=60,
+                          params={"stop_filter": "TargetStopFilter", **params})
+    try:
+        mstops.run_mu2e_job, calls = _fake_stops_job()
+        mstops.read_dumps = lambda path: (stops, steps)
+        outcome = mstops.run(context("ok"))
+        assert outcome.error is None, outcome.error
+        assert outcome.metrics["n_stops"] == 20 and outcome.metrics["n_gen_events"] == 12500
+        assert outcome.metrics["n_st_in"] == 20 and outcome.extra["stops_by_pdg"] == {13: 20}
+        names = [Path(f).name for f in outcome.files]
+        assert names[1:] == ["muon_stops_hists.root", "stop_z.png", "stop_r.png",
+                             "stop_time.png", "p_st_in.png", "stop_r_vs_z.png"], names
+        assert 'inputCollection : "TargetStopFilter"' in calls[0]  # the per-run fcl
+        import uproot
+        with uproot.open(outcome.files[1]) as f:
+            assert f["stop_r_vs_z"].values().sum() == 20 and f["p_st_in"].values().sum() == 20
+
+        mstops.read_dumps = lambda path: (stops[:0], steps[:0])
+        empty = mstops.run(context("empty"))
+        assert empty.error and "no stopped particle" in empty.error, empty.error
+
+        mstops.run_mu2e_job, _ = _fake_stops_job(stdout="no bookkeeping here")
+        assert "GenEventCount" in mstops.run(context("nogen")).error
+
+        mstops.run_mu2e_job, _ = _fake_stops_job(returncode=1)
+        failed = mstops.run(context("failed"))
+        assert "stop_filter" in failed.error and "PolyStopFilter" in failed.error
+    finally:
+        mstops.run_mu2e_job, mstops.read_dumps = real_job, real_read
 
 
 # --- stop_materials ----------------------------------------------------------
@@ -2865,6 +3499,11 @@ def test_every_art_analysis_parser_matches_its_declared_metrics():
         elif name == "trigger_rate":
             report = trig.parse_trig_report(sample)
             assert tuple(rate_metrics(report, 1.0, 0.5)) == spec.metrics
+        elif name == "muon_stops":
+            # the generated count from stdout, the rest from its ROOT file
+            stops = mstops.stop_variables(_stop_records([(-3874.0, 40.0, 5400.0, 300.0)]))
+            n_gen = mstops.parse_gen_count(sample)
+            assert tuple(mstops.stop_metrics(stops, np.array([30.0]), n_gen)) == spec.metrics
         elif name == "trigger_timing":
             # its numbers come from the timing database, not stdout
             assert tuple(timing_metrics(np.array([0.01, 0.02]))) == spec.metrics
@@ -3023,6 +3662,17 @@ def test_param_spec_rejects_non_numbers():
         assert "must be a number" in str(exc)
         return
     raise AssertionError("a non-numeric parameter was accepted")
+
+
+def test_param_spec_rejects_non_finite_numbers():
+    param = ParamSpec(name="p", description="d", default=1.0)
+    for bad in ("nan", "inf", float("-inf")):
+        try:
+            param.check(bad)
+        except ValueError as exc:
+            assert "finite" in str(exc)
+        else:
+            raise AssertionError(f"{bad!r} should have been refused")
 
 
 # --- input handling (-s / -S) ------------------------------------------------

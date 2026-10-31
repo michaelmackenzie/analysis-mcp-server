@@ -299,23 +299,20 @@ def check_mc_names(variables: dict, *expressions: str) -> None:
 
 # --- reading ---------------------------------------------------------------------
 
-def read_file(path: Path, paths: list[str]) -> tuple[dict, dict[str, np.ndarray], int]:
-    """(track variables, {path: per-event decision}, number of events)."""
+def open_tree(path: Path):
+    """The file's EventNtuple tree, or an NtupleError saying it has none."""
     import uproot
 
     try:
-        tree = uproot.open(path)[TREE_PATH]
+        return uproot.open(path)[TREE_PATH]
     except (KeyError, OSError, ValueError) as exc:
         raise NtupleError(f"{path}: no {TREE_PATH} ({exc}) — is this an "
                           "EventNtuple file?") from None
-    available = [k[len(TRIGGER_PREFIX):] for k in tree.keys(recursive=False)
-                 if k.startswith(TRIGGER_PREFIX)]
-    missing = [p for p in paths if p not in available]
-    if missing:
-        raise NtupleError(
-            f"{path.name}: no trigger branch for {', '.join(missing)}. "
-            f"It has: {', '.join(available) or '(none)'}"
-        )
+
+
+def read_track_arrays(tree, path: Path) -> dict:
+    """The LEAVES, plus MC_LEAVES and NPOT_BRANCH where the file has them,
+    as awkward arrays by name (events * tracks ...)."""
     names = {key.rsplit("/", 1)[-1] for key in tree.keys()}
     absent = [leaf for leaf in LEAVES if leaf not in names]
     if absent:
@@ -328,10 +325,31 @@ def read_file(path: Path, paths: list[str]) -> tuple[dict, dict[str, np.ndarray]
     arrays = {name: batch[name] for name in batch.fields}
     if NPOT_BRANCH in tree.keys():
         arrays[NPOT_BRANCH] = tree[NPOT_BRANCH].array(library="ak")
-    decisions = tree.arrays(filter_name=[TRIGGER_PREFIX + p for p in paths],
-                            library="np")
-    triggers = {p: np.asarray(decisions[TRIGGER_PREFIX + p], dtype=bool)
-                for p in paths}
+    return arrays
+
+
+def read_file(path: Path, paths: list[str]) -> tuple[dict, dict[str, np.ndarray], int]:
+    """(track variables, {path: per-event decision}, number of events).
+
+    With no `paths`, only the track variables are read (no trig_ branches
+    needed), as selection_efficiency_ntuple does.
+    """
+    tree = open_tree(path)
+    available = [k[len(TRIGGER_PREFIX):] for k in tree.keys(recursive=False)
+                 if k.startswith(TRIGGER_PREFIX)]
+    missing = [p for p in paths if p not in available]
+    if missing:
+        raise NtupleError(
+            f"{path.name}: no trigger branch for {', '.join(missing)}. "
+            f"It has: {', '.join(available) or '(none)'}"
+        )
+    arrays = read_track_arrays(tree, path)
+    triggers: dict[str, np.ndarray] = {}
+    if paths:
+        decisions = tree.arrays(filter_name=[TRIGGER_PREFIX + p for p in paths],
+                                library="np")
+        triggers = {p: np.asarray(decisions[TRIGGER_PREFIX + p], dtype=bool)
+                    for p in paths}
     return track_variables(arrays), triggers, tree.num_entries
 
 

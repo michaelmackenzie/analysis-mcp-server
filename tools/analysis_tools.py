@@ -44,6 +44,10 @@ def list_analyses() -> ArtifactResult:
 
     Chaining: an analysis whose `produced_by` names another should be given a
     ROOT file from that one's `files` output.
+
+    Comparisons: an analysis with `takes_reference` compares its input (the
+    new sample) with a baseline passed as reference_file, reference_files
+    or reference_dataset.
     """
     env = current_env()
     catalogue = {name: spec.describe() for name, spec in sorted(ANALYSES.items())}
@@ -74,6 +78,12 @@ def run_analysis(
     parameters: dict[str, Any] | None = None,
     max_events: Annotated[int | None, Field(ge=1)] = None,
     timeout_s: Annotated[int, Field(ge=1, le=7200)] = 900,
+    # Keyword-only and last, so a call passing parameters, max_events or
+    # timeout_s by position binds them as it did before these were added.
+    *,
+    reference_file: Annotated[str | None, Field(min_length=1)] = None,
+    reference_files: Annotated[list[str] | None, Field(min_length=1)] = None,
+    reference_dataset: Annotated[str | None, Field(min_length=1)] = None,
 ) -> ArtifactResult:
     """Run one analysis over its input file(s) and return its metrics.
 
@@ -118,9 +128,9 @@ def run_analysis(
             copies are preferred to tape, and a run whose tape files are not
             staged is refused with the command that stages them. The files
             run together as with data_files.
-        max_files: With dataset only: use the first this many files, by
-            name. Needed for a dataset over 2000 files; useful for a quick
-            check.
+        max_files: With dataset or reference_dataset only: use the first
+            this many files of each, by name. Needed for a dataset over 2000
+            files; useful for a quick check.
         parameters: Analysis-specific physics knobs, e.g.
             {"sig_eff": 2.5e-4} for approx_ce_sensitivity. list_analyses reports
             each analysis' parameters, defaults, and which are required.
@@ -131,6 +141,12 @@ def run_analysis(
             "per gen event" metric is meaningless when this is set.
         timeout_s: Kill the job if it runs longer than this many seconds.
             Raise it when passing many files.
+        reference_file: For an analysis with `takes_reference` (see
+            list_analyses) only, and required there: the baseline the input
+            is compared with, e.g. the ntuple before a code change when
+            data_file is the one after. Given as for data_file.
+        reference_files: Several baseline files, as for data_files.
+        reference_dataset: A catalogued baseline dataset, as for dataset.
     """
     spec = ANALYSES[analysis]
 
@@ -148,11 +164,23 @@ def run_analysis(
         return fail(f"pass one of data_file (one input file), data_files (a "
                     f"list of input files) or dataset, not {' and '.join(given)}.",
                     **given)
+    reference = {name: value for name, value in (
+        ("reference_file", reference_file), ("reference_files", reference_files),
+        ("reference_dataset", reference_dataset)) if value is not None}
+    if reference and not spec.takes_reference:
+        return fail(f"compares nothing, so {' and '.join(reference)} does not "
+                    "apply: only an analysis whose takes_reference is true (see "
+                    "list_analyses) takes a reference.", **reference)
+    if spec.takes_reference and len(reference) != 1:
+        return fail("compares its input with a baseline: pass exactly one of "
+                    "reference_file, reference_files or reference_dataset (the "
+                    "baseline, e.g. before a change), with data_file(s) or "
+                    "dataset as the new sample.", **reference)
     if spec.input_kind == "parameters":
         if given or max_events is not None:
             return fail("reads no input files; pass only parameters. "
                         f"{spec.input_hint}", **given)
-    elif max_files is not None and dataset is None:
+    elif max_files is not None and dataset is None and reference_dataset is None:
         return fail("max_files applies only to a dataset; pick the files "
                     "yourself with data_files.")
     if not given and spec.input_kind != "parameters":
@@ -201,6 +229,21 @@ def run_analysis(
         return fail("invalid input file(s): " + "; ".join(problems),
                     data_files=[str(p) for p in paths])
 
+    reference_paths, reference_source = [], {}
+    if reference:
+        try:
+            resolved_reference = resolve_inputs(
+                [reference_file] if reference_file is not None else reference_files,
+                dataset=reference_dataset, max_files=max_files)
+        except CatalogError as exc:
+            return fail(f"reference: {exc}", **reference)
+        reference_paths = resolved_reference.paths
+        reference_source = resolved_reference.source
+        problems = validate_input_paths(reference_paths)
+        if problems:
+            return fail("invalid reference file(s): " + "; ".join(problems),
+                        reference_files=[str(p) for p in reference_paths])
+
     env = current_env()
     outdir = Path(output_dir).expanduser().resolve()
     # Only code already on disk can be checked up front; for a Musing the
@@ -215,6 +258,7 @@ def run_analysis(
         timeout_s=timeout_s,
         max_events=max_events,
         wants_file_list=data_file is None,
+        reference_paths=reference_paths,
     ))
 
     # Describes the run in every result, so a caller chaining analyses can tell
@@ -226,6 +270,9 @@ def run_analysis(
         "n_input_files": len(paths),
         **({"inputs_from": resolved.source}
            if resolved is not None and resolved.source else {}),
+        **({"reference_files": [str(p) for p in reference_paths],
+            "n_reference_files": len(reference_paths)} if reference_paths else {}),
+        **({"reference_from": reference_source} if reference_source else {}),
         **({"parameters": params} if params else {}),
         **({"max_events": max_events} if max_events is not None else {}),
         **({"fcl": str(spec.fcl), "environment": env.describe()}
@@ -247,7 +294,9 @@ def run_analysis(
         status="success",
         files=outcome.files,
         message=(f"{analysis}: " if spec.input_kind == "parameters"
-                 else f"{analysis} over {len(paths)} input file(s): ")
+                 else f"{analysis} over {len(paths)} input file(s)"
+                      + (f" against {len(reference_paths)} reference file(s)"
+                         if reference_paths else "") + ": ")
                 + spec.summarize(outcome.metrics),
         metadata={**metadata, **outcome.metrics},
     )
