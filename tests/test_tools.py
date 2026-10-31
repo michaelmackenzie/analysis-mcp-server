@@ -1753,6 +1753,9 @@ def test_resolution_writes_histograms_and_refuses_bad_binning(tmp_dir):
     hists = {"resolution": nres.histogram(res, -5.0, 3.0, 0.05, "resolution"),
              "energy_loss": nres.histogram(eloss, 0.0, 10.0, 0.1, "energy_loss")}
     assert hists["resolution"].values.size == 160 and hists["resolution"].values.sum() == 3
+    # A width that does not divide the range keeps the requested endpoints.
+    uneven = nres.histogram(res, -5.0, 3.0, 3.0, "resolution")
+    assert uneven.nbins == 3 and uneven.edges()[-1] == 3.0
     files = nres._write_outputs(Path(tmp_dir), hists, metrics, "")
     assert [Path(f).name for f in files] == ["momentum_resolution.root",
                                              "resolution.png", "energy_loss.png"]
@@ -1992,6 +1995,21 @@ def test_comparison_matches_only_samples_that_share_most_events():
         assert "not the same events" in str(exc)
     else:
         raise AssertionError("'yes' with no shared event should have been refused")
+
+
+def test_comparison_does_not_match_repeated_event_ids():
+    # Event 2 twice in the new sample: intersect1d would pair only one of them.
+    new = _comparison_sample([1, 2, 2, 3], [(i, 1.0) for i in range(4)])
+    ref = _comparison_sample([1, 2, 3], [(i, 1.0) for i in range(3)])
+    m = vcmp.match(new, ref, "auto")
+    assert not m["matched"] and m["n_duplicate_ids_new"] == 1
+    assert m["i_new"].size == 0
+    try:
+        vcmp.match(new, ref, "yes")
+    except vcmp.ComparisonError as exc:
+        assert "match_events='no'" in str(exc)
+    else:
+        raise AssertionError("'yes' with repeated event ids should have been refused")
 
 
 def test_comparison_ranges_and_bins():
@@ -3434,6 +3452,17 @@ def test_param_spec_rejects_non_numbers():
         assert "must be a number" in str(exc)
         return
     raise AssertionError("a non-numeric parameter was accepted")
+
+
+def test_param_spec_rejects_non_finite_numbers():
+    param = ParamSpec(name="p", description="d", default=1.0)
+    for bad in ("nan", "inf", float("-inf")):
+        try:
+            param.check(bad)
+        except ValueError as exc:
+            assert "finite" in str(exc)
+        else:
+            raise AssertionError(f"{bad!r} should have been refused")
 
 
 # --- input handling (-s / -S) ------------------------------------------------

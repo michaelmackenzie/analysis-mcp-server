@@ -148,9 +148,9 @@ run_analysis(analysis="approx_ce_sensitivity",
 ```
 
 `list_analyses` reports each parameter's description, default, range, and
-whether it is required; unknown, missing, or out-of-range values come back as
-a plain error naming the offender. A parameter is a number unless its `kind`
-is `"text"`, which is for the ones that name something in the job's output —
+whether it is required; unknown, missing, non-finite, or out-of-range values
+come back as a plain error naming the offender. A parameter is a number unless
+its `kind` is `"text"`, which is for the ones that name something in the job's output —
 like `muon_stop_rate`'s `prescale_filter` — or, as with `selection`, are an
 expression.
 
@@ -687,7 +687,9 @@ give the median and `sigma68`, half the width of the central 68% (the sigma
 of a Gaussian, without a fit), and `energy_loss_p90`. The metrics use every
 track; the `*_min`/`*_max`/`*_bin_width` parameters set only the histograms
 (`momentum_resolution.root`, TH1D `resolution` and `energy_loss`) and the
-plots (`figures/resolution.png`, `figures/energy_loss.png`). How many tracks
+plots (`figures/resolution.png`, `figures/energy_loss.png`); the histograms
+span `*_min` to `*_max` exactly, in the whole number of bins nearest
+`*_bin_width` (the axis label gives the width used). How many tracks
 fall outside them is in `metadata.outside_histogram_range`. On the
 CeMLeadingLogMix1BB example file, with the default selection, 7192 tracks
 in 7178 events give a resolution sigma68 of 0.22 MeV/c (median -0.005, rms
@@ -784,7 +786,9 @@ comparisons come out:
   a reprocessing of the same events. With `match_events="auto"` events are
   matched when at least half of the smaller sample's (run, subrun, event)
   ids are in both, since independent samples can share a few by chance;
-  `yes` insists, `no` skips it. Unmatched, the matched metrics are NaN
+  `yes` insists, `no` skips it. A sample that repeats a (run, subrun,
+  event), e.g. from files combined twice, cannot be paired: `auto` does
+  not match it and `yes` is refused. Unmatched, the matched metrics are NaN
   (`n_events_matched` is 0).
 
 One sample with nothing selected is still compared, since a reprocessing
@@ -1185,7 +1189,7 @@ goes to `mu2e`, art resolves it on `FHICL_FILE_PATH`, `fcl_exists` comes back
 python3 tests/test_tools.py
 ```
 
-201 tests, none of which start a mu2e job or reach SAM or metacat (the
+203 tests, none of which start a mu2e job or reach SAM or metacat (the
 catalog tests use a fake). (The `ana` env has no pytest, so
 these are bare asserts.)
 
