@@ -8,6 +8,9 @@ difference is only what it consumes and what its runner does:
   input_kind="root_file"  Python computation over a ROOT file produced by an
                           earlier analysis (e.g. "approx_ce_sensitivity" reads
                           the nts.*.root that "edep" writes)
+  input_kind="parameters" Python computation over its parameters alone, no
+                          file (e.g. "total_edep_per_pot" adds earlier
+                          analyses' metrics, passed as parameters)
 
 Everything generic — argument validation, parameter checking, assembling the
 result — lives in analysis_tools.py and works for both. Adding an analysis
@@ -28,7 +31,7 @@ from .mu2e_env import current as current_env
 # whichever Offline environment a job sets up.
 FCL_DIR = Path(__file__).resolve().parent.parent / "fcl"
 
-InputKind = Literal["art_files", "root_file"]
+InputKind = Literal["art_files", "root_file", "parameters"]
 ParamKind = Literal["number", "text"]
 
 
@@ -155,7 +158,8 @@ class AnalysisSpec:
     Attributes:
         name: Short key agents pass as run_analysis(analysis=...).
         description: One line, shown by list_analyses.
-        input_kind: What it consumes — art file(s) or a ROOT file.
+        input_kind: What it consumes — art file(s), a ROOT file, or only its
+            parameters.
         metrics: Metric names it reports, in reporting order.
         run: Does the work (see Runner).
         summarize: Builds the human-readable one-line message.

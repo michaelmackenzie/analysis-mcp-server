@@ -59,7 +59,8 @@ tools/
     edep.py                    energy deposition: fcl + summary parser
     count.py                   events, gen events, optional prescale + the
                                parsing/job muon_stop_rate builds on
-    muon_stop_rate.py          stopping rate: count.py + POT scaling
+    muon_stop_rate.py          stopping rate: count.py + the mu-/mu+ split
+                               + POT scaling
     approx_ce_sensitivity.py   CE sensitivity from the EdepAna tree
     stop_materials.py          stops per material from <module>/stopmat
     trigger.py                 the trigger job (paths + prescales) and its
@@ -130,6 +131,7 @@ workflow can chain several runs and collect `metadata` uniformly.
 | `calo_cluster_resolution_ntuple` | simulated EventNtuple file(s) (calo MC truth) | calorimeter cluster dE (reco minus true energy) and dT (reco time minus earliest true deposit) for clusters passing a selection: plots, histograms, mean/rms/median/sigma68 |
 | `variable_comparison_ntuple` | two sets of EventNtuple file(s): the input (new) and a `reference_file(s)` (baseline) | one track or cluster variable compared: overlaid distributions with ratio, shifts and a KS test, and, for the same events, how many changed, gained or lost and by how much |
 | `muon_stops` | `sim.*.TargetStops.*.art` (or PolyStops / IPAStops) | where (z, radius), when and with what momentum at ST_In the muons stopped: metrics, plots, ROOT histograms |
+| `total_edep_per_pot` | none: parameters only (earlier `edep` and `muon_stop_rate` metrics) | the early electron-beam flash, early muon-beam flash and muon-stop pileup depositions per POT, their total and each one's share |
 
 `approx_ce_sensitivity` declares `produced_by = ["edep"]`, so chaining is
 discoverable: run `edep`, then pass the `nts.*.root` from its `files` to the
@@ -188,7 +190,11 @@ sensitivity is unchanged.
 
 ### Inputs
 
-Pass **exactly one** of the following — or neither, for an analysis that
+An analysis whose `input_kind` is `"parameters"` (`total_edep_per_pot`)
+reads no file: pass only `parameters`, and any `data_file`, `data_files`,
+`dataset` or `max_events` is refused.
+
+Otherwise pass **exactly one** of the following — or neither, for an analysis that
 `list_analyses` shows with `default_inputs` (`trigger_rate` and
 `trigger_timing`, which then run over the files in the configured code's
 `mu2e-trig-config/ci/data_files.txt`, found by following its `backing`
@@ -220,6 +226,15 @@ anything else happens:
 - SAM and metacat are read over plain HTTPS, without a token or a client.
   A 500-file definition resolves in about 20 s, most of it the locality
   checks.
+- The servers' certificates are checked against Python's default CA store.
+  Where that store is empty, the catalogs trust the first CA bundle that
+  exists: the Python environment's own (`<prefix>/ssl/cacert.pem`),
+  certifi's, then the system's. This matters for the CVMFS `ana` 2.7.0
+  Python started directly rather than through `pyenv` (which exports
+  `SSL_CERT_FILE`): it was relocated from the directory it was built in, so
+  its OpenSSL looks for CAs where none exist, and without the fallback every
+  lookup fails with `CERTIFICATE_VERIFY_FAILED`. An `SSL_CERT_FILE` or
+  `SSL_CERT_DIR` you set is used as it is.
 
 ```python
 run_analysis(analysis="count",
@@ -332,10 +347,20 @@ file's rate short by exactly the prescale, with nothing in the output to show
 for it. Either way `metadata.prescale_filters` lists every block the job
 printed, so an unset run is also how you discover what there was to name.
 
-`muon_stop_rate` is `count` with the target-stop filter and one more factor.
-It shares `count.py`'s parsing, input check and job run — `count.py` is the
-only place that knows how to read `print_counts.fcl` — and adds what is about
-muon stops rather than about counting. It reports:
+`muon_stop_rate` is `count` with the target-stop filter, the mu-/mu+ split
+and one more factor. It shares `count.py`'s parsing, input check and job run —
+`count.py` is the only place that knows how to read `print_counts.fcl`'s lines
+— and adds what is about muon stops rather than about counting. Its job is
+`fcl/stop_counts.fcl`: `print_counts.fcl` plus the two `ParticleCodeFilter`s of
+Production's `MuonStopSelector.fcl`, run as trigger paths (`selectMuminus`: a
+mu- captured at rest; `selectMuplus`: a mu+), whose passed counts it reads
+from art's TrigReport. A stop file holds both charges (about 1% mu+ in
+MDC2025), and only the mu- stops feed a conversion, DIO or RMC
+normalization — Production splits them into `MuminusStopsCat` and
+`MuplusStopsCat` before any primary is made — so use the `muminus_*` rates
+for those. The selectors read the stream's SimParticles, named after its
+prescale filter (`TargetStopPrescaleFilter` -> `TargetStopFilter`), through a
+per-run `stop_counts_job.fcl`. It reports:
 
 | metric | unit | from the job's print |
 |---|---|---|
@@ -344,6 +369,12 @@ muon stops rather than about counting. It reports:
 | `prescale` | | `with prescale fraction <P>`, for the `prescale_filter` |
 | `stops_per_gen_event` | stops / generated event | `n_events / (n_gen_events * prescale)` |
 | `stops_per_pot` | stops / POT | the above times the required `upstream_eff` parameter |
+| `n_muminus`, `n_muplus` | | the events path `selectMuminus` / `selectMuplus` passed (TrigReport) |
+| `muminus_stops_per_gen_event`, `muplus_stops_per_gen_event` | stops / generated event | `n_muminus / (n_gen_events * prescale)`, and for mu+ |
+| `muminus_stops_per_pot`, `muplus_stops_per_pot` | stops / POT | the above times `upstream_eff` |
+
+`stops_per_gen_event` and `stops_per_pot` count every stop, mu+ included, as
+before the split was added.
 
 It takes two parameters:
 
@@ -1062,6 +1093,26 @@ On the Run1B `CeEndpointMix1BB-KL` dataset, `occupancy_reco` (50 events of
 749 straw digis, 54 calo hits and 5.7 clusters, CRV and background
 branches all zero.
 
+## total_edep_per_pot
+
+The dose from the three beam-related sources, per POT. Each source is
+simulated from its own sample and `edep` reports it per generated event: a
+resampled beam electron (early electron-beam flash), a resampled MuBeamCat
+event (early muon-beam flash, unprescaled), or a muon stop (MuStopPileup on
+the target stops). This puts them on one footing and adds them:
+
+```
+per POT = ebeam / pot_per_ebeam_event      (default 11.5367: Run1Baa EleBeamCat, 25.0M POT / 2.17M electrons)
+        + mubeam * mubeam_events_per_pot   (default 0.01278168: muon_stop_rate's upstream_eff)
+        + mustop * stops_per_pot           (muon_stop_rate on the same geometry)
+```
+
+Pass the same detector's deposition (`avg_trk_edep_per_gen_event_mev`, or
+the calo one) for all three. It reports `total_edep_per_pot_mev`, each
+source's `*_edep_per_pot_mev` and `*_fraction`. A workflow chains it by
+passing the earlier metrics as its parameters; Mu2eBO's
+`foilsflash_col5bf_ax` uses the tracker total as its dose objective.
+
 ## Adding an analysis
 
 1. Write `tools/analyses/<name>.py` with a `run(context) -> RunOutcome` and a
@@ -1189,7 +1240,7 @@ goes to `mu2e`, art resolves it on `FHICL_FILE_PATH`, `fcl_exists` comes back
 python3 tests/test_tools.py
 ```
 
-203 tests, none of which start a mu2e job or reach SAM or metacat (the
+216 tests, none of which start a mu2e job or reach SAM or metacat (the
 catalog tests use a fake). (The `ana` env has no pytest, so
 these are bare asserts.)
 

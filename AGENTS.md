@@ -2,7 +2,8 @@
 
 An MCP server that exposes Mu2e analyses as agent tools: `list_analyses` and
 `run_analysis`. An analysis is either a `mu2e` job over art file(s), with its
-stdout parsed, or a Python computation over a ROOT file. README.md is the
+stdout parsed, a Python computation over a ROOT file, or one over its
+parameters alone. README.md is the
 full reference. This file holds what you need before changing code.
 
 ## Setup, test, run
@@ -41,7 +42,8 @@ python3 -m analysis_mcp_server --transport stdio [--work-area DIR | --musing 'Si
   `AnalysisSpec`, see `tools/spec.py`), plus an entry in `_ANALYSIS_MODULES`
   in `tools/registry.py`. The registry tests loop over every analysis and
   fail until it is covered: add a `SAMPLE_STDOUT` entry for an `art_files`
-  analysis, or direct tests for a `root_file` one.
+  analysis, or direct tests for a `root_file` or `parameters` one. A
+  `parameters` analysis reads no file and computes from its parameters alone.
 - **Physics knobs are `ParamSpec`s**, not tool arguments. They are validated,
   have defaults and ranges, and `list_analyses` reports them. Their
   descriptions are what agents read, so write them for an agent.
@@ -104,6 +106,9 @@ python3 -m analysis_mcp_server --transport stdio [--work-area DIR | --musing 'Si
   built on it. They share `tools/analyses/occupancy.py` (per-run fcl, summary
   table, tree). A skipped collection's metrics are -1, never absent, so every
   listed metric is always reported; keep that when adding collections.
+- **A stop file holds mu+ stops too** (about 1% in MDC2025). A rate for a
+  mu- capture process (conversion, DIO, RMC) is `muon_stop_rate`'s
+  `muminus_*`, not `stops_per_*`, which keep counting every stop.
 - **Never use `tpr_` or `mpr_` paths** in defaults, tests or examples: they
   are in the trigger menu but not meant for the real trigger. Use `apr_`,
   `cpr_` and `calo_` paths.

@@ -28,7 +28,11 @@ from tools.analyses.count import (CountsError, dataset_description,
                                   dataset_hint, parse_counts,
                                   parse_prescale_filters, saved_rates,
                                   wrong_dataset)
-from tools.analyses.muon_stop_rate import PRESCALE_FILTER, stop_rates
+from tools.analyses import count as count_mod
+from tools.analyses import muon_stop_rate as stop_mod
+from tools.analyses.muon_stop_rate import (PRESCALE_FILTER, job_fcl_text,
+                                           parse_species_counts,
+                                           stop_collection, stop_rates)
 from tools.analyses.stop_materials import combine_tables, material_rates
 from tools.analyses import trigger as trig
 from tools.analyses.trigger_efficiency import efficiency_metrics
@@ -45,6 +49,7 @@ from tools.analyses import occupancy_ntuple as occ_ntuple
 from tools.analyses import occupancy_reco as occ_reco
 from tools.analyses.trigger_rate import duty_factor, rate_metrics
 from tools.analyses.trigger_timing import timing_metrics
+from tools.analyses import total_edep_per_pot as dose
 from tools.mu2e_env import EnvError, Mu2eEnv, configure, current
 from tools.mu2e_job import (build_input_args, root_snapshot,
                             validate_input_paths, written_root_files)
@@ -130,6 +135,31 @@ GenEventCount total: 12500 events in 1 SubRuns
 Art has completed and will exit with status 0.
 """
 
+# stop_counts.fcl's output: the counts above, plus art's TrigReport for the
+# two selector paths, in the format of a real MDC2025ba TargetStops job.
+SAMPLE_STOP_COUNTS_STDOUT = SAMPLE_COUNTS_STDOUT.replace("""
+Art has completed""", """
+TrigReport ---------- Event summary -------------
+TrigReport Events total = 735 passed = 735 failed = 0
+TrigReport ---------- Trigger-path summary ------------
+TrigReport    Path ID        Run     Passed     Failed      Error Name
+TrigReport          0        735        728          7          0 selectMuminus
+TrigReport          1        735          7        728          0 selectMuplus
+TrigReport ---------- End-path summary ---------
+TrigReport        Run    Success      Error
+TrigReport        735        735          0
+TrigReport ---------- Modules in path: selectMuminus ------------
+TrigReport    Path ID    Visited     Passed     Failed      Error Name
+TrigReport          0        735        728          7          0 muminusSelector
+TrigReport ---------- Modules in path: selectMuplus ------------
+TrigReport    Path ID    Visited     Passed     Failed      Error Name
+TrigReport          1        735          7        728          0 muplusSelector
+TrigReport ---------- Modules in End-path ----------
+TrigReport        Run    Success      Error Name
+TrigReport        735        735          0 printModule
+
+Art has completed""")
+
 # The end of a trigger job's stdout: art's TrigReport, in the format of a run
 # of three menu paths (cpr_ at prescale 3) over 200 CE digi events.
 SAMPLE_TRIGGER_STDOUT = """\
@@ -196,7 +226,7 @@ TrigReport Events total = 735 passed = 735 failed = 0
 
 SAMPLE_STDOUT = {"edep": SAMPLE_EDEP_STDOUT,
                  "count": SAMPLE_COUNTS_STDOUT,
-                 "muon_stop_rate": SAMPLE_COUNTS_STDOUT,
+                 "muon_stop_rate": SAMPLE_STOP_COUNTS_STDOUT,
                  "trigger_efficiency": SAMPLE_TRIGGER_STDOUT,
                  "trigger_rate": SAMPLE_TRIGGER_STDOUT,
                  "trigger_timing": SAMPLE_TRIGGER_STDOUT,
@@ -479,6 +509,115 @@ def test_stop_rates_divide_out_the_prescale_and_scale_by_the_upstream_efficiency
     # the prescale kept half the events, so the true rate is twice 735/12500
     assert abs(rates["stops_per_gen_event"] - 0.1176) < 1e-6
     assert abs(rates["stops_per_pot"] - 0.1176 * 2.0e-3) < 1e-9
+    # without a mu-/mu+ split there are no per-charge rates to report
+    assert "muminus_stops_per_gen_event" not in rates
+
+
+def test_stop_rates_count_the_mu_minus_and_mu_plus_stops_apart():
+    counts = {**parse_counts(SAMPLE_STOP_COUNTS_STDOUT, PRESCALE_FILTER),
+              **parse_species_counts(SAMPLE_STOP_COUNTS_STDOUT)}
+    assert (counts["n_muminus"], counts["n_muplus"]) == (728.0, 7.0), counts
+    rates = stop_rates(counts, upstream_eff=2.0e-3)
+    # every stop is still in stops_per_gen_event; the mu- rate is the part a
+    # capture normalization wants, and the two charges add up to it
+    assert abs(rates["stops_per_gen_event"] - 735 / 12500) < 1e-12
+    assert abs(rates["muminus_stops_per_gen_event"] - 728 / 12500) < 1e-12
+    assert abs(rates["muplus_stops_per_gen_event"] - 7 / 12500) < 1e-12
+    assert abs(rates["muminus_stops_per_pot"] - 728 / 12500 * 2.0e-3) < 1e-15
+    # a prescaled file divides both charges by the same prescale
+    halved = stop_rates({**counts, "prescale": 0.5}, upstream_eff=1.0)
+    assert abs(halved["muminus_stops_per_gen_event"] - 2 * 728 / 12500) < 1e-12
+
+
+def test_species_counts_come_from_the_path_rows_not_the_module_rows():
+    # the per-module rows have the same shape, under the modules' names
+    assert parse_species_counts(SAMPLE_STOP_COUNTS_STDOUT) == {
+        "n_muminus": 728.0, "n_muplus": 7.0}
+    for stdout, words in (
+            (SAMPLE_COUNTS_STDOUT, ["no TrigReport row", "selectMuminus"]),
+            (SAMPLE_STOP_COUNTS_STDOUT.replace(
+                "        7          0 selectMuminus", "        7          2 selectMuminus"),
+             ["selectMuminus", "2 event(s) in error"])):
+        try:
+            parse_species_counts(stdout)
+        except CountsError as exc:
+            assert all(w in str(exc) for w in words), str(exc)
+        else:
+            raise AssertionError("an unusable TrigReport was not rejected")
+
+
+def test_stop_counts_read_the_streams_own_simparticles():
+    assert stop_collection("TargetStopPrescaleFilter") == "TargetStopFilter"
+    assert stop_collection("PolyStopPrescaleFilter") == "PolyStopFilter"
+    text = job_fcl_text("PolyStopFilter")
+    shipped = (FCL_DIR / "stop_counts.fcl").read_text()
+    assert text.startswith(shipped.rstrip())
+    for selector in ("muminusSelector", "muplusSelector"):
+        assert f'physics.filters.{selector}.SimParticles : "PolyStopFilter"' in text
+        assert selector in shipped
+    # the counts the job shares with print_counts.fcl, and the summary the
+    # path counts are read from
+    for needed in ("printModule", "genCountReader", "eventCount",
+                   "wantSummary : true", "selectMuminus", "selectMuplus",
+                   "muMinusCaptureAtRest"):
+        assert needed in shipped, needed
+
+
+def _fake_counts_job(stdout, returncode=0):
+    """A stand-in for run_mu2e_job that prints `stdout`, recording the fcl."""
+    from tools.mu2e_job import JobOutcome
+    seen = []
+
+    def fake(*, fcl, input_paths, outdir, single, timeout_s, max_events=None, **_):
+        seen.append(fcl)
+        outdir.mkdir(parents=True, exist_ok=True)
+        return JobOutcome(command="mu2e", returncode=returncode, timed_out=False,
+                          stdout=stdout, stderr="", log_path=outdir / "mu2e.log",
+                          input_paths=input_paths, input_flag="-s",
+                          environment="test", file_list_path=None,
+                          written_root_files=[])
+    return fake, seen
+
+
+def test_muon_stop_rate_runs_its_own_fcl_and_reports_the_charges(tmp_dir):
+    stops = Path(tmp_dir) / "sim.mu2e.TargetStops.MDC2025ba_x.001430_00000053.art"
+    stops.touch()
+    fake, seen = _fake_counts_job(SAMPLE_STOP_COUNTS_STDOUT)
+    real = count_mod.run_mu2e_job
+    count_mod.run_mu2e_job = fake
+    try:
+        result = run_analysis(analysis="muon_stop_rate", data_file=str(stops),
+                              output_dir=str(Path(tmp_dir) / "out"),
+                              parameters={"upstream_eff": 2.0e-3})
+    finally:
+        count_mod.run_mu2e_job = real
+    assert result.status == "success", result.message
+    meta = result.metadata
+    assert seen == [Path(tmp_dir) / "out" / stop_mod.JOB_FCL_NAME], seen
+    assert 'SimParticles : "TargetStopFilter"' in seen[0].read_text()
+    assert meta["stop_collection"] == "TargetStopFilter"
+    assert (meta["n_muminus"], meta["n_muplus"]) == (728.0, 7.0), meta
+    assert abs(meta["muminus_stops_per_pot"] - 728 / 12500 * 2.0e-3) < 1e-15
+    assert "728 mu-" in result.message, result.message
+
+
+def test_muon_stop_rate_says_when_the_file_lacks_the_stop_collection(tmp_dir):
+    stops = Path(tmp_dir) / "sim.mu2e.TargetStops.v1.001430_00000000.art"
+    stops.touch()
+    fake, _ = _fake_counts_job(
+        "---- ProductNotFound BEGIN\n  getValidHandle: no TargetStopFilter\n", returncode=1)
+    real = count_mod.run_mu2e_job
+    count_mod.run_mu2e_job = fake
+    try:
+        result = run_analysis(analysis="muon_stop_rate", data_file=str(stops),
+                              output_dir=str(Path(tmp_dir) / "out"),
+                              parameters={"upstream_eff": 1.0})
+    finally:
+        count_mod.run_mu2e_job = real
+    assert result.status == "error"
+    for words in ("'TargetStopFilter' SimParticle collection", "prescale_filter",
+                  "'count'"):
+        assert words in result.message, result.message
 
 
 # --- the spectrum helper -----------------------------------------------------
@@ -3226,6 +3365,76 @@ def test_occupancy_ntuple_on_a_real_file(tmp_dir):
     assert meta["calohits_sel_mean"] == meta["calohits_mean"]     # full window
 
 
+# --- total_edep_per_pot (reads no files) -------------------------------------
+
+DOSE_PARAMS = {"ebeam_edep_per_gen_event_mev": 6.89476e-06,
+               "mubeam_edep_per_gen_event_mev": 1.334e-07,
+               "mustop_edep_per_gen_event_mev": 2.84332e-04,
+               "stops_per_pot": 1.1514376428e-03}
+
+
+def test_total_edep_per_pot_normalizes_each_source_and_adds_them():
+    params = dict(DOSE_PARAMS, pot_per_ebeam_event=dose.POT_PER_EBEAM_EVENT,
+                  mubeam_events_per_pot=dose.MUBEAM_EVENTS_PER_POT)
+    m = dose.per_pot(params)
+    ebeam = 6.89476e-06 / 11.536718606512062
+    mubeam = 1.334e-07 * 0.01278168
+    mustop = 2.84332e-04 * 1.1514376428e-03
+    assert abs(m["ebeam_edep_per_pot_mev"] - ebeam) < 1e-18
+    assert abs(m["mubeam_edep_per_pot_mev"] - mubeam) < 1e-18
+    assert abs(m["mustop_edep_per_pot_mev"] - mustop) < 1e-18
+    assert abs(m["total_edep_per_pot_mev"] - (ebeam + mubeam + mustop)) < 1e-18
+    assert abs(sum(m[f"{s}_fraction"] for s in dose.SOURCES) - 1.0) < 1e-12
+    assert tuple(m) == dose.SPEC.metrics
+
+
+def test_total_edep_per_pot_with_nothing_deposited_has_zero_shares():
+    params = {k: 0.0 for k in DOSE_PARAMS}
+    params.update(pot_per_ebeam_event=1.0, mubeam_events_per_pot=1.0)
+    m = dose.per_pot(params)
+    assert m["total_edep_per_pot_mev"] == 0.0
+    assert all(m[f"{s}_fraction"] == 0.0 for s in dose.SOURCES)
+
+
+def test_a_parameters_analysis_runs_without_input_files(tmp_dir):
+    result = run_analysis(analysis="total_edep_per_pot", output_dir=tmp_dir,
+                          parameters=DOSE_PARAMS)
+    assert result.status == "success", result.message
+    assert result.metadata["n_input_files"] == 0
+    assert result.metadata["input_kind"] == "parameters"
+    assert result.metadata["total_edep_per_pot_mev"] > 0
+    assert "MeV/POT" in result.message
+
+
+def test_a_parameters_analysis_refuses_input_files(tmp_dir):
+    path = Path(tmp_dir) / "x.root"
+    path.write_text("")
+    for extra in ({"data_file": str(path)}, {"data_files": [str(path)]},
+                  {"max_events": 10}):
+        result = run_analysis(analysis="total_edep_per_pot",
+                              output_dir=tmp_dir, parameters=DOSE_PARAMS,
+                              **extra)
+        assert result.status == "error", extra
+        assert "reads no input files" in result.message, result.message
+
+
+def test_a_parameters_analysis_needs_its_required_parameters(tmp_dir):
+    params = dict(DOSE_PARAMS)
+    del params["stops_per_pot"]
+    result = run_analysis(analysis="total_edep_per_pot", output_dir=tmp_dir,
+                          parameters=params)
+    assert result.status == "error"
+    assert "stops_per_pot" in result.message, result.message
+
+
+def test_list_analyses_describes_the_parameters_kind():
+    entry = list_analyses().metadata["analyses"]["total_edep_per_pot"]
+    assert entry["input_kind"] == "parameters"
+    assert entry["takes_data_files"] is False
+    assert entry["parameters"]["pot_per_ebeam_event"]["default"] == \
+        dose.POT_PER_EBEAM_EVENT
+
+
 # --- the registry (loops over every analysis) --------------------------------
 
 def test_registry_includes_every_analysis():
@@ -3239,7 +3448,8 @@ def test_every_spec_is_self_consistent():
         assert spec.description.strip(), f"{name}: needs a description"
         assert spec.metrics, f"{name}: needs at least one metric"
         assert callable(spec.run) and callable(spec.summarize)
-        assert spec.input_kind in ("art_files", "root_file"), spec.input_kind
+        assert spec.input_kind in ("art_files", "root_file", "parameters"), \
+            spec.input_kind
         for metric in (spec.units or {}):
             assert metric in spec.metrics, f"{name}: unit for unknown '{metric}'"
         for param in spec.parameters:
@@ -3251,7 +3461,7 @@ def test_every_spec_is_self_consistent():
             assert current().missing_fcl(spec.fcl) is None, \
                 f"{name}: {current().missing_fcl(spec.fcl)}"
         else:
-            assert spec.fcl is None, f"{name}: root_file analysis should have no fcl"
+            assert spec.fcl is None, f"{name}: {spec.input_kind} analysis should have no fcl"
             # its input comes from another analysis here, or from elsewhere
             # (a production job's ntuple) — either way, say which
             assert spec.produced_by or spec.input_hint.strip(), \
@@ -3280,8 +3490,8 @@ def test_every_art_analysis_parser_matches_its_declared_metrics():
         elif name == "count":
             assert tuple(saved_rates(parse_counts(sample))) == spec.metrics
         elif name == "muon_stop_rate":
-            parsed = stop_rates(parse_counts(sample, PRESCALE_FILTER),
-                                upstream_eff=1.0)
+            parsed = stop_rates({**parse_counts(sample, PRESCALE_FILTER),
+                                 **parse_species_counts(sample)}, upstream_eff=1.0)
             assert tuple(parsed) == spec.metrics
         elif name == "trigger_efficiency":
             report = trig.parse_trig_report(sample)
@@ -3320,7 +3530,7 @@ def test_list_analyses_reports_every_registered_analysis():
 
     stops = catalogue["muon_stop_rate"]
     assert stops["input_kind"] == "art_files"
-    assert stops["fcl"] == str(FCL_DIR / "print_counts.fcl")
+    assert stops["fcl"] == str(FCL_DIR / "stop_counts.fcl")
     assert stops["fcl_exists"] is True
     assert stops["parameters"]["upstream_eff"]["required"] is True
     assert stops["units"]["stops_per_pot"] == "stops / POT"
@@ -3785,6 +3995,56 @@ def test_unstaged_tape_files_are_refused_with_the_command_that_stages_them():
     fake.localities = {}
     from tools.catalog import resolve_inputs
     assert len(resolve_inputs(entries=names, client=fake).paths) == 2
+
+
+def test_catalog_trusts_a_fallback_bundle_when_the_default_store_is_empty(tmp_dir):
+    """A relocated conda Python (CVMFS ana 2.7.0) can have no CA at all
+    outside pyenv; the catalogs then fall back to a bundle on disk."""
+    import ssl
+    from tools import catalog
+    bundle = Path(tmp_dir) / "cacert.pem"
+    loaded = []
+
+    class EmptyStore(ssl.SSLContext):
+        def cert_store_stats(self):
+            return {"x509": 0, "crl": 0, "x509_ca": 0}
+
+        def load_verify_locations(self, cafile=None, **_):
+            loaded.append(cafile)
+
+    real = (catalog.ssl.create_default_context, catalog.CA_BUNDLES, dict(catalog.os.environ))
+    catalog.ssl.create_default_context = lambda: EmptyStore(ssl.PROTOCOL_TLS_CLIENT)
+    catalog.CA_BUNDLES = (Path(tmp_dir) / "missing.pem", bundle)
+    try:
+        for name in ("SSL_CERT_FILE", "SSL_CERT_DIR"):
+            catalog.os.environ.pop(name, None)
+        bundle.write_text("")
+        catalog.ssl_context.cache_clear()
+        catalog.ssl_context()
+        # the first bundle that exists (certifi, if installed, comes second)
+        assert loaded and loaded[0] in (str(bundle),) + tuple(
+            str(b) for b in catalog.ca_bundles()[1:2]), loaded
+        # a store the caller chose through the environment is left alone
+        loaded.clear()
+        catalog.os.environ["SSL_CERT_FILE"] = str(bundle)
+        catalog.ssl_context.cache_clear()
+        catalog.ssl_context()
+        assert loaded == [], loaded
+    finally:
+        catalog.ssl.create_default_context, catalog.CA_BUNDLES = real[:2]
+        catalog.os.environ.clear()
+        catalog.os.environ.update(real[2])
+        catalog.ssl_context.cache_clear()
+
+
+def test_catalog_says_what_to_do_about_an_unverified_certificate():
+    import ssl
+    import urllib.error
+    from tools.catalog import network_problem
+    bad = urllib.error.URLError(ssl.SSLCertVerificationError(
+        "certificate verify failed: unable to get local issuer certificate"))
+    assert "SSL_CERT_FILE" in network_problem(bad)
+    assert network_problem(OSError("connection refused")) == "connection refused"
 
 
 def test_catalogued_input_errors_say_what_is_wrong():

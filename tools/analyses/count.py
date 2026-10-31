@@ -40,6 +40,7 @@ restating it, so the parsing and the input check have one home.
 """
 
 import re
+from collections.abc import Callable
 from pathlib import Path
 
 from ..mu2e_job import run_mu2e_job
@@ -175,8 +176,14 @@ def parse_counts(stdout: str, filter_label: str | None = None) -> dict[str, floa
     }
 
 
-def run_counts_job(context: RunContext, filter_label: str | None) -> RunOutcome:
-    """Run print_counts.fcl over the input file(s) and parse what it printed.
+def run_counts_job(context: RunContext, filter_label: str | None,
+                   fcl: Path = FCL,
+                   parse_more: Callable[[str], dict[str, float]] | None = None,
+                   ) -> RunOutcome:
+    """Run print_counts.fcl (or `fcl`, which must print the same lines) over
+    the input file(s) and parse what it printed. `parse_more` reads anything
+    else the caller's fcl prints into more metrics, raising CountsError as
+    parse_counts does.
 
     Shared by every analysis built on these counts. On success the outcome's
     `metrics` are the raw counts — `n_events`, `n_gen_events`, `prescale` —
@@ -200,7 +207,7 @@ def run_counts_job(context: RunContext, filter_label: str | None) -> RunOutcome:
         ))
 
     outcome = run_mu2e_job(
-        fcl=FCL,
+        fcl=fcl,
         input_paths=context.input_paths,
         outdir=context.outdir,
         single=len(context.input_paths) == 1 and not context.wants_file_list,
@@ -232,6 +239,8 @@ def run_counts_job(context: RunContext, filter_label: str | None) -> RunOutcome:
     extra["prescale_filters"] = parse_prescale_filters(outcome.stdout)
     try:
         counts = parse_counts(outcome.stdout, filter_label)
+        if parse_more is not None:
+            counts.update(parse_more(outcome.stdout))
     except CountsError as exc:
         extra["stdout_tail"] = outcome.stdout_tail()
         return RunOutcome(log_path=outcome.log_path, extra=extra, error=str(exc))
